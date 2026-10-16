@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="id">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f5f5f0" />
+    <meta name="description" content="Kontrol manifest dan bukti serah terima paket D'Fixer OrderGuard." />
+    <title>D'Fixer OrderGuard Manifest</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@500;600;700;800&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="styles.css" />
+    <script src="https://cdn.jsdelivr.net/npm/lucide@0.468.0/dist/umd/lucide.min.js" defer></script>
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" id="sidebar">
+        <a class="brand" href="#dashboard" aria-label="D'Fixer OrderGuard, beranda">
+          <span class="brand-mark"><i data-lucide="package-check"></i></span>
+          <span class="brand-copy"><strong>D'Fixer</strong><small>ORDERGUARD</small></span>
+        </a>
+        <div class="workspace-switch">
+          <span class="workspace-icon">DF</span>
+          <span class="workspace-name"><strong>D'Fixer Store</strong><small>Workspace demo</small></span>
+          <i data-lucide="chevrons-up-down" class="workspace-chevron"></i>
+        </div>
+        <nav class="primary-nav" aria-label="Navigasi utama">
+          <p class="nav-label">OPERASIONAL</p>
+          <button class="nav-link active" data-view="dashboard"><i data-lucide="layout-dashboard"></i><span>Ringkasan</span></button>
+          <button class="nav-link" data-view="manifests"><i data-lucide="boxes"></i><span>Manifest</span><span class="nav-count" id="nav-manifest-count">0</span></button>
+          <button class="nav-link" data-view="imports"><i data-lucide="file-up"></i><span>Impor data</span></button>
+          <button class="nav-link" data-view="incidents"><i data-lucide="triangle-alert"></i><span>Insiden</span><span class="nav-count alert-count" id="nav-incident-count">0</span></button>
+          <p class="nav-label nav-label-spaced">KONTROL</p>
+          <button class="nav-link" data-view="reports"><i data-lucide="chart-no-axes-column-increasing"></i><span>Laporan</span></button>
+          <button class="nav-link" data-view="audit"><i data-lucide="history"></i><span>Audit log</span></button>
+        </nav>
+        <div class="sidebar-bottom">
+          <div class="local-note"><span class="status-dot"></span><span><strong>Mode lokal</strong><small>Data tersimpan di browser ini</small></span></div>
+          <button class="profile-button" type="button"><span class="avatar">RA</span><span><strong>Rani Admin</strong><small>Store Admin</small></span><i data-lucide="more-horizontal"></i></button>
+        </div>
+      </aside>
+      <main class="main-area">
+        <header class="topbar">
+          <div class="topbar-left">
+            <button class="icon-button mobile-menu" id="menu-toggle" aria-label="Buka navigasi"><i data-lucide="menu"></i></button>
+            <div class="breadcrumb"><span>Operasional</span><i data-lucide="chevron-right"></i><strong id="breadcrumb-current">Ringkasan</strong></div>
+          </div>
+          <div class="topbar-actions">
+            <span class="environment-tag"><span></span> SANDBOX</span>
+            <button class="icon-button" id="help-button" aria-label="Tentang aplikasi" title="Tentang aplikasi"><i data-lucide="circle-help"></i></button>
+            <button class="button button-secondary button-small" id="logout-button" type="button"><i data-lucide="log-out"></i> Keluar</button>
+            <span class="topbar-divider"></span>
+            <span class="topbar-date" id="today-date"></span>
+            <span id="user-role-label" class="environment-tag"><span></span> STORE ADMIN</span>
+            <span class="avatar avatar-small">RA</span>
+          </div>
+        </header>
+        <section class="page-content" id="page-content" aria-live="polite"></section>
+      </main>
+    </div>
+    <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="true"></div>
+    <div class="modal-backdrop" id="modal-backdrop" hidden>
+      <section class="modal" id="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title"></section>
+    </div>
+  </body>
+</html>

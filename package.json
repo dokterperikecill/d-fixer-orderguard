@@ -1,0 +1,14 @@
+{
+  "name": "dfixer-orderguard",
+  "version": "1.0.0",
+  "description": "D'Fixer OrderGuard MVP backend and frontend",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test backend.test.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.7.0",
+    "express": "^4.21.2"
+  }
+}
