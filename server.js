@@ -3,6 +3,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const Database = require('better-sqlite3');
+const { isDeepStrictEqual } = require('node:util');
 
 const app = express();
 const port = Number(process.env.PORT || 4173);
@@ -50,6 +51,12 @@ db.exec(`
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
   CREATE TABLE IF NOT EXISTS employee_audit (
     id TEXT PRIMARY KEY,
     actor_id TEXT NOT NULL,
@@ -64,20 +71,12 @@ const INITIAL_TENANTS = [
   { id: 'dfixer-store', name: "D'Fixer Store" },
   { id: 'maya-commerce', name: 'Maya Commerce' },
 ];
-const DEMO_USERS = [
-  { id: 'admin', username: 'admin', password: 'admin123', name: 'Platform Admin', role: 'super-admin', tenantId: 'dfixer-store' },
-  { id: 'rani', username: 'rani', password: 'rani123', name: 'Rani Admin', role: 'store-admin', tenantId: 'dfixer-store' },
-  { id: 'handover', username: 'handover', password: 'handover123', name: 'Budi Handover', role: 'handover-staff', tenantId: 'dfixer-store' },
-  { id: 'maya', username: 'maya', password: 'maya123', name: 'Maya Admin', role: 'store-admin', tenantId: 'maya-commerce' },
-];
 const EMPLOYEE_ROLES = ['super-admin', 'store-admin', 'handover-staff'];
 const ROLE_PERMISSIONS = {
   'super-admin': ['dashboard', 'manifests', 'imports', 'incidents', 'reports', 'audit'],
   'store-admin': ['dashboard', 'manifests', 'imports', 'incidents', 'reports', 'audit'],
   'handover-staff': ['dashboard', 'manifests'],
 };
-const SESSIONS = new Map();
-
 function seedTenants() {
   const insert = db.prepare('INSERT OR IGNORE INTO tenants (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)');
   const now = new Date().toISOString();
@@ -99,8 +98,12 @@ function recordTenantAudit(actor, tenantId, action) {
     .run(crypto.randomUUID(), actor.id, actor.name, tenantId, action, new Date().toISOString());
 }
 
-function signSessionToken(userId) {
-  return crypto.createHash('sha256').update(`${userId}:${Date.now()}:${Math.random()}`).digest('hex');
+function signSessionToken() {
+  return crypto.randomBytes(32).toString('base64url');
+}
+
+function hashSessionToken(token) {
+  return crypto.createHash('sha256').update(token).digest('hex');
 }
 
 function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
@@ -114,13 +117,40 @@ function verifyPassword(password, salt, hash) {
   return candidate.length === expected.length && crypto.timingSafeEqual(candidate, expected);
 }
 
-function seedDemoUsers() {
+function seedInitialUsers() {
   const count = db.prepare('SELECT COUNT(*) AS count FROM users').get().count;
-  if (count) return;
+  if (count) {
+    if (process.env.NODE_ENV === 'production') {
+      const legacyDemoAccounts = db.prepare("SELECT username FROM users WHERE id IN ('admin', 'rani', 'handover', 'maya') AND active = 1").all();
+      if (legacyDemoAccounts.length) {
+        const names = legacyDemoAccounts.map((user) => user.username).join(', ');
+        throw new Error(`Database masih memiliki akun demo aktif (${names}). Nonaktifkan atau migrasikan akun tersebut sebelum menjalankan production.`);
+      }
+    }
+    return;
+  }
+  let initialUsers;
+  if (process.env.NODE_ENV === 'test') {
+    try {
+      initialUsers = JSON.parse(process.env.ORDERGUARD_TEST_USERS || '[]');
+    } catch (error) {
+      throw new Error('ORDERGUARD_TEST_USERS harus berupa JSON valid.');
+    }
+  } else {
+    const username = String(process.env.ORDERGUARD_BOOTSTRAP_USERNAME || '').trim();
+    const password = String(process.env.ORDERGUARD_BOOTSTRAP_PASSWORD || '');
+    const name = String(process.env.ORDERGUARD_BOOTSTRAP_NAME || '').trim();
+    if (!username || password.length < 12 || !name) {
+      throw new Error('Database pengguna kosong. Set ORDERGUARD_BOOTSTRAP_USERNAME, ORDERGUARD_BOOTSTRAP_PASSWORD (minimal 12 karakter), dan ORDERGUARD_BOOTSTRAP_NAME untuk membuat Platform Admin pertama.');
+    }
+    initialUsers = [{ id: crypto.randomUUID(), username, password, name, role: 'super-admin', tenantId: 'dfixer-store' }];
+  }
+  if (!Array.isArray(initialUsers) || !initialUsers.length) throw new Error('Tidak ada akun awal untuk database kosong.');
+
   const insert = db.prepare('INSERT INTO users (id, username, name, password_salt, password_hash, role, tenant_id, active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)');
   const now = new Date().toISOString();
   const seed = db.transaction(() => {
-    for (const user of DEMO_USERS) {
+    for (const user of initialUsers) {
       const credentials = hashPassword(user.password);
       insert.run(user.id, user.username, user.name, credentials.salt, credentials.hash, user.role, user.tenantId, now, now);
     }
@@ -129,7 +159,7 @@ function seedDemoUsers() {
 }
 
 seedTenants();
-seedDemoUsers();
+seedInitialUsers();
 
 function parseCookies(header = '') {
   return header.split(';').map((segment) => segment.trim()).filter(Boolean).reduce((accumulator, segment) => {
@@ -142,9 +172,24 @@ function parseCookies(header = '') {
 function getUserFromRequest(req) {
   const cookies = parseCookies(req.headers.cookie || '');
   const token = cookies.orderguard_session;
-  const userId = token ? SESSIONS.get(token) : null;
-  if (!userId) return null;
-  return db.prepare('SELECT id, username, name, role, tenant_id AS tenantId FROM users WHERE id = ? AND active = 1').get(userId) || null;
+  if (!token) return null;
+  const hashedToken = hashSessionToken(token);
+  const session = db.prepare('SELECT user_id AS userId FROM sessions WHERE token_hash = ? AND expires_at > ?').get(hashedToken, new Date().toISOString());
+  if (!session) {
+    db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(hashedToken);
+    return null;
+  }
+  const user = db.prepare('SELECT id, username, name, role, tenant_id AS tenantId FROM users WHERE id = ? AND active = 1').get(session.userId);
+  if (!user) db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(hashedToken);
+  return user || null;
+}
+
+function revokeUserSessions(userId, exceptToken = '') {
+  if (exceptToken) {
+    db.prepare('DELETE FROM sessions WHERE user_id = ? AND token_hash <> ?').run(userId, hashSessionToken(exceptToken));
+    return;
+  }
+  db.prepare('DELETE FROM sessions WHERE user_id = ?').run(userId);
 }
 
 function requireAuth(req, res, next) {
@@ -243,6 +288,252 @@ function publicUser(user) {
     createdAt: user.createdAt || user.created_at,
     updatedAt: user.updatedAt || user.updated_at,
   };
+}
+
+function prefixedEntries(previous, next) {
+  if (!Array.isArray(previous) || !Array.isArray(next) || next.length < previous.length) return null;
+  const addedCount = next.length - previous.length;
+  return isDeepStrictEqual(next.slice(addedCount), previous) ? next.slice(0, addedCount) : null;
+}
+
+function appendedEntries(previous, next) {
+  if (!Array.isArray(previous) || !Array.isArray(next) || next.length < previous.length) return null;
+  return isDeepStrictEqual(next.slice(0, previous.length), previous) ? next.slice(previous.length) : null;
+}
+
+function auditEntries(previous, next) {
+  const added = prefixedEntries(previous, next);
+  if (added) return added;
+  if (previous.length === 5000 && next.length === 5000 && isDeepStrictEqual(next.slice(1), previous.slice(0, -1))) return [next[0]];
+  return null;
+}
+
+function validTimestamp(value) {
+  return typeof value === 'string' && Number.isFinite(Date.parse(value));
+}
+
+function validateAuditAppend(user, previous, next) {
+  const added = auditEntries(previous, next);
+  if (!added) return 'Riwayat audit lama tidak boleh diubah atau dihapus.';
+  for (const entry of added) {
+    if (entry.actor !== user.name || typeof entry.action !== 'string' || typeof entry.object !== 'string' || !validTimestamp(entry.createdAt)) {
+      return 'Audit hanya boleh ditambahkan oleh pengguna yang sedang login.';
+    }
+  }
+  return null;
+}
+
+function validateStoreAdminUpdate(user, previous, next) {
+  if (!next || typeof next !== 'object' || Array.isArray(next)) return 'Payload state tidak valid.';
+  const allowedFields = ['manifests', 'incidents', 'audit', 'importJobs'];
+  for (const field of new Set([...Object.keys(previous), ...Object.keys(next)])) {
+    if (!allowedFields.includes(field) && !isDeepStrictEqual(previous[field], next[field])) return 'Field state tidak dikenal atau tidak dapat diubah.';
+  }
+  for (const field of allowedFields) {
+    if (!Array.isArray(previous[field]) || !Array.isArray(next[field])) return `Data ${field} tidak valid.`;
+  }
+  const auditError = validateAuditAppend(user, previous.audit, next.audit);
+  if (auditError) return auditError;
+  const addedAudit = auditEntries(previous.audit, next.audit);
+  const addedManifests = prefixedEntries(previous.manifests, next.manifests);
+  const addedJobs = prefixedEntries(previous.importJobs, next.importJobs);
+  if (!addedManifests || !addedJobs) return 'Manifest, riwayat impor, dan audit lama tidak boleh dihapus atau disusun ulang.';
+  const addedIncidents = prefixedEntries(previous.incidents, next.incidents);
+
+  if (addedManifests.length) {
+    if (!addedIncidents || addedIncidents.length) return 'Pembuatan manifest tidak boleh mengubah insiden lama.';
+    if (next.manifests.length - addedManifests.length !== previous.manifests.length || !isDeepStrictEqual(next.manifests.slice(addedManifests.length), previous.manifests)) return 'Manifest lama tidak boleh diubah saat membuat manifest baru.';
+    const packageCount = addedManifests.reduce((total, manifest) => total + (Array.isArray(manifest.packages) ? manifest.packages.length : 0), 0);
+    if (!addedManifests.every((manifest) => manifest.createdBy === user.name && manifest.status === 'OPEN' && manifest.shop && manifest.courier && validTimestamp(manifest.createdAt) && Array.isArray(manifest.packages) && manifest.packages.length > 0 && Array.isArray(manifest.scans) && manifest.scans.length === 0 && Array.isArray(manifest.sessions) && manifest.sessions.length === 0 && manifest.packages.every((parcel) => parcel.order && parcel.tracking && parcel.status === 'EXPECTED' && parcel.scannedAt === null))) {
+      return 'Manifest baru tidak memenuhi aturan pembuatan.';
+    }
+    if (addedJobs.length === 0) {
+      if (addedManifests.length !== 1 || addedManifests[0].source !== 'manual' || addedAudit.length !== 1 || addedAudit[0].object !== addedManifests[0].id || addedAudit[0].action !== `Manifest dibuat manual dengan ${packageCount} paket`) return 'Pembuatan manifest manual tidak cocok dengan catatan audit.';
+    } else {
+      const job = addedJobs[0];
+      if (addedJobs.length !== 1 || addedManifests.some((manifest) => manifest.source !== job.fileName) || job.valid !== packageCount || job.manifestCount !== addedManifests.length || job.valid + job.failed !== job.total || !validTimestamp(job.createdAt) || addedAudit.length !== 1 || addedAudit[0].object !== job.id || addedAudit[0].action !== `Impor ${job.fileName}: ${job.valid} valid, ${job.failed} ditolak`) return 'Manifest impor tidak cocok dengan riwayat impor dan audit.';
+    }
+    return null;
+  }
+
+  if (addedJobs.length) return 'Riwayat impor hanya dapat ditambahkan bersama manifest baru.';
+
+  if (!addedIncidents) {
+    if (next.incidents.length !== previous.incidents.length) return 'Insiden lama tidak boleh dihapus atau disusun ulang.';
+    const changedIncidents = previous.incidents.map((incident, index) => ({ previous: incident, next: next.incidents[index] })).filter(({ previous: oldIncident, next: newIncident }) => !isDeepStrictEqual(oldIncident, newIncident));
+    if (changedIncidents.length !== 1) return 'Hanya satu insiden terbuka yang dapat diselesaikan per perubahan.';
+    const { previous: oldIncident, next: newIncident } = changedIncidents[0];
+    const oldFields = Object.fromEntries(Object.entries(oldIncident).filter(([key]) => !['status', 'resolution', 'resolvedAt', 'resolvedBy'].includes(key)));
+    const newFields = Object.fromEntries(Object.entries(newIncident).filter(([key]) => !['status', 'resolution', 'resolvedAt', 'resolvedBy'].includes(key)));
+    if (oldIncident.status !== 'OPEN' || newIncident.status !== 'RESOLVED' || !newIncident.resolution || newIncident.resolvedBy !== user.name || !validTimestamp(newIncident.resolvedAt) || !isDeepStrictEqual(oldFields, newFields) || addedAudit.length !== 1 || addedAudit[0].object !== oldIncident.id || addedAudit[0].action !== `Insiden diselesaikan: ${oldIncident.category} — ${newIncident.resolution}`) return 'Penyelesaian insiden tidak valid atau tidak cocok dengan audit.';
+    return null;
+  }
+
+  if (addedIncidents.length) {
+    if (addedIncidents.length !== 1 || !isDeepStrictEqual(previous.manifests, next.manifests)) return 'Pencatatan insiden tidak boleh mengubah manifest.';
+    const incident = addedIncidents[0];
+    if (!incident.id || !incident.category || !incident.description || incident.reportedBy !== user.name || incident.status !== 'OPEN' || !validTimestamp(incident.createdAt) || (incident.manifestId && !previous.manifests.some((manifest) => manifest.id === incident.manifestId)) || addedAudit.length !== 1 || addedAudit[0].object !== incident.id || addedAudit[0].action !== `Insiden dicatat: ${incident.category}`) return 'Insiden baru tidak valid atau tidak cocok dengan audit.';
+    return null;
+  }
+
+  if (!isDeepStrictEqual(previous.manifests, next.manifests)) {
+    const workflowError = validateHandoverUpdate(user, previous, next);
+    if (!workflowError) return null;
+
+    if (next.manifests.length !== previous.manifests.length) return workflowError;
+    const changed = previous.manifests.map((manifest, index) => ({ previous: manifest, next: next.manifests[index] })).filter(({ previous: oldManifest, next: newManifest }) => !isDeepStrictEqual(oldManifest, newManifest));
+    if (changed.length !== 1 || !isDeepStrictEqual(previous.incidents, next.incidents) || addedAudit.length !== 1) return workflowError;
+    const { previous: oldManifest, next: newManifest } = changed[0];
+    if (oldManifest.id !== newManifest.id) return workflowError;
+    if (newManifest.status === 'CLOSED' && oldManifest.status !== 'CLOSED') {
+      const counts = oldManifest.packages.filter((parcel) => ['EXPECTED', 'SCANNED', 'REJECTED', 'EXCEPTION'].includes(parcel.status)).length;
+      if (counts || previous.incidents.some((incident) => incident.manifestId === oldManifest.id && incident.status === 'OPEN') || !isDeepStrictEqual(oldManifest.packages, newManifest.packages) || addedAudit[0].object !== oldManifest.id || addedAudit[0].action !== 'Manifest ditutup') return 'Penutupan manifest tidak memenuhi syarat rekonsiliasi.';
+      const oldFields = Object.fromEntries(Object.entries(oldManifest).filter(([key]) => key !== 'status'));
+      const newFields = Object.fromEntries(Object.entries(newManifest).filter(([key]) => key !== 'status'));
+      return isDeepStrictEqual(oldFields, newFields) ? null : workflowError;
+    }
+    if (newManifest.status === 'CANCELLED' && oldManifest.status !== 'CANCELLED') {
+      if (oldManifest.packages.some((parcel) => parcel.status === 'HANDED_OVER') || addedAudit[0].object !== oldManifest.id || addedAudit[0].action !== 'Manifest dibatalkan') return 'Manifest yang memiliki penerimaan tidak dapat dibatalkan.';
+      const oldFields = Object.fromEntries(Object.entries(oldManifest).filter(([key]) => !['status', 'packages'].includes(key)));
+      const newFields = Object.fromEntries(Object.entries(newManifest).filter(([key]) => !['status', 'packages'].includes(key)));
+      const packagesValid = oldManifest.packages.length === newManifest.packages.length && oldManifest.packages.every((parcel, index) => {
+        const updated = newManifest.packages[index];
+        if (parcel.status === 'HANDED_OVER') return isDeepStrictEqual(parcel, updated);
+        return updated.status === 'CANCELLED' && isDeepStrictEqual(Object.fromEntries(Object.entries(parcel).filter(([key]) => key !== 'status')), Object.fromEntries(Object.entries(updated).filter(([key]) => key !== 'status')));
+      });
+      return packagesValid && isDeepStrictEqual(oldFields, newFields) ? null : workflowError;
+    }
+    return workflowError;
+  }
+
+  if (addedAudit.length === 1 && addedAudit[0].action === 'Laporan rekonsiliasi diekspor' && addedAudit[0].object === 'CSV') return null;
+  if (addedAudit.length === 0 || addedAudit.every((entry) => entry.action === 'Laporan rekonsiliasi diekspor' && entry.object === 'CSV')) return null;
+  return 'Perubahan state tidak cocok dengan tindakan Store Admin yang diizinkan.';
+}
+
+function validateHandoverUpdate(user, previous, next) {
+  if (!next || typeof next !== 'object' || Array.isArray(next)) return 'Payload state tidak valid.';
+  for (const field of new Set([...Object.keys(previous), ...Object.keys(next)])) {
+    if (['manifests', 'incidents', 'audit', 'importJobs'].includes(field)) continue;
+    if (!isDeepStrictEqual(previous[field], next[field])) return 'Handover Staff tidak diizinkan mengubah data administratif.';
+  }
+  if (!Array.isArray(previous.manifests) || !Array.isArray(next.manifests) || previous.manifests.length !== next.manifests.length) {
+    return 'Handover Staff tidak dapat menambah atau menghapus manifest.';
+  }
+  if (!isDeepStrictEqual(previous.importJobs, next.importJobs)) return 'Handover Staff tidak dapat mengubah data impor.';
+  if (!Array.isArray(previous.incidents) || !Array.isArray(next.incidents)) return 'Data insiden tidak valid.';
+  if (!Array.isArray(previous.audit) || !Array.isArray(next.audit)) return 'Data audit tidak valid.';
+
+  const auditError = validateAuditAppend(user, previous.audit, next.audit);
+  if (auditError) return auditError;
+  const addedAudit = auditEntries(previous.audit, next.audit);
+  const addedIncidents = prefixedEntries(previous.incidents, next.incidents);
+  if (!addedIncidents) return 'Insiden lama tidak boleh diubah atau dihapus.';
+  const knownAuditActions = [
+    /^Paket dipindai: .+$/,
+    /^Pemindaian di luar manifest: .+$/,
+    /^Serah terima TR-[A-Z0-9-]+ dikonfirmasi: .+$/,
+  ];
+  for (const entry of addedAudit) {
+    if (entry.actor !== user.name || !validTimestamp(entry.createdAt) || !knownAuditActions.some((pattern) => pattern.test(entry.action)) || !previous.manifests.some((manifest) => manifest.id === entry.object)) {
+      return 'Catatan audit baru tidak valid untuk peran Handover Staff.';
+    }
+  }
+
+  const expectedIncidents = [];
+  for (let index = 0; index < previous.manifests.length; index += 1) {
+    const oldManifest = previous.manifests[index];
+    const newManifest = next.manifests[index];
+    if (!newManifest || oldManifest.id !== newManifest.id) return 'Handover Staff tidak dapat mengganti manifest.';
+    const protectedManifest = (manifest) => Object.fromEntries(Object.entries(manifest).filter(([key]) => !['status', 'packages', 'scans', 'sessions'].includes(key)));
+    if (!isDeepStrictEqual(protectedManifest(oldManifest), protectedManifest(newManifest))) return 'Informasi administratif manifest tidak boleh diubah.';
+    if (!Array.isArray(oldManifest.packages) || !Array.isArray(newManifest.packages) || oldManifest.packages.length !== newManifest.packages.length) return 'Daftar paket manifest tidak boleh diubah.';
+    if (!Array.isArray(oldManifest.scans) || !Array.isArray(newManifest.scans) || !Array.isArray(oldManifest.sessions) || !Array.isArray(newManifest.sessions)) return 'Riwayat pemindaian atau serah terima tidak valid.';
+
+    const newScans = appendedEntries(oldManifest.scans, newManifest.scans);
+    const newSessions = appendedEntries(oldManifest.sessions, newManifest.sessions);
+    if (!newScans || !newSessions) return 'Riwayat pemindaian dan serah terima hanya boleh ditambahkan.';
+    const newlyHandedOver = new Set();
+    const newlyRejected = new Set();
+    const newlyScanned = new Set();
+
+    for (let packageIndex = 0; packageIndex < oldManifest.packages.length; packageIndex += 1) {
+      const oldPackage = oldManifest.packages[packageIndex];
+      const newPackage = newManifest.packages[packageIndex];
+      if (!newPackage || oldPackage.order !== newPackage.order || oldPackage.tracking !== newPackage.tracking) return 'Identitas paket manifest tidak boleh diubah.';
+      const protectedPackage = (parcel) => Object.fromEntries(Object.entries(parcel).filter(([key]) => !['status', 'scannedAt'].includes(key)));
+      if (!isDeepStrictEqual(protectedPackage(oldPackage), protectedPackage(newPackage))) return 'Data paket administratif tidak boleh diubah.';
+
+      if (oldPackage.status === newPackage.status) {
+        if (oldPackage.scannedAt !== newPackage.scannedAt) return 'Waktu pemindaian tidak boleh diubah.';
+      } else if (oldPackage.status === 'EXPECTED' && newPackage.status === 'SCANNED') {
+        if (!validTimestamp(newPackage.scannedAt)) return 'Waktu pemindaian tidak valid.';
+        newlyScanned.add(newPackage.tracking);
+      } else if (oldPackage.status === 'SCANNED' && ['HANDED_OVER', 'REJECTED'].includes(newPackage.status)) {
+        if (oldPackage.scannedAt !== newPackage.scannedAt) return 'Waktu pemindaian tidak boleh diubah.';
+        (newPackage.status === 'HANDED_OVER' ? newlyHandedOver : newlyRejected).add(newPackage.tracking);
+      } else {
+        return 'Transisi status paket tidak diizinkan untuk Handover Staff.';
+      }
+    }
+
+    if (oldManifest.status !== newManifest.status) {
+      const permittedStatuses = ['OPEN', 'HANDOVER_IN_PROGRESS', 'RECONCILIATION_REQUIRED', 'PARTIALLY_HANDED_OVER', 'READY_FOR_CONFIRMATION', 'CONFIRMED'];
+      if (!permittedStatuses.includes(oldManifest.status) || !permittedStatuses.includes(newManifest.status) || ['CLOSED', 'CANCELLED', 'CONFIRMED'].includes(oldManifest.status)) return 'Handover Staff tidak dapat menutup, membatalkan, atau mengubah manifest final.';
+      if (!newSessions.length) return 'Perubahan status manifest harus berasal dari sesi serah terima.';
+      const hasOutstanding = newManifest.packages.some((parcel) => ['EXPECTED', 'SCANNED', 'REJECTED', 'EXCEPTION'].includes(parcel.status));
+      if (newManifest.status !== (hasOutstanding ? 'PARTIALLY_HANDED_OVER' : 'CONFIRMED')) return 'Status manifest tidak sesuai dengan hasil serah terima.';
+    }
+
+    const handedOverInSessions = new Set();
+    for (const session of newSessions) {
+      if (session.actor !== user.name || !session.receiver || !validTimestamp(session.createdAt) || !Array.isArray(session.items) || !session.items.length) return 'Sesi serah terima tidak valid.';
+      const sessionItems = new Set();
+      for (const tracking of session.items) {
+        if (!newlyHandedOver.has(tracking) || handedOverInSessions.has(tracking) || sessionItems.has(tracking)) return 'Sesi hanya boleh berisi paket yang baru dikonfirmasi.';
+        sessionItems.add(tracking);
+        handedOverInSessions.add(tracking);
+      }
+    }
+    if (handedOverInSessions.size !== newlyHandedOver.size) return 'Setiap paket yang diterima harus tercatat dalam sesi serah terima.';
+
+    for (const scan of newScans) {
+      if (scan.actor !== user.name || !validTimestamp(scan.createdAt) || !['MATCH', 'DUPLICATE_SCAN', 'NOT_IN_MANIFEST', 'ALREADY_HANDED_OVER', 'INVALID_PACKAGE', 'CANCELLED'].includes(scan.result)) {
+        return 'Catatan pemindaian baru tidak valid.';
+      }
+      const packageBefore = oldManifest.packages.find((parcel) => parcel.tracking === scan.tracking);
+      const packageAfter = newManifest.packages.find((parcel) => parcel.tracking === scan.tracking);
+      const handedOverElsewhere = previous.manifests.some((manifest) => manifest.packages.some((parcel) => parcel.tracking === scan.tracking && parcel.status === 'HANDED_OVER'));
+      if (scan.result === 'MATCH' && !newlyScanned.has(scan.tracking)) return 'Hasil scan cocok harus memperbarui paket yang direncanakan.';
+      if (scan.result === 'DUPLICATE_SCAN' && !['SCANNED', 'HANDED_OVER'].includes(packageAfter?.status)) return 'Hasil scan duplikat tidak cocok dengan status paket.';
+      if (scan.result === 'NOT_IN_MANIFEST' && (packageBefore || handedOverElsewhere)) return 'Hasil scan di luar manifest tidak sesuai dengan data paket.';
+      if (scan.result === 'ALREADY_HANDED_OVER' && !handedOverElsewhere && packageBefore?.status !== 'HANDED_OVER') return 'Hasil scan sudah diserahkan tidak sesuai dengan data paket.';
+      if (scan.result === 'INVALID_PACKAGE' && packageBefore?.status !== 'REJECTED') return 'Hasil scan tidak valid tidak sesuai dengan data paket.';
+      if (scan.result === 'CANCELLED' && packageBefore?.status !== 'CANCELLED') return 'Hasil scan dibatalkan tidak sesuai dengan data paket.';
+    }
+    for (const incident of addedIncidents) {
+      if (incident.manifestId !== oldManifest.id) continue;
+      if (incident.category !== 'Paket ditolak kurir' || incident.reportedBy !== user.name || incident.status !== 'OPEN' || !newlyRejected.has(incident.tracking) || !validTimestamp(incident.createdAt) || typeof incident.description !== 'string') {
+        return 'Handover Staff hanya dapat mencatat insiden penolakan paket dari sesi serah terima.';
+      }
+      expectedIncidents.push(incident);
+    }
+
+    for (const audit of addedAudit) {
+      if (audit.object !== oldManifest.id) continue;
+      if (audit.action.startsWith('Paket dipindai: ') && !newScans.some((scan) => scan.result === 'MATCH' && audit.action === `Paket dipindai: ${scan.tracking}`)) return 'Audit pemindaian tidak sesuai dengan catatan scan.';
+      if (audit.action.startsWith('Pemindaian di luar manifest: ') && !newScans.some((scan) => scan.result === 'NOT_IN_MANIFEST' && audit.action === `Pemindaian di luar manifest: ${scan.tracking}`)) return 'Audit pemindaian tidak sesuai dengan catatan scan.';
+      if (audit.action.startsWith('Serah terima ') && !newSessions.some((session) => audit.action.startsWith(`Serah terima ${session.id} dikonfirmasi:`))) return 'Audit serah terima tidak sesuai dengan sesi baru.';
+    }
+
+    for (const tracking of newlyRejected) {
+      const incident = expectedIncidents.find((entry) => entry.manifestId === oldManifest.id && entry.tracking === tracking);
+      if (!incident || !newSessions.some((session) => incident.description.includes(session.id))) return 'Paket yang ditolak harus memiliki insiden dan sesi serah terima.';
+    }
+  }
+
+  if (addedIncidents.length !== expectedIncidents.length) return 'Insiden baru tidak cocok dengan paket yang ditolak.';
+  return null;
 }
 
 app.use(express.json({ limit: '10mb' }));
@@ -370,10 +661,8 @@ app.patch('/api/users/:id', requireAuth, requireRole(['super-admin']), (req, res
     if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') return res.status(409).json({ error: 'Username sudah digunakan.' });
     throw error;
   }
-  if (password && existing.id !== req.user.id) {
-    for (const [token, userId] of SESSIONS) {
-      if (userId === existing.id) SESSIONS.delete(token);
-    }
+  if (password || role !== existing.role || tenantId !== existing.tenant_id || !active) {
+    revokeUserSessions(existing.id, existing.id === req.user.id ? parseCookies(req.headers.cookie || '').orderguard_session : '');
   }
   const action = password ? 'Data karyawan dan kata sandi diperbarui' : 'Data karyawan diperbarui';
   db.prepare('INSERT INTO employee_audit (id, actor_id, actor_name, target_user_id, action, created_at) VALUES (?, ?, ?, ?, ?, ?)')
@@ -393,9 +682,7 @@ app.delete('/api/users/:id', requireAuth, requireRole(['super-admin']), (req, re
 
   const now = new Date().toISOString();
   db.prepare('UPDATE users SET active = 0, updated_at = ? WHERE id = ?').run(now, existing.id);
-  for (const [token, userId] of SESSIONS) {
-    if (userId === existing.id) SESSIONS.delete(token);
-  }
+  revokeUserSessions(existing.id);
   db.prepare('INSERT INTO employee_audit (id, actor_id, actor_name, target_user_id, action, created_at) VALUES (?, ?, ?, ?, ?, ?)')
     .run(crypto.randomUUID(), req.user.id, req.user.name, existing.id, 'Akun karyawan dinonaktifkan', now);
   res.json({ ok: true });
@@ -408,12 +695,17 @@ app.post('/api/login', (req, res) => {
     return res.status(401).json({ error: 'Kredensial tidak valid.' });
   }
 
-  const token = signSessionToken(user.id);
-  SESSIONS.set(token, user.id);
+  const token = signSessionToken();
+  const createdAt = new Date();
+  const expiresAt = new Date(createdAt.getTime() + 1000 * 60 * 60 * 8).toISOString();
+  db.prepare('INSERT INTO sessions (token_hash, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)')
+    .run(hashSessionToken(token), user.id, expiresAt, createdAt.toISOString());
+  db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(createdAt.toISOString());
+  const secureCookie = process.env.NODE_ENV === 'production';
   res.cookie('orderguard_session', token, {
     httpOnly: true,
     sameSite: 'lax',
-    secure: false,
+    secure: secureCookie,
     maxAge: 1000 * 60 * 60 * 8,
   });
   res.json({ ok: true, user: publicUser(user) });
@@ -422,8 +714,8 @@ app.post('/api/login', (req, res) => {
 app.post('/api/logout', (req, res) => {
   const cookies = parseCookies(req.headers.cookie || '');
   const token = cookies.orderguard_session;
-  if (token) SESSIONS.delete(token);
-  res.clearCookie('orderguard_session');
+  if (token) db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(hashSessionToken(token));
+  res.clearCookie('orderguard_session', { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production' });
   res.json({ ok: true });
 });
 
@@ -432,16 +724,29 @@ app.get('/api/state', requireAuth, requireRole(['super-admin', 'store-admin', 'h
 });
 
 app.post('/api/state', requireAuth, requireRole(['super-admin', 'store-admin', 'handover-staff']), (req, res) => {
-  const payload = req.body && typeof req.body === 'object' ? req.body : baseState(getTenant(req.user.tenantId)?.name);
+  const payload = req.body && typeof req.body === 'object' ? req.body : null;
+  if (!payload) return res.status(400).json({ error: 'Payload state tidak valid.' });
+  const previous = readState(req.user.tenantId);
+  if (!Array.isArray(payload.audit)) return res.status(400).json({ error: 'Data audit tidak valid.' });
+  const auditError = validateAuditAppend(req.user, previous.audit, payload.audit);
+  if (auditError) return res.status(403).json({ error: auditError });
+  if (req.user.role === 'handover-staff') {
+    const validationError = validateHandoverUpdate(req.user, previous, payload);
+    if (validationError) return res.status(403).json({ error: validationError });
+  } else if (req.user.role === 'store-admin') {
+    const validationError = validateStoreAdminUpdate(req.user, previous, payload);
+    if (validationError) return res.status(403).json({ error: validationError });
+  }
   writeState(req.user.tenantId, payload);
   res.json({ ok: true, updatedAt: new Date().toISOString() });
 });
 
-app.use(express.static(appDir));
-
-app.get(/^\/(?!api).*/, (req, res) => {
+app.get('/', (req, res) => {
   res.sendFile(path.join(appDir, 'index.html'));
 });
+
+app.get('/app.js', (req, res) => res.sendFile(path.join(appDir, 'app.js')));
+app.get('/styles.css', (req, res) => res.sendFile(path.join(appDir, 'styles.css')));
 
 app.listen(port, () => {
   console.log(`OrderGuard backend running on http://localhost:${port}`);

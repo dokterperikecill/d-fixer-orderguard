@@ -6,23 +6,34 @@ const os = require('node:os');
 const path = require('node:path');
 const Database = require('better-sqlite3');
 
+const TEST_USERS = [
+  { id: 'admin', username: 'admin', password: 'admin123', name: 'Platform Admin', role: 'super-admin', tenantId: 'dfixer-store' },
+  { id: 'rani', username: 'rani', password: 'rani123', name: 'Rani Admin', role: 'store-admin', tenantId: 'dfixer-store' },
+  { id: 'handover', username: 'handover', password: 'handover123', name: 'Budi Handover', role: 'handover-staff', tenantId: 'dfixer-store' },
+  { id: 'maya', username: 'maya', password: 'maya123', name: 'Maya Admin', role: 'store-admin', tenantId: 'maya-commerce' },
+];
+
+function startTestServer(port, dbPath) {
+  const child = spawn(process.execPath, ['server.js'], {
+    cwd: __dirname,
+    env: { ...process.env, PORT: String(port), ORDERGUARD_DB_PATH: dbPath, NODE_ENV: 'test', ORDERGUARD_TEST_USERS: JSON.stringify(TEST_USERS) },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  return child;
+}
+
 function createTestServer(port, prepareDatabase) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orderguard-test-'));
   const dbPath = path.join(directory, 'orderguard.db');
   if (prepareDatabase) prepareDatabase(dbPath);
-  const child = spawn(process.execPath, ['server.js'], {
-    cwd: __dirname,
-    env: { ...process.env, PORT: String(port), ORDERGUARD_DB_PATH: dbPath, NODE_ENV: 'test' },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  return { child, directory };
+  return { child: startTestServer(port, dbPath), dbPath, directory, port };
 }
 
-async function stopTestServer(server) {
+async function stopTestServer(server, removeDirectory = true) {
   const exited = new Promise((resolve) => server.child.once('exit', resolve));
   server.child.kill('SIGTERM');
   await exited;
-  fs.rmSync(server.directory, { recursive: true, force: true });
+  if (removeDirectory) fs.rmSync(server.directory, { recursive: true, force: true });
 }
 
 function waitForServer(port) {
@@ -56,6 +67,12 @@ test('server exposes health endpoint and state API', async () => {
     const healthJson = await health.json();
     assert.equal(healthJson.status, 'ok');
     assert.equal(unauthenticatedState.status, 401);
+    assert.equal((await fetch(`http://127.0.0.1:${port}/`)).status, 200);
+    assert.equal((await fetch(`http://127.0.0.1:${port}/app.js`)).status, 200);
+    assert.equal((await fetch(`http://127.0.0.1:${port}/styles.css`)).status, 200);
+    assert.equal((await fetch(`http://127.0.0.1:${port}/server.js`)).status, 404);
+    assert.equal((await fetch(`http://127.0.0.1:${port}/data/orderguard.db`)).status, 404);
+    assert.equal((await fetch(`http://127.0.0.1:${port}/package-lock.json`)).status, 404);
 
     const login = await fetch(`http://127.0.0.1:${port}/api/login`, {
       method: 'POST',
@@ -80,7 +97,90 @@ test('server exposes health endpoint and state API', async () => {
   }
 });
 
-test('handover staff is allowed to access and update manifest state', async () => {
+test('session remains valid after server restart and is removed on logout', async () => {
+  const port = 4315;
+  let server = createTestServer(port);
+
+  try {
+    await waitForServer(port);
+    const login = await fetch(`http://127.0.0.1:${port}/api/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'rani', password: 'rani123' }),
+    });
+    const cookie = /orderguard_session=([^;]+)/.exec(login.headers.get('set-cookie') || '')?.[1];
+    assert.ok(cookie);
+    await stopTestServer(server, false);
+
+    server = { ...server, child: startTestServer(port, server.dbPath) };
+    await waitForServer(port);
+    const session = await fetch(`http://127.0.0.1:${port}/api/session`, {
+      headers: { Cookie: `orderguard_session=${cookie}` },
+    }).then((response) => response.json());
+    assert.equal(session.user.username, 'rani');
+
+    const logout = await fetch(`http://127.0.0.1:${port}/api/logout`, {
+      method: 'POST',
+      headers: { Cookie: `orderguard_session=${cookie}` },
+    });
+    assert.equal(logout.status, 200);
+    const expired = await fetch(`http://127.0.0.1:${port}/api/session`, {
+      headers: { Cookie: `orderguard_session=${cookie}` },
+    }).then((response) => response.json());
+    assert.equal(expired.user, null);
+  } finally {
+    await stopTestServer(server);
+  }
+});
+
+test('production requires explicit bootstrap credentials and marks session cookies secure', async () => {
+  const port = 4316;
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orderguard-production-test-'));
+  const emptyDatabase = path.join(directory, 'empty.sqlite');
+  const missingBootstrap = spawn(process.execPath, ['server.js'], {
+    cwd: __dirname,
+    env: { ...process.env, NODE_ENV: 'production', PORT: String(port), ORDERGUARD_DB_PATH: emptyDatabase },
+    stdio: ['ignore', 'ignore', 'pipe'],
+  });
+  let startupError = '';
+  missingBootstrap.stderr.setEncoding('utf8').on('data', (chunk) => { startupError += chunk; });
+  const exitCode = await new Promise((resolve) => missingBootstrap.once('exit', resolve));
+  assert.equal(exitCode, 1);
+  assert.match(startupError, /ORDERGUARD_BOOTSTRAP_PASSWORD/);
+
+  const databasePath = path.join(directory, 'production.sqlite');
+  const server = {
+    child: spawn(process.execPath, ['server.js'], {
+      cwd: __dirname,
+      env: {
+        ...process.env,
+        NODE_ENV: 'production',
+        PORT: String(port),
+        ORDERGUARD_DB_PATH: databasePath,
+        ORDERGUARD_BOOTSTRAP_USERNAME: 'production-owner',
+        ORDERGUARD_BOOTSTRAP_NAME: 'Production Owner',
+        ORDERGUARD_BOOTSTRAP_PASSWORD: 'production-test-password-123',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }),
+    directory,
+  };
+
+  try {
+    await waitForServer(port);
+    const login = await fetch(`http://127.0.0.1:${port}/api/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'production-owner', password: 'production-test-password-123' }),
+    });
+    assert.equal(login.status, 200);
+    assert.match(login.headers.get('set-cookie') || '', /; Secure(?:;|$)/i);
+  } finally {
+    await stopTestServer(server);
+  }
+});
+
+test('handover staff can scan packages but cannot change administrative state', async () => {
   const port = 4311;
   const server = createTestServer(port);
 
@@ -105,6 +205,13 @@ test('handover staff is allowed to access and update manifest state', async () =
     assert.equal(stateBefore.status, 200);
     const state = await stateBefore.json();
     assert.ok(Array.isArray(state.manifests));
+    const manifest = state.manifests[0];
+    const parcel = manifest.packages.find((item) => item.status === 'EXPECTED');
+    const scannedAt = new Date().toISOString();
+    parcel.status = 'SCANNED';
+    parcel.scannedAt = scannedAt;
+    manifest.scans.push({ tracking: parcel.tracking, result: 'MATCH', createdAt: scannedAt, actor: 'Budi Handover' });
+    state.audit.unshift({ id: 'AU-HANDOVER-TEST', actor: 'Budi Handover', action: `Paket dipindai: ${parcel.tracking}`, object: manifest.id, createdAt: scannedAt });
 
     const update = await fetch(`http://127.0.0.1:${port}/api/state`, {
       method: 'POST',
@@ -112,12 +219,56 @@ test('handover staff is allowed to access and update manifest state', async () =
         'Content-Type': 'application/json',
         Cookie: `orderguard_session=${sessionCookie}`,
       },
-      body: JSON.stringify({ ...state, updatedAt: new Date().toISOString() }),
+      body: JSON.stringify(state),
     });
 
     assert.equal(update.status, 200);
     const updateJson = await update.json();
     assert.equal(updateJson.ok, true);
+
+    let persistedState = await fetch(`http://127.0.0.1:${port}/api/state`, {
+      headers: { Cookie: `orderguard_session=${sessionCookie}` },
+    }).then((response) => response.json());
+
+    const handoverState = structuredClone(persistedState);
+    const handoverManifest = handoverState.manifests[0];
+    const scannedPackages = handoverManifest.packages.filter((item) => item.status === 'SCANNED');
+    const acceptedTracking = scannedPackages[0].tracking;
+    const rejectedPackages = scannedPackages.slice(1);
+    const sessionId = 'TR-TEST-HANDOVER';
+    const handedOverAt = new Date().toISOString();
+    handoverManifest.packages.forEach((item) => {
+      if (item.status === 'SCANNED') item.status = item.tracking === acceptedTracking ? 'HANDED_OVER' : 'REJECTED';
+    });
+    handoverManifest.sessions.push({ id: sessionId, receiver: 'Kurir Test', actor: 'Budi Handover', createdAt: handedOverAt, note: '', items: [acceptedTracking], evidence: null });
+    handoverManifest.status = 'PARTIALLY_HANDED_OVER';
+    for (const item of rejectedPackages) {
+      handoverState.incidents.unshift({ id: `INC-${item.tracking}`, category: 'Paket ditolak kurir', manifestId: handoverManifest.id, tracking: item.tracking, description: `Ditolak pada sesi ${sessionId}`, reportedBy: 'Budi Handover', createdAt: handedOverAt, status: 'OPEN', resolution: '' });
+    }
+    handoverState.audit.unshift({ id: 'AU-HANDOVER-CONFIRM', actor: 'Budi Handover', action: `Serah terima ${sessionId} dikonfirmasi: 1 diterima, ${rejectedPackages.length} ditolak`, object: handoverManifest.id, createdAt: handedOverAt });
+    const handoverUpdate = await fetch(`http://127.0.0.1:${port}/api/state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${sessionCookie}` },
+      body: JSON.stringify(handoverState),
+    });
+    const handoverResult = await handoverUpdate.json();
+    assert.equal(handoverUpdate.status, 200, handoverResult.error);
+    persistedState = await fetch(`http://127.0.0.1:${port}/api/state`, {
+      headers: { Cookie: `orderguard_session=${sessionCookie}` },
+    }).then((response) => response.json());
+
+    const maliciousPayload = { ...persistedState, importJobs: [{ id: 'forged-import' }] };
+    const forbiddenUpdate = await fetch(`http://127.0.0.1:${port}/api/state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${sessionCookie}` },
+      body: JSON.stringify(maliciousPayload),
+    });
+    assert.equal(forbiddenUpdate.status, 403);
+
+    const stateAfterAttack = await fetch(`http://127.0.0.1:${port}/api/state`, {
+      headers: { Cookie: `orderguard_session=${sessionCookie}` },
+    }).then((response) => response.json());
+    assert.deepEqual(stateAfterAttack, persistedState);
   } finally {
     await stopTestServer(server);
   }
@@ -154,12 +305,50 @@ test('tenant state is isolated and legacy D\'Fixer data is preserved', async () 
     }).then((response) => response.json());
     assert.equal(legacyState.marker, 'legacy-state');
 
-    const raniUpdate = { manifests: [{ id: 'rani-only' }], incidents: [], audit: [], importJobs: [], marker: 'rani-state' };
-    await fetch(`http://127.0.0.1:${port}/api/state`, {
+    const raniUpdate = structuredClone(legacyState);
+    const raniIncident = { id: 'INC-RANI-ONLY', category: 'Masalah lain', manifestId: '', tracking: '', description: 'Insiden tenant Rani saja', reportedBy: 'Rani Admin', createdAt: new Date().toISOString(), status: 'OPEN', resolution: '' };
+    raniUpdate.incidents.unshift(raniIncident);
+    raniUpdate.audit.unshift({ id: 'AU-RANI-ONLY', actor: 'Rani Admin', action: 'Insiden dicatat: Masalah lain', object: raniIncident.id, createdAt: raniIncident.createdAt });
+    const raniSave = await fetch(`http://127.0.0.1:${port}/api/state`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${raniCookie}` },
       body: JSON.stringify(raniUpdate),
     });
+    assert.equal(raniSave.status, 200);
+
+    const tamperedManifestState = structuredClone(raniUpdate);
+    tamperedManifestState.manifests[0].id = 'forged-manifest';
+    const tamperedManifest = await fetch(`http://127.0.0.1:${port}/api/state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${raniCookie}` },
+      body: JSON.stringify(tamperedManifestState),
+    });
+    assert.equal(tamperedManifest.status, 403);
+
+    const newManifestState = structuredClone(raniUpdate);
+    const createdAt = new Date().toISOString();
+    const newManifest = { id: 'OG-TEST-001', shop: "D'Fixer Store", courier: 'JNE', date: createdAt.slice(0, 10), location: 'Gudang', status: 'OPEN', createdAt, createdBy: 'Rani Admin', source: 'manual', packages: [{ order: 'ORD-TEST', tracking: 'JNE-TEST-001', status: 'EXPECTED', scannedAt: null }], scans: [], sessions: [] };
+    newManifestState.manifests.unshift(newManifest);
+    newManifestState.audit.unshift({ id: 'AU-MANIFEST-TEST', actor: 'Rani Admin', action: 'Manifest dibuat manual dengan 1 paket', object: newManifest.id, createdAt });
+    const createManifest = await fetch(`http://127.0.0.1:${port}/api/state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${raniCookie}` },
+      body: JSON.stringify(newManifestState),
+    });
+    assert.equal(createManifest.status, 200);
+
+    const importState = structuredClone(newManifestState);
+    const importedAt = new Date().toISOString();
+    const importJob = { id: 'IMP-TEST-001', fileName: 'orders.csv', total: 1, valid: 1, failed: 0, manifestCount: 1, createdAt: importedAt, errors: [] };
+    importState.manifests.unshift({ id: 'OG-TEST-002', shop: "D'Fixer Store", courier: 'JNE', date: importedAt.slice(0, 10), location: 'Gudang', status: 'OPEN', createdAt: importedAt, createdBy: 'Rani Admin', source: importJob.fileName, packages: [{ order: 'ORD-IMPORT', tracking: 'JNE-IMPORT-001', status: 'EXPECTED', scannedAt: null }], scans: [], sessions: [] });
+    importState.importJobs.unshift(importJob);
+    importState.audit.unshift({ id: 'AU-IMPORT-TEST', actor: 'Rani Admin', action: 'Impor orders.csv: 1 valid, 0 ditolak', object: importJob.id, createdAt: importedAt });
+    const importSave = await fetch(`http://127.0.0.1:${port}/api/state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${raniCookie}` },
+      body: JSON.stringify(importState),
+    });
+    assert.equal(importSave.status, 200);
 
     const mayaLogin = await fetch(`http://127.0.0.1:${port}/api/login`, {
       method: 'POST',
@@ -174,25 +363,29 @@ test('tenant state is isolated and legacy D\'Fixer data is preserved', async () 
     const mayaInitialState = await fetch(`http://127.0.0.1:${port}/api/state`, {
       headers: { Cookie: `orderguard_session=${mayaCookie}` },
     }).then((response) => response.json());
-    assert.equal(mayaInitialState.marker, undefined);
     assert.equal(mayaInitialState.manifests[0].shop, 'Maya Commerce');
-    assert.equal(mayaInitialState.manifests.some((manifest) => manifest.id === 'rani-only'), false);
+    assert.equal(mayaInitialState.incidents.some((incident) => incident.id === raniIncident.id), false);
 
-    await fetch(`http://127.0.0.1:${port}/api/state`, {
+    const mayaState = structuredClone(mayaInitialState);
+    const mayaIncident = { id: 'INC-MAYA-ONLY', category: 'Masalah lain', manifestId: '', tracking: '', description: 'Insiden tenant Maya saja', reportedBy: 'Maya Admin', createdAt: new Date().toISOString(), status: 'OPEN', resolution: '' };
+    mayaState.incidents.unshift(mayaIncident);
+    mayaState.audit.unshift({ id: 'AU-MAYA-ONLY', actor: 'Maya Admin', action: 'Insiden dicatat: Masalah lain', object: mayaIncident.id, createdAt: mayaIncident.createdAt });
+    const mayaSave = await fetch(`http://127.0.0.1:${port}/api/state`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${mayaCookie}` },
-      body: JSON.stringify({ manifests: [], incidents: [], audit: [], importJobs: [], tenantId: 'dfixer-store', marker: 'maya-state' }),
+      body: JSON.stringify(mayaState),
     });
+    assert.equal(mayaSave.status, 200);
 
     const raniAfterMayaUpdate = await fetch(`http://127.0.0.1:${port}/api/state`, {
       headers: { Cookie: `orderguard_session=${raniCookie}` },
     }).then((response) => response.json());
-    assert.equal(raniAfterMayaUpdate.marker, 'rani-state');
+    assert.equal(raniAfterMayaUpdate.incidents.some((incident) => incident.id === mayaIncident.id), false);
 
     const mayaAfterUpdate = await fetch(`http://127.0.0.1:${port}/api/state`, {
       headers: { Cookie: `orderguard_session=${mayaCookie}` },
     }).then((response) => response.json());
-    assert.equal(mayaAfterUpdate.marker, 'maya-state');
+    assert.equal(mayaAfterUpdate.incidents.some((incident) => incident.id === mayaIncident.id), true);
   } finally {
     await stopTestServer(server);
   }
@@ -221,6 +414,22 @@ test('employee management is super-admin only and updates credentials and access
       headers: { Cookie: `orderguard_session=${storeAdmin.cookie}` },
     });
     assert.equal(forbidden.status, 403);
+
+    const storeState = await fetch(`http://127.0.0.1:${port}/api/state`, {
+      headers: { Cookie: `orderguard_session=${storeAdmin.cookie}` },
+    }).then((response) => response.json());
+    const tamperedAudit = structuredClone(storeState);
+    tamperedAudit.audit[0].action = 'Audit lama diubah';
+    const auditTamper = await fetch(`http://127.0.0.1:${port}/api/state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${storeAdmin.cookie}` },
+      body: JSON.stringify(tamperedAudit),
+    });
+    assert.equal(auditTamper.status, 403);
+    const stateAfterTamper = await fetch(`http://127.0.0.1:${port}/api/state`, {
+      headers: { Cookie: `orderguard_session=${storeAdmin.cookie}` },
+    }).then((response) => response.json());
+    assert.deepEqual(stateAfterTamper, storeState);
 
     const platformAdmin = await loginAs('admin', 'admin123');
     const listResponse = await fetch(`http://127.0.0.1:${port}/api/users`, {

@@ -209,7 +209,8 @@ function getAllowedViews() {
 }
 
 function hasAccess(view) {
-  return getAllowedViews().includes(view);
+  const requiredView = view === 'manifest-detail' ? 'manifests' : view;
+  return getAllowedViews().includes(requiredView);
 }
 
 function ensureAccess(view) {
@@ -226,13 +227,22 @@ async function persist() {
   const snapshot = JSON.stringify(state);
   localStorage.setItem(tenantStorageKey(), snapshot);
   try {
-    await fetch('/api/state', {
+    const response = await fetch('/api/state', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: snapshot,
     });
+    if (!response.ok) {
+      const result = await response.json().catch(() => ({}));
+      await hydrateStateFromServer();
+      renderPage();
+      toast(result.error || 'Perubahan ditolak oleh server.', true);
+      return false;
+    }
+    return true;
   } catch (error) {
     console.warn('Gagal menyimpan state ke backend.', error);
+    return false;
   }
 }
 

@@ -5,7 +5,9 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test backend.test.js"
+    "test": "node --test backend.test.js",
+    "db:backup": "node scripts/backup.js",
+    "db:restore": "node scripts/restore.js"
   },
   "dependencies": {
     "better-sqlite3": "^11.7.0",
