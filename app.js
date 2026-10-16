@@ -8,9 +8,10 @@ const VIEW_LABELS = {
   incidents: "Insiden",
   reports: "Laporan",
   audit: "Audit log",
+  employees: "Karyawan",
 };
 const ROLE_PERMISSIONS = {
-  'super-admin': ['dashboard', 'manifests', 'imports', 'incidents', 'reports', 'audit'],
+  'super-admin': ['dashboard', 'manifests', 'imports', 'incidents', 'reports', 'audit', 'employees'],
   'store-admin': ['dashboard', 'manifests', 'imports', 'incidents', 'reports', 'audit'],
   'handover-staff': ['dashboard', 'manifests'],
 };
@@ -67,7 +68,7 @@ const statusClass = (status) => ({
   REJECTED: "exception",
 }[status] || "");
 
-function sampleState() {
+function sampleState(shopName = "D'Fixer Store") {
   const today = todayISO();
   const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
   const firstId = `OG-${today.replaceAll("-", "").slice(2)}-042`;
@@ -87,8 +88,8 @@ function sampleState() {
   ].map(([order, tracking, status]) => ({ order, tracking, status, scannedAt: null }));
   return {
     manifests: [
-      { id: firstId, shop: "D'Fixer Store", courier: "J&T Express", location: "Gudang Jakarta Selatan", date: today, status: "HANDOVER_IN_PROGRESS", createdAt: nowISO(), createdBy: ACTOR, packages: firstPackages, scans: ["SPXID028451101", "SPXID028451102"].map((tracking) => ({ tracking, result: "MATCH", createdAt: nowISO(), actor: ACTOR })), sessions: [] },
-      { id: secondId, shop: "D'Fixer Store", courier: "JNE", location: "Gudang Jakarta Selatan", date: yesterday, status: "PARTIALLY_HANDED_OVER", createdAt: new Date(Date.now() - 86400000).toISOString(), createdBy: ACTOR, packages: secondPackages, scans: [], sessions: [{ id: `TR-${yesterday.replaceAll("-", "")}-01`, receiver: "Budi Santoso", actor: ACTOR, createdAt: new Date(Date.now() - 86400000 + 3600000).toISOString(), note: "Pengambilan tahap pertama", items: ["JNE0008114201", "JNE0008114202"], evidence: null }] },
+      { id: firstId, shop: shopName, courier: "J&T Express", location: "Gudang Jakarta Selatan", date: today, status: "HANDOVER_IN_PROGRESS", createdAt: nowISO(), createdBy: ACTOR, packages: firstPackages, scans: ["SPXID028451101", "SPXID028451102"].map((tracking) => ({ tracking, result: "MATCH", createdAt: nowISO(), actor: ACTOR })), sessions: [] },
+      { id: secondId, shop: shopName, courier: "JNE", location: "Gudang Jakarta Selatan", date: yesterday, status: "PARTIALLY_HANDED_OVER", createdAt: new Date(Date.now() - 86400000).toISOString(), createdBy: ACTOR, packages: secondPackages, scans: [], sessions: [{ id: `TR-${yesterday.replaceAll("-", "")}-01`, receiver: "Budi Santoso", actor: ACTOR, createdAt: new Date(Date.now() - 86400000 + 3600000).toISOString(), note: "Pengambilan tahap pertama", items: ["JNE0008114201", "JNE0008114202"], evidence: null }] },
     ],
     incidents: [{ id: "INC-2601", category: "Paket di luar manifest", manifestId: firstId, tracking: "SPXID028451199", description: "Resi terbaca saat proses sortir, belum ditambahkan ke manifest.", reportedBy: ACTOR, createdAt: nowISO(), status: "OPEN", resolution: "" }],
     audit: [
@@ -100,9 +101,9 @@ function sampleState() {
   };
 }
 
-function loadState() {
+function loadState(storageKey = STORAGE_KEY, shopName = "D'Fixer Store") {
   try {
-    const saved = localStorage.getItem(STORAGE_KEY);
+    const saved = localStorage.getItem(storageKey);
     if (saved) {
       const parsed = JSON.parse(saved);
       return { manifests: [], incidents: [], audit: [], importJobs: [], ...parsed };
@@ -110,9 +111,19 @@ function loadState() {
   } catch (error) {
     console.warn("Data lokal tidak dapat dibaca.", error);
   }
-  const initial = sampleState();
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(initial));
-  return initial;
+  return sampleState(shopName);
+}
+
+const tenantStorageKey = () => `${STORAGE_KEY}:${currentUser?.tenantId || 'anonymous'}`;
+
+function activateTenantCache() {
+  const storageKey = tenantStorageKey();
+  let tenantState = loadState(storageKey, currentUser.tenantName);
+  if (!localStorage.getItem(storageKey) && currentUser.tenantId === 'dfixer-store') {
+    tenantState = loadState(STORAGE_KEY, currentUser.tenantName);
+  }
+  Object.keys(state).forEach((key) => delete state[key]);
+  Object.assign(state, tenantState);
 }
 
 async function hydrateStateFromServer() {
@@ -121,7 +132,7 @@ async function hydrateStateFromServer() {
     if (!response.ok) return;
     const remote = await response.json();
     if (remote && Array.isArray(remote.manifests)) {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(remote));
+      localStorage.setItem(tenantStorageKey(), JSON.stringify(remote));
       Object.assign(state, remote);
     }
   } catch (error) {
@@ -129,7 +140,7 @@ async function hydrateStateFromServer() {
   }
 }
 
-const state = loadState();
+const state = { manifests: [], incidents: [], audit: [], importJobs: [] };
 let currentUser = null;
 let currentView = "dashboard";
 let selectedManifestId = null;
@@ -138,6 +149,7 @@ let lastImportJob = null;
 let cameraStream = null;
 let cameraFrameId = null;
 let lastCameraValue = "";
+let employeeDirectory = { users: [], tenants: [], activity: [] };
 const content = document.querySelector("#page-content");
 const modalBackdrop = document.querySelector("#modal-backdrop");
 const modal = document.querySelector("#modal");
@@ -148,7 +160,10 @@ async function getSession() {
     if (!response.ok) return null;
     const data = await response.json();
     currentUser = data.user;
-    if (currentUser) localStorage.setItem(CURRENT_USER_KEY, JSON.stringify(currentUser));
+    if (currentUser) {
+      localStorage.setItem(CURRENT_USER_KEY, JSON.stringify(currentUser));
+      activateTenantCache();
+    }
     else localStorage.removeItem(CURRENT_USER_KEY);
     return currentUser;
   } catch (error) {
@@ -172,6 +187,7 @@ async function login(username, password) {
 
   currentUser = data.user;
   localStorage.setItem(CURRENT_USER_KEY, JSON.stringify(currentUser));
+  activateTenantCache();
   await hydrateStateFromServer();
   currentView = 'dashboard';
   selectedManifestId = null;
@@ -208,7 +224,7 @@ function ensureAccess(view) {
 
 async function persist() {
   const snapshot = JSON.stringify(state);
-  localStorage.setItem(STORAGE_KEY, snapshot);
+  localStorage.setItem(tenantStorageKey(), snapshot);
   try {
     await fetch('/api/state', {
       method: 'POST',
@@ -221,7 +237,7 @@ async function persist() {
 }
 
 function logAudit(action, object) {
-  state.audit.unshift({ id: makeId("AU"), actor: ACTOR, action, object, createdAt: nowISO() });
+  state.audit.unshift({ id: makeId("AU"), actor: currentUser?.name || ACTOR, action, object, createdAt: nowISO() });
   state.audit = state.audit.slice(0, 5000);
 }
 
@@ -309,6 +325,7 @@ function renderLogin() {
             <button type="button" class="mini-role" data-role="admin" data-user="admin" data-pass="admin123">admin / admin123</button>
             <button type="button" class="mini-role" data-role="rani" data-user="rani" data-pass="rani123">rani / rani123</button>
             <button type="button" class="mini-role" data-role="handover" data-user="handover" data-pass="handover123">handover / handover123</button>
+            <button type="button" class="mini-role" data-role="maya" data-user="maya" data-pass="maya123">maya / maya123</button>
           </div>
           <button class="button button-primary" type="submit" style="width:100%"><i data-lucide="log-in"></i> Masuk</button>
         </form>
@@ -338,6 +355,9 @@ function renderPage() {
   if (document.querySelector('#user-role-label')) {
     document.querySelector('#user-role-label').textContent = roleText;
   }
+  document.querySelector('#workspace-tenant-name').textContent = currentUser.tenantName || 'Tenant';
+  document.querySelector('#profile-user-name').textContent = currentUser.name;
+  document.querySelector('#profile-user-role').textContent = roleText;
   document.querySelector("#breadcrumb-current").textContent = selectedManifestId && currentView === "manifest-detail" ? selectedManifestId : VIEW_LABELS[currentView] || "Manifest";
   document.querySelector("#nav-manifest-count").textContent = state.manifests.filter((manifest) => !["CLOSED", "CANCELLED"].includes(computedManifestStatus(manifest))).length;
   document.querySelector("#nav-incident-count").textContent = state.incidents.filter((incident) => incident.status === "OPEN").length;
@@ -348,6 +368,7 @@ function renderPage() {
     incidents: renderIncidents,
     reports: renderReports,
     audit: renderAudit,
+    employees: renderEmployees,
     "manifest-detail": () => renderManifestDetail(getManifest(selectedManifestId)),
   };
   (renderers[currentView] || renderDashboard)();
@@ -408,7 +429,7 @@ function renderDashboard() {
         <div class="activity-strip"><i data-lucide="shield-check"></i><p>Jumlah diterima dihitung dari daftar resi di sesi serah terima terkonfirmasi, bukan dari angka yang diketik.</p></div>
       </section>
     </div>
-    <div class="footer-note">Data demo tersimpan hanya di browser ini. Jangan gunakan untuk transaksi operasional nyata sebelum backend, autentikasi, dan kontrol akses tenant diterapkan.</div>`;
+    <div class="footer-note">Data demo tersimpan di server dan dipisahkan per tenant. Gunakan akun demo saja; kredensial dan pengelolaan tenant belum disiapkan untuk produksi.</div>`;
 }
 
 function renderManifests() {
@@ -602,7 +623,7 @@ function nextManifestId(date) {
 }
 
 function createManifest({ shop, courier, date, location, parcels, source = "manual" }) {
-  const manifest = { id: nextManifestId(date), shop, courier, date, location: location || "Lokasi belum ditentukan", status: "OPEN", createdAt: nowISO(), createdBy: ACTOR, source, packages: parcels.map((parcel) => ({ ...parcel, status: "EXPECTED", scannedAt: null })), scans: [], sessions: [] };
+  const manifest = { id: nextManifestId(date), shop, courier, date, location: location || "Lokasi belum ditentukan", status: "OPEN", createdAt: nowISO(), createdBy: currentUser?.name || ACTOR, source, packages: parcels.map((parcel) => ({ ...parcel, status: "EXPECTED", scannedAt: null })), scans: [], sessions: [] };
   state.manifests.unshift(manifest);
   return manifest;
 }
@@ -683,7 +704,7 @@ function recordScan(manifest, rawTracking) {
     const handedElsewhere = state.manifests.some((other) => other.id !== manifest.id && other.packages.some((item) => normalize(item.tracking) === normalize(tracking) && item.status === "HANDED_OVER"));
     result = handedElsewhere ? "ALREADY_HANDED_OVER" : "NOT_IN_MANIFEST";
   }
-  manifest.scans.push({ tracking, result, createdAt: nowISO(), actor: ACTOR });
+  manifest.scans.push({ tracking, result, createdAt: nowISO(), actor: currentUser?.name || ACTOR });
   if (result === "NOT_IN_MANIFEST") logAudit(`Pemindaian di luar manifest: ${tracking}`, manifest.id);
   else if (result === "MATCH") logAudit(`Paket dipindai: ${tracking}`, manifest.id);
   persist();
@@ -734,14 +755,14 @@ async function confirmHandover(form) {
     try { evidence = await loadImageData(photo); }
     catch (error) { return toast(error.message, true); }
   }
-  const session = { id: makeId("TR"), receiver, actor: ACTOR, createdAt: nowISO(), note: String(formData.get("note") || "").trim(), items: [...accepted], evidence };
+  const session = { id: makeId("TR"), receiver, actor: currentUser?.name || ACTOR, createdAt: nowISO(), note: String(formData.get("note") || "").trim(), items: [...accepted], evidence };
   accepted.forEach((tracking) => {
     const parcel = manifest.packages.find((item) => item.tracking === tracking);
     parcel.status = "HANDED_OVER";
   });
   rejected.forEach((parcel) => {
     parcel.status = "REJECTED";
-    state.incidents.unshift({ id: makeId("INC"), category: "Paket ditolak kurir", manifestId: manifest.id, tracking: parcel.tracking, description: `Paket ditolak oleh ${receiver} saat sesi ${session.id}.`, reportedBy: ACTOR, createdAt: nowISO(), status: "OPEN", resolution: "" });
+    state.incidents.unshift({ id: makeId("INC"), category: "Paket ditolak kurir", manifestId: manifest.id, tracking: parcel.tracking, description: `Paket ditolak oleh ${receiver} saat sesi ${session.id}.`, reportedBy: currentUser?.name || ACTOR, createdAt: nowISO(), status: "OPEN", resolution: "" });
   });
   manifest.sessions.push(session);
   manifest.status = getManifestCounts(manifest).outstanding === 0 ? "CONFIRMED" : "PARTIALLY_HANDED_OVER";
@@ -828,6 +849,115 @@ function renderAudit() {
     <div class="footer-note">Audit log pada versi demo ini tersimpan di penyimpanan browser, bukan log server yang immutable. Pengguna dengan akses ke browser dapat mengubah data lokal.</div>`;
 }
 
+function employeeRow(employee) {
+  const tenant = employeeDirectory.tenants.find((item) => item.id === employee.tenantId);
+  const roles = { 'super-admin': 'Platform Admin', 'store-admin': 'Store Admin', 'handover-staff': 'Handover Staff' };
+  return `<tr><td><span class="cell-primary">${escapeHtml(employee.name)}</span><span class="cell-secondary">${escapeHtml(employee.username)}</span></td><td>${escapeHtml(roles[employee.role] || employee.role)}</td><td>${escapeHtml(tenant?.name || employee.tenantId)}</td><td><span class="status-pill ${employee.active ? 'confirmed' : 'closed'}">${employee.active ? 'Aktif' : 'Nonaktif'}</span></td><td><button class="table-action" data-action="edit-employee" data-id="${escapeHtml(employee.id)}"><i data-lucide="pencil"></i> Ubah</button>${employee.active && employee.id !== currentUser.id ? ` <button class="table-action" data-action="deactivate-employee" data-id="${escapeHtml(employee.id)}"><i data-lucide="user-round-x"></i> Nonaktifkan</button>` : ''}</td></tr>`;
+}
+
+async function renderEmployees() {
+  const headingActions = '<button class="button button-secondary" data-action="new-tenant"><i data-lucide="building-2"></i> Tambah tenant</button><button class="button button-primary" data-action="new-employee"><i data-lucide="user-plus"></i> Tambah karyawan</button>';
+  const loadingActions = '<button class="button button-secondary" disabled><i data-lucide="building-2"></i> Tambah tenant</button><button class="button button-primary" disabled><i data-lucide="user-plus"></i> Tambah karyawan</button>';
+  content.innerHTML = `${pageHeading("ADMINISTRASI", "Karyawan dan tenant", "Kelola akun, peran, serta organisasi yang menggunakan OrderGuard.", loadingActions)}<section class="panel"><div class="section-toolbar"><label class="search-box"><i data-lucide="search"></i><input id="employee-search" type="search" placeholder="Cari nama atau username" aria-label="Cari karyawan" /></label><span class="cell-secondary">Memuat daftar karyawan...</span></div></section>`;
+  try {
+    const response = await fetch('/api/users', { credentials: 'same-origin' });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'Daftar karyawan tidak dapat dimuat.');
+    employeeDirectory = data;
+    if (currentView !== 'employees') return;
+    const rows = employeeDirectory.users.map(employeeRow).join('');
+    const tenantRows = employeeDirectory.tenants.map((tenant) => `<tr><td><span class="cell-primary">${escapeHtml(tenant.name)}</span><span class="cell-secondary">${escapeHtml(tenant.id)}</span></td><td>${tenant.employeeCount} akun</td><td><button class="table-action" data-action="edit-tenant" data-id="${escapeHtml(tenant.id)}"><i data-lucide="pencil"></i> Ubah nama</button></td></tr>`).join('');
+    const activityRows = employeeDirectory.activity.map((entry) => `<div class="audit-entry"><span class="audit-icon"><i data-lucide="users-round"></i></span><p><strong>${escapeHtml(entry.actorName)}</strong> ${escapeHtml(entry.action)}<span class="cell-secondary">Akun: ${escapeHtml(entry.targetUserId)}</span></p><small>${formatDateTime(entry.createdAt)}</small></div>`).join('');
+    const tenantActivityRows = employeeDirectory.tenantActivity.map((entry) => `<div class="audit-entry"><span class="audit-icon"><i data-lucide="building-2"></i></span><p><strong>${escapeHtml(entry.actorName)}</strong> ${escapeHtml(entry.action)}<span class="cell-secondary">Tenant: ${escapeHtml(entry.tenantId)}</span></p><small>${formatDateTime(entry.createdAt)}</small></div>`).join('');
+    content.innerHTML = `${pageHeading("ADMINISTRASI", "Karyawan dan tenant", "Kelola akun, peran, serta organisasi yang menggunakan OrderGuard.", headingActions)}<section class="panel"><div class="section-toolbar"><label class="search-box"><i data-lucide="search"></i><input id="employee-search" type="search" placeholder="Cari nama atau username" aria-label="Cari karyawan" /></label><span class="cell-secondary">${employeeDirectory.users.length} akun</span></div><div class="table-wrap"><table><thead><tr><th>NAMA / USERNAME</th><th>PERAN</th><th>TENANT</th><th>STATUS</th><th>AKSI</th></tr></thead><tbody id="employee-table-body">${rows || '<tr><td colspan="5">Belum ada karyawan.</td></tr>'}</tbody></table></div></section><section class="panel"><div class="panel-heading"><div><h2>Tenant</h2><p>${employeeDirectory.tenants.length} organisasi terdaftar</p></div></div><div class="table-wrap"><table><thead><tr><th>NAMA / ID TENANT</th><th>KARYAWAN</th><th>AKSI</th></tr></thead><tbody>${tenantRows || '<tr><td colspan="3">Belum ada tenant.</td></tr>'}</tbody></table></div></section><section class="panel"><div class="panel-heading"><div><h2>Aktivitas administrasi</h2><p>Perubahan tenant dan akun terbaru</p></div></div>${tenantActivityRows}${activityRows || '<p class="page-subtitle">Belum ada perubahan akun.</p>'}</section>`;
+    renderIcons(content);
+  } catch (error) {
+    if (currentView === 'employees') {
+      content.innerHTML = `${pageHeading("ADMINISTRASI", "Karyawan", "Kelola akun, peran, dan tenant yang dapat diakses.")}<section class="panel">${emptyState("users-round", "Daftar karyawan tidak tersedia", error.message)}</section>`;
+      renderIcons(content);
+    }
+  }
+}
+
+function filterEmployees() {
+  const body = document.querySelector('#employee-table-body');
+  if (!body) return;
+  const query = normalize(document.querySelector('#employee-search')?.value || '');
+  const matching = employeeDirectory.users.filter((employee) => normalize(`${employee.name} ${employee.username} ${employee.tenantId}`).includes(query));
+  body.innerHTML = matching.map(employeeRow).join('') || '<tr><td colspan="5">Tidak ada karyawan yang cocok.</td></tr>';
+  renderIcons(body);
+}
+
+function openEmployeeModal(id = '') {
+  const employee = employeeDirectory.users.find((item) => item.id === id);
+  const editing = Boolean(employee);
+  const isSelf = employee?.id === currentUser.id;
+  const roleOptions = [['super-admin', 'Platform Admin'], ['store-admin', 'Store Admin'], ['handover-staff', 'Handover Staff']].map(([value, label]) => `<option value="${value}" ${employee?.role === value ? 'selected' : ''}>${label}</option>`).join('');
+  const tenantOptions = employeeDirectory.tenants.map((tenant) => `<option value="${escapeHtml(tenant.id)}" ${employee?.tenantId === tenant.id ? 'selected' : ''}>${escapeHtml(tenant.name)}</option>`).join('');
+  openModal(editing ? 'Ubah karyawan' : 'Tambah karyawan', editing ? 'Perbarui identitas dan akses akun.' : 'Buat akun dan tetapkan peran serta tenant.', `<form class="modal-form" id="employee-form" data-id="${escapeHtml(id)}"><div class="modal-grid"><div class="field"><label for="employee-name">Nama lengkap <span class="required-mark">*</span></label><input id="employee-name" name="name" required maxlength="100" value="${escapeHtml(employee?.name || '')}" /></div><div class="field"><label for="employee-username">Username <span class="required-mark">*</span></label><input id="employee-username" name="username" required minlength="3" maxlength="32" pattern="[A-Za-z0-9._-]+" value="${escapeHtml(employee?.username || '')}" /></div><div class="field"><label for="employee-role">Peran <span class="required-mark">*</span></label><select id="employee-role" name="role" ${isSelf ? 'disabled' : ''}>${roleOptions}</select></div><div class="field"><label for="employee-tenant">Tenant <span class="required-mark">*</span></label><select id="employee-tenant" name="tenantId" ${isSelf ? 'disabled' : ''}>${tenantOptions}</select></div><div class="field"><label for="employee-password">${editing ? 'Kata sandi baru' : 'Kata sandi awal'} ${editing ? '' : '<span class="required-mark">*</span>'}</label><input id="employee-password" name="password" type="password" ${editing ? '' : 'required'} minlength="8" autocomplete="new-password" /><span class="field-help">${editing ? 'Kosongkan jika tidak ingin mengganti sandi.' : 'Minimal 8 karakter.'}</span></div>${editing ? `<label class="field"><span>Status akun</span><span><input type="checkbox" name="active" ${employee.active ? 'checked' : ''} ${isSelf ? 'disabled' : ''} /> Aktif</span></label>` : ''}</div><div class="modal-actions"><button type="button" class="button button-secondary" data-action="close-modal">Batal</button><button type="submit" class="button button-primary"><i data-lucide="save"></i> Simpan</button></div></form>`);
+}
+
+function openTenantModal(id = '') {
+  const tenant = employeeDirectory.tenants.find((item) => item.id === id);
+  const editing = Boolean(tenant);
+  openModal(editing ? 'Ubah tenant' : 'Tambah tenant', editing ? 'ID tenant tetap untuk menjaga kaitan akun dan data.' : 'Daftarkan organisasi baru untuk OrderGuard.', `<form class="modal-form" id="tenant-form" data-id="${escapeHtml(id)}"><div class="field"><label for="tenant-name">Nama tenant <span class="required-mark">*</span></label><input id="tenant-name" name="name" required minlength="2" maxlength="100" value="${escapeHtml(tenant?.name || '')}" /></div><div class="field"><label for="tenant-id">ID tenant <span class="required-mark">*</span></label><input id="tenant-id" name="id" required minlength="2" maxlength="50" pattern="[a-z0-9]+(-[a-z0-9]+)*" placeholder="contoh: toko-baru" value="${escapeHtml(tenant?.id || '')}" ${editing ? 'readonly' : ''} /><span class="field-help">Huruf kecil, angka, dan tanda hubung. ID tenant tidak dapat diubah setelah dibuat.</span></div><div class="modal-actions"><button type="button" class="button button-secondary" data-action="close-modal">Batal</button><button type="submit" class="button button-primary"><i data-lucide="save"></i> Simpan</button></div></form>`);
+}
+
+async function saveTenant(form) {
+  const formData = new FormData(form);
+  const editing = Boolean(form.dataset.id);
+  const endpoint = editing ? `/api/tenants/${encodeURIComponent(form.dataset.id)}` : '/api/tenants';
+  const payload = editing
+    ? { name: String(formData.get('name') || '').trim() }
+    : { id: String(formData.get('id') || '').trim(), name: String(formData.get('name') || '').trim() };
+  const response = await fetch(endpoint, {
+    method: editing ? 'PATCH' : 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'same-origin',
+    body: JSON.stringify(payload),
+  });
+  const result = await response.json();
+  if (!response.ok) throw new Error(result.error || 'Tenant gagal disimpan.');
+  closeModal();
+  toast(editing ? 'Nama tenant diperbarui.' : 'Tenant berhasil ditambahkan.');
+  await renderEmployees();
+}
+
+async function saveEmployee(form) {
+  const formData = new FormData(form);
+  const payload = { name: String(formData.get('name') || '').trim(), username: String(formData.get('username') || '').trim() };
+  const role = form.querySelector('[name="role"]');
+  const tenant = form.querySelector('[name="tenantId"]');
+  const active = form.querySelector('[name="active"]');
+  if (role && !role.disabled) payload.role = role.value;
+  if (tenant && !tenant.disabled) payload.tenantId = tenant.value;
+  if (active && !active.disabled) payload.active = active.checked;
+  const password = String(formData.get('password') || '');
+  if (password) payload.password = password;
+  const editing = Boolean(form.dataset.id);
+  const response = await fetch(editing ? `/api/users/${encodeURIComponent(form.dataset.id)}` : '/api/users', {
+    method: editing ? 'PATCH' : 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'same-origin',
+    body: JSON.stringify(payload),
+  });
+  const result = await response.json();
+  if (!response.ok) throw new Error(result.error || 'Perubahan karyawan gagal disimpan.');
+  closeModal();
+  toast(editing ? 'Data karyawan diperbarui.' : 'Karyawan berhasil ditambahkan.');
+  await renderEmployees();
+}
+
+async function deactivateEmployee(id) {
+  const employee = employeeDirectory.users.find((item) => item.id === id);
+  if (!employee || !window.confirm(`Nonaktifkan akun ${employee.name} (${employee.username})?`)) return;
+  const response = await fetch(`/api/users/${encodeURIComponent(id)}`, { method: 'DELETE', credentials: 'same-origin' });
+  const result = await response.json();
+  if (!response.ok) return toast(result.error || 'Akun gagal dinonaktifkan.', true);
+  toast('Akun karyawan dinonaktifkan.');
+  await renderEmployees();
+}
+
 function openNewManifestModal() {
   openModal("Buat manifest manual", "Tambahkan paket yang akan diserahkan ke kurir.", `<form class="modal-form" id="new-manifest-form"><div class="modal-grid"><div class="field"><label for="new-shop">Toko <span class="required-mark">*</span></label><input id="new-shop" name="shop" required value="D'Fixer Store" /></div><div class="field"><label for="new-courier">Kurir / ekspedisi <span class="required-mark">*</span></label><input id="new-courier" name="courier" required placeholder="Contoh: J&T Express" /></div><div class="field"><label for="new-date">Tanggal rencana <span class="required-mark">*</span></label><input id="new-date" name="date" type="date" required value="${todayISO()}" /></div><div class="field"><label for="new-location">Lokasi</label><input id="new-location" name="location" placeholder="Gudang / titik serah" /></div></div><div class="field"><label for="new-parcels">Nomor resi <span class="required-mark">*</span></label><textarea id="new-parcels" name="parcels" required placeholder="Satu nomor resi per baris"></textarea><span class="field-help">Nomor resi duplikat atau yang sudah ada pada manifest aktif akan ditolak.</span></div><div class="modal-actions"><button type="button" class="button button-secondary" data-action="close-modal">Batal</button><button type="submit" class="button button-primary"><i data-lucide="plus"></i> Buat manifest</button></div></form>`);
 }
@@ -860,7 +990,7 @@ function openNewIncidentModal() {
 
 function submitIncident(form) {
   const data = new FormData(form);
-  const incident = { id: makeId("INC"), category: String(data.get("category")), manifestId: String(data.get("manifestId") || ""), tracking: String(data.get("tracking") || "").trim(), description: String(data.get("description") || "").trim(), reportedBy: ACTOR, createdAt: nowISO(), status: "OPEN", resolution: "" };
+  const incident = { id: makeId("INC"), category: String(data.get("category")), manifestId: String(data.get("manifestId") || ""), tracking: String(data.get("tracking") || "").trim(), description: String(data.get("description") || "").trim(), reportedBy: currentUser?.name || ACTOR, createdAt: nowISO(), status: "OPEN", resolution: "" };
   state.incidents.unshift(incident);
   logAudit(`Insiden dicatat: ${incident.category}`, incident.id);
   persist();
@@ -883,7 +1013,7 @@ function resolveIncident(form) {
   incident.status = "RESOLVED";
   incident.resolution = resolution;
   incident.resolvedAt = nowISO();
-  incident.resolvedBy = ACTOR;
+  incident.resolvedBy = currentUser?.name || ACTOR;
   logAudit(`Insiden diselesaikan: ${incident.category} — ${resolution}`, incident.id);
   persist();
   closeModal();
@@ -955,7 +1085,7 @@ function changeManifestStatus(id, action) {
 }
 
 function openHelp() {
-  openModal("Tentang OrderGuard", "Demo MVP untuk alur kontrol manifest dan serah terima.", `<div class="help-copy"><p><strong>Yang tersedia:</strong> impor CSV/XLSX dengan pemetaan dan laporan validasi, manifest, scanner keyboard/kamera yang didukung browser, rekonsiliasi per paket, serah terima parsial, insiden, audit log, serta ekspor CSV.</p><p><strong>Penyimpanan:</strong> data tersimpan pada localStorage browser ini. File impor dan foto bukti diproses di perangkat; pembaca XLSX dimuat dari CDN saat diperlukan.</p><p><strong>Batas demo:</strong> belum ada login, backend, isolasi tenant, otorisasi server, sinkronisasi perangkat, backup terkelola, atau log immutable. Jangan gunakan data produksi.</p><p>Untuk membaca barcode dengan kamera, gunakan browser yang mendukung BarcodeDetector dan berikan izin kamera. Scanner USB/Bluetooth keyboard serta entri manual tetap dapat digunakan.</p></div><div class="modal-actions"><button type="button" class="button button-primary" data-action="close-modal">Mengerti</button></div>`);
+  openModal("Tentang OrderGuard", "Demo MVP untuk alur kontrol manifest dan serah terima.", `<div class="help-copy"><p><strong>Yang tersedia:</strong> impor CSV/XLSX dengan pemetaan dan laporan validasi, manifest, scanner keyboard/kamera yang didukung browser, rekonsiliasi per paket, serah terima parsial, insiden, audit log, serta ekspor CSV.</p><p><strong>Penyimpanan:</strong> state utama tersimpan di SQLite server dan cache browser dipisahkan per tenant. File impor dan foto bukti diproses di perangkat; pembaca XLSX dimuat dari CDN saat diperlukan.</p><p><strong>Batas demo:</strong> akun dan kredensial bersifat demo, sesi disimpan di memori, tenant dapat dibuat dan diganti nama tetapi belum dapat dinonaktifkan/dihapus, serta backup terkelola dan log immutable belum tersedia. Jangan gunakan data produksi.</p><p>Untuk membaca barcode dengan kamera, gunakan browser yang mendukung BarcodeDetector dan berikan izin kamera. Scanner USB/Bluetooth keyboard serta entri manual tetap dapat digunakan.</p></div><div class="modal-actions"><button type="button" class="button button-primary" data-action="close-modal">Mengerti</button></div>`);
 }
 
 document.addEventListener("click", async (event) => {
@@ -986,6 +1116,11 @@ document.addEventListener("click", async (event) => {
     else if (name === "export-audit") { if (!hasAccess('audit')) return toast('Anda tidak memiliki izin untuk melihat audit log.', true); exportAudit(); }
     else if (name === "export-failed") exportFailedRows(id);
     else if (name === "view-evidence") showEvidence(id);
+    else if (name === "new-employee") { if (!hasAccess('employees')) return toast('Hanya Platform Admin yang dapat mengelola karyawan.', true); openEmployeeModal(); }
+    else if (name === "edit-employee") { if (!hasAccess('employees')) return toast('Hanya Platform Admin yang dapat mengelola karyawan.', true); openEmployeeModal(id); }
+    else if (name === "deactivate-employee") { if (!hasAccess('employees')) return toast('Hanya Platform Admin yang dapat mengelola karyawan.', true); deactivateEmployee(id).catch((error) => toast(error.message, true)); }
+    else if (name === "new-tenant") { if (!hasAccess('employees')) return toast('Hanya Platform Admin yang dapat mengelola tenant.', true); openTenantModal(); }
+    else if (name === "edit-tenant") { if (!hasAccess('employees')) return toast('Hanya Platform Admin yang dapat mengelola tenant.', true); openTenantModal(id); }
     else if (name === "close-manifest" || name === "cancel-manifest") { if (!hasAccess('imports')) return toast('Anda tidak memiliki izin untuk mengubah status manifest.', true); changeManifestStatus(id, name); }
     return;
   }
@@ -1023,11 +1158,18 @@ document.addEventListener("submit", async (event) => {
   } else if (event.target.id === "resolve-incident-form") {
     event.preventDefault();
     resolveIncident(event.target);
+  } else if (event.target.id === "employee-form") {
+    event.preventDefault();
+    saveEmployee(event.target).catch((error) => toast(error.message, true));
+  } else if (event.target.id === "tenant-form") {
+    event.preventDefault();
+    saveTenant(event.target).catch((error) => toast(error.message, true));
   }
 });
 
 document.addEventListener("input", (event) => {
   if (event.target.id === "manifest-search") filterManifestRows();
+  else if (event.target.id === "employee-search") filterEmployees();
 });
 
 document.addEventListener("change", async (event) => {

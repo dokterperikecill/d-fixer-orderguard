@@ -22,7 +22,7 @@
         </a>
         <div class="workspace-switch">
           <span class="workspace-icon">DF</span>
-          <span class="workspace-name"><strong>D'Fixer Store</strong><small>Workspace demo</small></span>
+          <span class="workspace-name"><strong id="workspace-tenant-name">D'Fixer Store</strong><small>Tenant</small></span>
           <i data-lucide="chevrons-up-down" class="workspace-chevron"></i>
         </div>
         <nav class="primary-nav" aria-label="Navigasi utama">
@@ -34,10 +34,12 @@
           <p class="nav-label nav-label-spaced">KONTROL</p>
           <button class="nav-link" data-view="reports"><i data-lucide="chart-no-axes-column-increasing"></i><span>Laporan</span></button>
           <button class="nav-link" data-view="audit"><i data-lucide="history"></i><span>Audit log</span></button>
+          <p class="nav-label nav-label-spaced">PLATFORM</p>
+          <button class="nav-link" data-view="employees"><i data-lucide="users-round"></i><span>Karyawan</span></button>
         </nav>
         <div class="sidebar-bottom">
-          <div class="local-note"><span class="status-dot"></span><span><strong>Mode lokal</strong><small>Data tersimpan di browser ini</small></span></div>
-          <button class="profile-button" type="button"><span class="avatar">RA</span><span><strong>Rani Admin</strong><small>Store Admin</small></span><i data-lucide="more-horizontal"></i></button>
+          <div class="local-note"><span class="status-dot"></span><span><strong>Penyimpanan server</strong><small>Data terisolasi per tenant</small></span></div>
+          <button class="profile-button" type="button"><span class="avatar">RA</span><span><strong id="profile-user-name">Rani Admin</strong><small id="profile-user-role">Store Admin</small></span><i data-lucide="more-horizontal"></i></button>
         </div>
       </aside>
       <main class="main-area">
