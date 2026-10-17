@@ -1237,6 +1237,11 @@ document.addEventListener("drop", async (event) => {
 });
 
 document.querySelector("#today-date").textContent = new Intl.DateTimeFormat("id-ID", { weekday: "short", day: "numeric", month: "short", year: "numeric" }).format(new Date());
+if ("serviceWorker" in navigator && window.isSecureContext) {
+  navigator.serviceWorker.register("/service-worker.js").catch((error) => {
+    console.error("Pendaftaran service worker gagal.", error);
+  });
+}
 (async () => {
   const session = await getSession();
   if (session) {

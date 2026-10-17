@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: dfixer-orderguard
+    runtime: node
+    plan: starter
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /api/health
+    disk:
+      name: orderguard-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: NODE_VERSION
+        value: 24
+      - key: NODE_ENV
+        value: production
+      - key: ORDERGUARD_DB_PATH
+        value: /var/data/orderguard.db
+      - key: ORDERGUARD_BACKUP_DIR
+        value: /var/data/backups
+      - key: ORDERGUARD_BOOTSTRAP_USERNAME
+        sync: false
+      - key: ORDERGUARD_BOOTSTRAP_NAME
+        sync: false
+      - key: ORDERGUARD_BOOTSTRAP_PASSWORD
+        sync: false

@@ -747,6 +747,19 @@ app.get('/', (req, res) => {
 
 app.get('/app.js', (req, res) => res.sendFile(path.join(appDir, 'app.js')));
 app.get('/styles.css', (req, res) => res.sendFile(path.join(appDir, 'styles.css')));
+app.get('/manifest.webmanifest', (req, res) => {
+  res.set('Cache-Control', 'no-cache');
+  res.sendFile(path.join(appDir, 'manifest.webmanifest'));
+});
+app.get('/service-worker.js', (req, res) => {
+  res.set('Cache-Control', 'no-cache');
+  res.set('Service-Worker-Allowed', '/');
+  res.sendFile(path.join(appDir, 'service-worker.js'));
+});
+app.get('/icons/:icon', (req, res) => {
+  if (!['orderguard.svg', 'icon-192.png', 'icon-512.png'].includes(req.params.icon)) return res.sendStatus(404);
+  res.sendFile(path.join(appDir, 'icons', req.params.icon));
+});
 
 app.listen(port, () => {
   console.log(`OrderGuard backend running on http://localhost:${port}`);

@@ -67,9 +67,24 @@ test('server exposes health endpoint and state API', async () => {
     const healthJson = await health.json();
     assert.equal(healthJson.status, 'ok');
     assert.equal(unauthenticatedState.status, 401);
-    assert.equal((await fetch(`http://127.0.0.1:${port}/`)).status, 200);
+    const home = await fetch(`http://127.0.0.1:${port}/`);
+    assert.equal(home.status, 200);
+    assert.match(await home.text(), /rel="manifest" href="\/manifest\.webmanifest"/);
     assert.equal((await fetch(`http://127.0.0.1:${port}/app.js`)).status, 200);
     assert.equal((await fetch(`http://127.0.0.1:${port}/styles.css`)).status, 200);
+    const manifestResponse = await fetch(`http://127.0.0.1:${port}/manifest.webmanifest`);
+    assert.equal(manifestResponse.status, 200);
+    const manifest = await manifestResponse.json();
+    assert.equal(manifest.display, 'standalone');
+    assert.deepEqual(manifest.icons.map((icon) => icon.sizes), ['192x192', '512x512']);
+    for (const icon of manifest.icons) {
+      assert.equal((await fetch(`http://127.0.0.1:${port}${icon.src}`)).status, 200);
+    }
+    const serviceWorker = await fetch(`http://127.0.0.1:${port}/service-worker.js`);
+    assert.equal(serviceWorker.status, 200);
+    assert.equal(serviceWorker.headers.get('service-worker-allowed'), '/');
+    assert.match(await serviceWorker.text(), /url\.pathname\.startsWith\("\/api\/"\)/);
+    assert.equal((await fetch(`http://127.0.0.1:${port}/icons/unknown.png`)).status, 404);
     assert.equal((await fetch(`http://127.0.0.1:${port}/server.js`)).status, 404);
     assert.equal((await fetch(`http://127.0.0.1:${port}/data/orderguard.db`)).status, 404);
     assert.equal((await fetch(`http://127.0.0.1:${port}/package-lock.json`)).status, 404);

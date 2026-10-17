@@ -1,5 +1,37 @@
 # Operasi OrderGuard
 
+## PWA dan Aplikasi Desktop
+
+Aplikasi web dapat dipasang di Android sebagai PWA setelah di-deploy melalui HTTPS. Manifest dan service worker disediakan oleh server; API `/api/` sengaja tidak disimpan ke cache, sehingga login dan sinkronisasi data tetap memerlukan koneksi ke server.
+
+Cache PWA hanya menyimpan shell aplikasi. Setelah mengubah `app.js`, `styles.css`, atau aset shell lain, naikkan versi `CACHE_NAME` di `service-worker.js` agar perangkat mengambil aset rilis terbaru.
+
+### Deploy ke Render
+
+1. Push proyek ke repository GitHub, lalu di Render pilih **New → Blueprint** dan hubungkan repository tersebut.
+2. Tinjau `render.yaml`, lalu deploy service. Konfigurasi menggunakan paket Render yang mendukung persistent disk; jangan ubah ke paket tanpa disk atau menambah instance karena SQLite hanya cocok untuk satu instance dengan disk yang sama.
+3. Saat diminta, isi `ORDERGUARD_BOOTSTRAP_USERNAME`, `ORDERGUARD_BOOTSTRAP_NAME`, dan `ORDERGUARD_BOOTSTRAP_PASSWORD` sebagai environment variable rahasia di Render. Password harus minimal 12 karakter. Jangan simpan rahasia di repository atau kirim melalui chat.
+4. Tunggu health check `/api/health` berhasil, lalu gunakan URL HTTPS `*.onrender.com` yang diberikan Render. Database dan backup diarahkan ke persistent disk `/var/data`.
+
+URL Render sudah cukup untuk uji coba dan PWA; domain pribadi bisa ditambahkan kemudian. Gunakan URL akhir yang sama saat membuat installer desktop dan konfigurasi TWA Android.
+
+Untuk installer Windows, atur URL domain HTTPS produksi saat menjalankan perintah build:
+
+```sh
+ORDERGUARD_APP_URL=https://app.domainanda.com npm run desktop:dist
+```
+
+Di Windows PowerShell:
+
+```powershell
+$env:ORDERGUARD_APP_URL = "https://app.domainanda.com"
+npm run desktop:dist
+```
+
+Installer NSIS akan dibuat di `release/desktop/`. Perintah ini perlu dijalankan di Windows untuk build Windows yang paling andal. Untuk pengembangan desktop, set `ORDERGUARD_APP_URL` ke URL HTTPS server, lalu jalankan `npm run desktop:dev`.
+
+APK Android melalui Trusted Web Activity (TWA) belum dapat dibuat sebelum domain produksi tersedia. APK memerlukan PWA yang sudah ter-deploy, konfigurasi verifikasi domain (`/.well-known/assetlinks.json`), Android SDK, dan kunci penandatanganan Android. Domain publik juga diperlukan untuk menyiapkan serta menguji file verifikasi tersebut.
+
 ## Inisialisasi Production
 
 Database baru tidak membuat akun demo. Tentukan bootstrap Platform Admin melalui environment saat menjalankan aplikasi:
