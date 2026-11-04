@@ -4,6 +4,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const Database = require('better-sqlite3');
 const { isDeepStrictEqual } = require('node:util');
+const TikTokShop = require('./tiktok-shop');
 
 const app = express();
 const port = Number(process.env.PORT || 4173);
@@ -14,6 +15,7 @@ fs.mkdirSync(dataDir, { recursive: true });
 const dbPath = process.env.ORDERGUARD_DB_PATH || path.join(dataDir, 'orderguard.db');
 fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 const db = new Database(dbPath);
+const tiktokTokenRefreshes = new Map();
 db.exec(`
   CREATE TABLE IF NOT EXISTS app_state (
     id TEXT PRIMARY KEY,
@@ -56,6 +58,36 @@ db.exec(`
     user_id TEXT NOT NULL,
     expires_at TEXT NOT NULL,
     created_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS tiktok_oauth_states (
+    state_hash TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS tiktok_connections (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    open_id TEXT NOT NULL,
+    access_token TEXT NOT NULL,
+    refresh_token TEXT NOT NULL,
+    access_token_expires_at INTEGER NOT NULL,
+    refresh_token_expires_at INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (tenant_id, open_id)
+  );
+  CREATE TABLE IF NOT EXISTS tiktok_shops (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    connection_id TEXT NOT NULL,
+    shop_id TEXT NOT NULL,
+    shop_cipher TEXT NOT NULL,
+    name TEXT NOT NULL,
+    region TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    UNIQUE (tenant_id, shop_id)
   );
   CREATE TABLE IF NOT EXISTS employee_audit (
     id TEXT PRIMARY KEY,
@@ -104,6 +136,10 @@ function signSessionToken() {
 
 function hashSessionToken(token) {
   return crypto.createHash('sha256').update(token).digest('hex');
+}
+
+function hashOpaqueValue(value) {
+  return crypto.createHash('sha256').update(value).digest('hex');
 }
 
 function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
@@ -209,6 +245,68 @@ function requireRole(requiredRoles) {
     }
     next();
   };
+}
+
+function tiktokTokenExpiry(value, now = Date.now()) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) throw new Error('Respons otorisasi TikTok Shop tidak memuat waktu kedaluwarsa token yang valid.');
+  return numeric > 1000000000 ? numeric * 1000 : now + numeric * 1000;
+}
+
+function tiktokConfigStatus() {
+  const config = TikTokShop.getConfig();
+  return { config, configured: config.missing.length === 0 };
+}
+
+function tiktokConnectionForShop(tenantId, shopId) {
+  return db.prepare(`
+    SELECT tiktok_shops.shop_id AS shopId, tiktok_shops.shop_cipher AS shopCipher,
+      tiktok_shops.name AS shopName, tiktok_shops.region,
+      tiktok_connections.id AS connectionId, tiktok_connections.open_id AS openId,
+      tiktok_connections.access_token AS accessToken,
+      tiktok_connections.refresh_token AS refreshToken,
+      tiktok_connections.access_token_expires_at AS accessTokenExpiresAt,
+      tiktok_connections.refresh_token_expires_at AS refreshTokenExpiresAt
+    FROM tiktok_shops
+    JOIN tiktok_connections ON tiktok_connections.id = tiktok_shops.connection_id
+    WHERE tiktok_shops.tenant_id = ? AND tiktok_shops.shop_id = ?
+  `).get(tenantId, shopId) || null;
+}
+
+async function ensureTikTokAccessToken(connection, config) {
+  const now = Date.now();
+  const accessToken = TikTokShop.decryptSecret(connection.accessToken, config.encryptionKey);
+  if (connection.accessTokenExpiresAt > now + 5 * 60 * 1000) return accessToken;
+  if (connection.refreshTokenExpiresAt <= now) throw new Error('Otorisasi TikTok Shop kedaluwarsa. Hubungkan ulang toko tersebut.');
+
+  const pendingRefresh = tiktokTokenRefreshes.get(connection.connectionId);
+  if (pendingRefresh) return pendingRefresh;
+
+  const refreshPromise = (async () => {
+    const refreshToken = TikTokShop.decryptSecret(connection.refreshToken, config.encryptionKey);
+    const refreshed = await TikTokShop.refreshAccessToken({ refreshToken, config });
+    if (!refreshed.access_token || !refreshed.refresh_token) throw new Error('TikTok Shop tidak mengembalikan token baru yang valid.');
+    const updatedAt = new Date().toISOString();
+    db.prepare(`
+      UPDATE tiktok_connections SET access_token = ?, refresh_token = ?,
+        access_token_expires_at = ?, refresh_token_expires_at = ?, updated_at = ?
+      WHERE id = ?
+    `).run(
+      TikTokShop.encryptSecret(refreshed.access_token, config.encryptionKey),
+      TikTokShop.encryptSecret(refreshed.refresh_token, config.encryptionKey),
+      tiktokTokenExpiry(refreshed.access_token_expire_in, now),
+      tiktokTokenExpiry(refreshed.refresh_token_expire_in, now),
+      updatedAt,
+      connection.connectionId,
+    );
+    return refreshed.access_token;
+  })();
+  tiktokTokenRefreshes.set(connection.connectionId, refreshPromise);
+  try {
+    return await refreshPromise;
+  } finally {
+    tiktokTokenRefreshes.delete(connection.connectionId);
+  }
 }
 
 function baseState(tenantName = "D'Fixer Store") {
@@ -717,6 +815,159 @@ app.post('/api/logout', (req, res) => {
   if (token) db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(hashSessionToken(token));
   res.clearCookie('orderguard_session', { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production' });
   res.json({ ok: true });
+});
+
+app.get('/api/tiktok/status', requireAuth, requireRole(['super-admin', 'store-admin']), (req, res) => {
+  const { configured, config } = tiktokConfigStatus();
+  const shops = db.prepare('SELECT COUNT(*) AS count FROM tiktok_shops WHERE tenant_id = ?').get(req.user.tenantId).count;
+  res.json({ configured, missing: configured ? [] : config.missing, connectedShops: shops });
+});
+
+app.get('/api/tiktok/connect', requireAuth, requireRole(['super-admin', 'store-admin']), (req, res) => {
+  const { configured, config } = tiktokConfigStatus();
+  if (!configured) {
+    return res.status(503).json({ error: `Integrasi TikTok Shop belum dikonfigurasi: ${config.missing.join(', ')}.` });
+  }
+  const state = crypto.randomBytes(32).toString('base64url');
+  const now = new Date();
+  db.prepare('DELETE FROM tiktok_oauth_states WHERE expires_at <= ?').run(now.toISOString());
+  db.prepare('INSERT INTO tiktok_oauth_states (state_hash, tenant_id, user_id, expires_at, created_at) VALUES (?, ?, ?, ?, ?)')
+    .run(hashOpaqueValue(state), req.user.tenantId, req.user.id, new Date(now.getTime() + 10 * 60 * 1000).toISOString(), now.toISOString());
+
+  const authorizationUrl = new URL(TikTokShop.AUTHORIZATION_URL);
+  authorizationUrl.searchParams.set('service_id', config.key);
+  authorizationUrl.searchParams.set('state', state);
+  res.set('Cache-Control', 'no-store');
+  res.redirect(302, authorizationUrl.toString());
+});
+
+app.get('/api/tiktok/callback', async (req, res) => {
+  const state = String(req.query.state || '');
+  const authCode = String(req.query.auth_code || req.query.code || '');
+  if (!state || !authCode) return res.status(400).send('Callback TikTok Shop tidak lengkap. Silakan mulai ulang proses koneksi.');
+
+  const stateHash = hashOpaqueValue(state);
+  const pending = db.prepare('SELECT tenant_id AS tenantId FROM tiktok_oauth_states WHERE state_hash = ? AND expires_at > ?')
+    .get(stateHash, new Date().toISOString());
+  db.prepare('DELETE FROM tiktok_oauth_states WHERE state_hash = ?').run(stateHash);
+  if (!pending) return res.status(400).send('Sesi koneksi TikTok Shop kedaluwarsa atau tidak valid. Silakan mulai ulang proses koneksi.');
+
+  const { configured, config } = tiktokConfigStatus();
+  if (!configured) return res.status(503).send('Integrasi TikTok Shop belum dikonfigurasi oleh administrator.');
+
+  try {
+    const tokenData = await TikTokShop.exchangeAuthorizationCode({ authCode, config });
+    if (!tokenData.access_token || !tokenData.refresh_token || !tokenData.open_id) {
+      throw new Error('Respons otorisasi TikTok Shop tidak memuat kredensial yang diwajibkan.');
+    }
+    const shopData = await TikTokShop.getAuthorizedShops({ accessToken: tokenData.access_token, config });
+    const shops = Array.isArray(shopData.shops) ? shopData.shops : [];
+    const validShops = shops.filter((shop) => shop.shop_id && shop.shop_cipher);
+    if (!validShops.length) throw new Error('Tidak ada toko berotorisasi dengan informasi toko yang lengkap.');
+
+    const now = Date.now();
+    const createdAt = new Date(now).toISOString();
+    const insertConnection = db.prepare(`
+      INSERT INTO tiktok_connections (
+        id, tenant_id, open_id, access_token, refresh_token,
+        access_token_expires_at, refresh_token_expires_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(tenant_id, open_id) DO UPDATE SET
+        access_token = excluded.access_token,
+        refresh_token = excluded.refresh_token,
+        access_token_expires_at = excluded.access_token_expires_at,
+        refresh_token_expires_at = excluded.refresh_token_expires_at,
+        updated_at = excluded.updated_at
+    `);
+    const saveConnection = db.transaction(() => {
+      insertConnection.run(
+        crypto.randomUUID(),
+        pending.tenantId,
+        String(tokenData.open_id),
+        TikTokShop.encryptSecret(tokenData.access_token, config.encryptionKey),
+        TikTokShop.encryptSecret(tokenData.refresh_token, config.encryptionKey),
+        tiktokTokenExpiry(tokenData.access_token_expire_in, now),
+        tiktokTokenExpiry(tokenData.refresh_token_expire_in, now),
+        createdAt,
+        createdAt,
+      );
+      const connection = db.prepare('SELECT id FROM tiktok_connections WHERE tenant_id = ? AND open_id = ?')
+        .get(pending.tenantId, String(tokenData.open_id));
+      db.prepare('DELETE FROM tiktok_shops WHERE connection_id = ?').run(connection.id);
+      const insertShop = db.prepare(`
+        INSERT INTO tiktok_shops (id, tenant_id, connection_id, shop_id, shop_cipher, name, region, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(tenant_id, shop_id) DO UPDATE SET
+          connection_id = excluded.connection_id,
+          shop_cipher = excluded.shop_cipher,
+          name = excluded.name,
+          region = excluded.region
+      `);
+      for (const shop of validShops) {
+        insertShop.run(
+          crypto.randomUUID(),
+          pending.tenantId,
+          connection.id,
+          String(shop.shop_id),
+          String(shop.shop_cipher),
+          String(shop.shop_name || shop.name || shop.shop_id),
+          String(shop.region || shop.region_code || ''),
+          createdAt,
+        );
+      }
+    });
+    saveConnection();
+    return res.redirect('/?view=imports&tiktok=connected');
+  } catch (error) {
+    console.error('Koneksi TikTok Shop gagal:', error.message);
+    return res.redirect('/?view=imports&tiktok=error');
+  }
+});
+
+app.get('/api/tiktok/shops', requireAuth, requireRole(['super-admin', 'store-admin']), (req, res) => {
+  const shops = db.prepare(`
+    SELECT shop_id AS shopId, name, region FROM tiktok_shops
+    WHERE tenant_id = ? ORDER BY name COLLATE NOCASE
+  `).all(req.user.tenantId);
+  res.json({ shops });
+});
+
+app.post('/api/tiktok/sync', requireAuth, requireRole(['super-admin', 'store-admin']), async (req, res) => {
+  const shopId = String(req.body?.shopId || '').trim();
+  if (!shopId) return res.status(400).json({ error: 'Pilih toko TikTok Shop terlebih dahulu.' });
+  const { configured, config } = tiktokConfigStatus();
+  if (!configured) return res.status(503).json({ error: `Integrasi TikTok Shop belum dikonfigurasi: ${config.missing.join(', ')}.` });
+  const connection = tiktokConnectionForShop(req.user.tenantId, shopId);
+  if (!connection) return res.status(404).json({ error: 'Toko TikTok Shop tidak ditemukan pada tenant ini.' });
+
+  try {
+    const accessToken = await ensureTikTokAccessToken(connection, config);
+    const orders = await TikTokShop.searchOrders({
+      accessToken,
+      shopCipher: connection.shopCipher,
+      config,
+    });
+    const date = new Date().toISOString().slice(0, 10);
+    const shopName = connection.shopName.trim().toLocaleLowerCase('id-ID');
+    const knownPackages = readState(req.user.tenantId).manifests
+      .filter((manifest) => String(manifest.shop || '').trim().toLocaleLowerCase('id-ID') === shopName)
+      .flatMap((manifest) => Array.isArray(manifest.packages) ? manifest.packages : []);
+    const { orders: eligibleOrders, withoutTracking, alreadyImported, duplicateOrders } = TikTokShop.prepareImportOrders(orders, connection.shopName, date, {
+      existingOrders: knownPackages.map((parcel) => parcel.order).filter(Boolean),
+      existingTrackings: knownPackages.map((parcel) => parcel.tracking).filter(Boolean),
+    });
+    res.json({
+      shop: { shopId: connection.shopId, name: connection.shopName },
+      fetched: orders.length,
+      withoutTracking,
+      alreadyImported,
+      duplicateOrders,
+      orders: eligibleOrders,
+    });
+  } catch (error) {
+    console.error('Sinkronisasi TikTok Shop gagal:', error.message);
+    res.status(502).json({ error: error.message || 'Sinkronisasi TikTok Shop gagal.' });
+  }
 });
 
 app.get('/api/state', requireAuth, requireRole(['super-admin', 'store-admin', 'handover-staff']), (req, res) => {

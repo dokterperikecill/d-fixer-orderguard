@@ -164,6 +164,11 @@ tbody tr:hover { background: #fbfcfa; }
 .callout p { margin: 0; font-size: 10px; line-height: 1.55; }
 .callout strong { color: #4a483c; }
 .import-layout { display: grid; grid-template-columns: minmax(0,1.35fr) minmax(250px,.65fr); gap: 15px; align-items: start; }
+.tiktok-panel { margin-bottom: 15px; }
+.tiktok-integration-actions { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; padding: 14px 18px; }
+.tiktok-integration-actions .field { min-width: min(250px,100%); }
+.tiktok-integration-actions .page-subtitle { margin: 0 auto 0 0; }
+.tiktok-panel > .field-help { margin: 0 18px 14px; }
 .import-main { padding: 18px; }
 .step-line { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; }
 .step-number { display: grid; flex: 0 0 24px; height: 24px; place-items: center; border-radius: 50%; background: var(--forest); color: white; font-size: 10px; font-weight: 700; }

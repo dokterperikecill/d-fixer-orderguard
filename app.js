@@ -150,6 +150,7 @@ let cameraStream = null;
 let cameraFrameId = null;
 let lastCameraValue = "";
 let employeeDirectory = { users: [], tenants: [], activity: [] };
+let tiktokShops = [];
 const content = document.querySelector("#page-content");
 const modalBackdrop = document.querySelector("#modal-backdrop");
 const modal = document.querySelector("#modal");
@@ -504,13 +505,74 @@ function normalizeImportDate(value) {
 function renderImports() {
   const previousJob = lastImportJob ? `<div class="callout" style="margin-bottom:14px"><i data-lucide="circle-check"></i><p><strong>Impor selesai.</strong> ${lastImportJob.valid} baris valid masuk ke ${lastImportJob.manifestCount} manifest; ${lastImportJob.failed} baris ditolak dan tercatat.${lastImportJob.failed ? ` <button class="text-button" data-action="export-failed" data-id="${escapeHtml(lastImportJob.id)}">Unduh baris gagal</button>` : ""}</p></div>` : "";
   content.innerHTML = `${pageHeading("DATA MASUK", "Impor pesanan", "Unggah CSV atau Excel, petakan kolom, lalu tinjau hasil validasi sebelum membuat manifest.")}
-    ${previousJob}<div class="import-layout"><section class="panel import-main"><div class="step-line"><span class="step-number">1</span><div><strong>Pilih file dan petakan kolom</strong><small>Data diproses di browser ini; pelanggan tidak perlu ikut diimpor.</small></div></div>
+    ${previousJob}<section class="panel history-panel tiktok-panel"><div class="panel-heading"><div><h2>Integrasi TikTok Shop</h2><p>Ambil pesanan dari toko yang sudah mengotorisasi aplikasi.</p></div></div><div id="tiktok-integration"><p class="page-subtitle">Memeriksa koneksi TikTok Shop...</p></div></section>
+    <div class="import-layout"><section class="panel import-main"><div class="step-line"><span class="step-number">1</span><div><strong>Pilih file dan petakan kolom</strong><small>Data diproses di browser ini; pelanggan tidak perlu ikut diimpor.</small></div></div>
       <label class="upload-zone" id="upload-zone" for="import-file"><span class="upload-icon"><i data-lucide="file-up"></i></span><strong>Letakkan file di sini atau pilih dari perangkat</strong><p>CSV, XLS, atau XLSX · satu baris untuk satu resi/paket</p><button class="button button-secondary button-small" type="button" id="choose-file">Pilih file</button><input id="import-file" type="file" accept=".csv,.xlsx,.xls,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel" /><span class="file-name" id="file-name">Belum ada file dipilih</span></label>
       <div id="import-mapping">${importDraft ? renderMapping() : ""}</div><div id="import-preview"></div>
     </section><aside class="import-sidebar"><div class="guide-card"><h3>Validasi sebelum manifest</h3><ul><li><i data-lucide="check"></i>Nomor pesanan, resi, dan kurir harus terisi.</li><li><i data-lucide="check"></i>Resi duplikat di file atau manifest aktif ditolak, tidak dihapus diam-diam.</li><li><i data-lucide="check"></i>Kolom toko dan jadwal dapat dipetakan untuk pengelompokan.</li><li><i data-lucide="check"></i>Hanya baris valid yang masuk ke manifest.</li></ul></div><div class="guide-note"><strong>Privasi data</strong><p>File tidak dikirim ke server. Data yang disimpan dalam demo ini tetap berada di penyimpanan browser pada perangkat yang digunakan.</p></div><div class="guide-card"><h3>Riwayat impor terakhir</h3>${state.importJobs.length ? state.importJobs.slice(0, 5).map((job) => `<div class="history-session"><div><strong>${escapeHtml(job.fileName)}</strong><small>${formatDateTime(job.createdAt)} · ${job.valid} valid · ${job.failed} ditolak</small></div></div>`).join("") : '<p class="page-subtitle">Belum ada riwayat impor.</p>'}</div></aside></div>`;
   if (importDraft) {
     document.querySelector("#file-name").textContent = importDraft.fileName;
     renderImportPreview();
+  }
+  loadTikTokIntegration();
+}
+
+async function loadTikTokIntegration() {
+  const target = document.querySelector("#tiktok-integration");
+  if (!target) return;
+  try {
+    const statusResponse = await fetch('/api/tiktok/status');
+    const status = await statusResponse.json();
+    if (!statusResponse.ok) throw new Error(status.error || 'Status integrasi TikTok Shop tidak dapat dibaca.');
+    if (!status.configured) {
+      target.innerHTML = `<p class="page-subtitle">Integrasi belum dikonfigurasi di server. Administrator perlu menyiapkan: ${status.missing.map(escapeHtml).join(', ')}.</p>`;
+      return;
+    }
+
+    const shopsResponse = await fetch('/api/tiktok/shops');
+    const shopData = await shopsResponse.json();
+    if (!shopsResponse.ok) throw new Error(shopData.error || 'Daftar toko TikTok Shop tidak dapat dibaca.');
+    tiktokShops = shopData.shops || [];
+    if (!tiktokShops.length) {
+      target.innerHTML = `<div class="tiktok-integration-actions"><p class="page-subtitle">Belum ada toko TikTok Shop yang terhubung.</p><a class="button button-secondary button-small" href="/api/tiktok/connect"><i data-lucide="link"></i> Hubungkan toko</a></div>`;
+    } else {
+      target.innerHTML = `<div class="tiktok-integration-actions"><div class="field"><label for="tiktok-shop-select">Toko TikTok Shop</label><select id="tiktok-shop-select">${tiktokShops.map((shop) => `<option value="${escapeHtml(shop.shopId)}">${escapeHtml(shop.name)}${shop.region ? ` · ${escapeHtml(shop.region)}` : ""}</option>`).join("")}</select></div><button class="button button-primary button-small" type="button" data-action="tiktok-sync"><i data-lucide="download"></i> Ambil pesanan dengan resi</button><a class="button button-secondary button-small" href="/api/tiktok/connect"><i data-lucide="plus"></i> Hubungkan toko lain</a></div><p class="field-help">Mencari pesanan yang diperbarui dalam 30 hari terakhir. Pesanan tanpa nomor resi tidak diimpor. Hasil tetap harus ditinjau sebelum manifest dibuat.</p>`;
+    }
+    renderIcons(target);
+  } catch (error) {
+    target.innerHTML = `<p class="row-error">${escapeHtml(error.message)}</p>`;
+  }
+}
+
+async function syncTikTokOrders(button) {
+  if (!hasAccess('imports')) return toast('Hanya Store Admin atau Super Admin yang dapat mengimpor pesanan.', true);
+  const shopId = document.querySelector('#tiktok-shop-select')?.value;
+  if (!shopId) return toast('Pilih toko TikTok Shop terlebih dahulu.', true);
+  button.disabled = true;
+  try {
+    const response = await fetch('/api/tiktok/sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ shopId }),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || 'Sinkronisasi TikTok Shop gagal.');
+    if (!result.orders.length) {
+      toast(`Tidak ada pesanan baru untuk manifest. ${result.withoutTracking} tanpa resi dan ${result.alreadyImported} sudah diimpor dilewati.`);
+      return;
+    }
+    importDraft = {
+      fileName: `TikTok Shop - ${result.shop.name} - ${todayISO()}`,
+      headers: ['Nomor pesanan', 'Nomor resi', 'Kurir', 'Toko', 'Tanggal'],
+      rows: result.orders.map((order) => [order.order, order.tracking, order.courier, order.shop, order.date]),
+      mapping: { order: '0', tracking: '1', courier: '2', shop: '3', date: '4', quantity: '' },
+    };
+    renderImports();
+    toast(`${result.orders.length} pesanan dengan resi siap ditinjau; ${result.withoutTracking} tanpa resi, ${result.alreadyImported} sudah diimpor, dan ${result.duplicateOrders} duplikat dilewati.`);
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -1121,6 +1183,7 @@ document.addEventListener("click", async (event) => {
     else if (name === "back-manifests") { if (!hasAccess('manifests')) return toast('Anda tidak memiliki izin untuk membuka manifest.', true); selectedManifestId = null; currentView = "manifests"; renderPage(); }
     else if (name === "close-modal") closeModal();
     else if (name === "commit-import") { if (!hasAccess('imports')) return toast('Anda tidak memiliki izin untuk impor data.', true); commitImport(); }
+    else if (name === "tiktok-sync") syncTikTokOrders(action);
     else if (name === "resolve-incident") { if (!hasAccess('incidents')) return toast('Anda tidak memiliki izin untuk menyelesaikan insiden.', true); openResolveModal(id); }
     else if (name === "export-report") { if (!hasAccess('reports')) return toast('Anda tidak memiliki izin untuk mengakses laporan.', true); exportReport(); }
     else if (name === "export-audit") { if (!hasAccess('audit')) return toast('Anda tidak memiliki izin untuk melihat audit log.', true); exportAudit(); }
@@ -1243,9 +1306,17 @@ if ("serviceWorker" in navigator && window.isSecureContext) {
   });
 }
 (async () => {
+  const query = new URLSearchParams(window.location.search);
+  if (query.get('view') === 'imports') currentView = 'imports';
+  const tiktokResult = query.get('tiktok');
+  if (tiktokResult) {
+    window.history.replaceState({}, '', window.location.pathname);
+  }
   const session = await getSession();
   if (session) {
     await hydrateStateFromServer();
   }
   renderPage();
+  if (tiktokResult === 'connected') toast('Toko TikTok Shop berhasil dihubungkan.');
+  else if (tiktokResult === 'error') toast('TikTok Shop gagal dihubungkan. Periksa konfigurasi dan log server.', true);
 })();

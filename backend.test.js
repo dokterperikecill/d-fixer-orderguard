@@ -16,7 +16,17 @@ const TEST_USERS = [
 function startTestServer(port, dbPath) {
   const child = spawn(process.execPath, ['server.js'], {
     cwd: __dirname,
-    env: { ...process.env, PORT: String(port), ORDERGUARD_DB_PATH: dbPath, NODE_ENV: 'test', ORDERGUARD_TEST_USERS: JSON.stringify(TEST_USERS) },
+    env: {
+      ...process.env,
+      PORT: String(port),
+      ORDERGUARD_DB_PATH: dbPath,
+      NODE_ENV: 'test',
+      ORDERGUARD_TEST_USERS: JSON.stringify(TEST_USERS),
+      TIKTOK_APP_KEY: '',
+      TIKTOK_APP_SECRET: '',
+      TIKTOK_REDIRECT_URI: '',
+      ORDERGUARD_TOKEN_ENCRYPTION_KEY: '',
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   return child;
@@ -107,6 +117,22 @@ test('server exposes health endpoint and state API', async () => {
     assert.equal(state.status, 200);
     const stateJson = await state.json();
     assert.ok(Array.isArray(stateJson.manifests));
+
+    const tiktokStatus = await fetch(`http://127.0.0.1:${port}/api/tiktok/status`, {
+      headers: { Cookie: `orderguard_session=${sessionCookie}` },
+    });
+    assert.equal(tiktokStatus.status, 200);
+    assert.equal((await tiktokStatus.json()).configured, false);
+    const tiktokShops = await fetch(`http://127.0.0.1:${port}/api/tiktok/shops`, {
+      headers: { Cookie: `orderguard_session=${sessionCookie}` },
+    });
+    assert.deepEqual(await tiktokShops.json(), { shops: [] });
+    const tiktokSync = await fetch(`http://127.0.0.1:${port}/api/tiktok/sync`, {
+      method: 'POST',
+      headers: { Cookie: `orderguard_session=${sessionCookie}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ shopId: 'not-connected' }),
+    });
+    assert.equal(tiktokSync.status, 503);
   } finally {
     await stopTestServer(server);
   }
@@ -212,6 +238,16 @@ test('handover staff can scan packages but cannot change administrative state', 
     const cookies = login.headers.get('set-cookie') || '';
     const sessionCookie = /orderguard_session=([^;]+)/.exec(cookies)?.[1];
     assert.ok(sessionCookie);
+
+    const tiktokStatus = await fetch(`http://127.0.0.1:${port}/api/tiktok/status`, {
+      headers: { Cookie: `orderguard_session=${sessionCookie}` },
+    });
+    assert.equal(tiktokStatus.status, 403);
+    const tiktokConnect = await fetch(`http://127.0.0.1:${port}/api/tiktok/connect`, {
+      headers: { Cookie: `orderguard_session=${sessionCookie}` },
+      redirect: 'manual',
+    });
+    assert.equal(tiktokConnect.status, 403);
 
     const stateBefore = await fetch(`http://127.0.0.1:${port}/api/state`, {
       headers: { Cookie: `orderguard_session=${sessionCookie}` },

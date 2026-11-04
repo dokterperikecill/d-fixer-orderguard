@@ -25,3 +25,11 @@ services:
         sync: false
       - key: ORDERGUARD_BOOTSTRAP_PASSWORD
         sync: false
+      - key: TIKTOK_APP_KEY
+        sync: false
+      - key: TIKTOK_APP_SECRET
+        sync: false
+      - key: TIKTOK_REDIRECT_URI
+        sync: false
+      - key: ORDERGUARD_TOKEN_ENCRYPTION_KEY
+        sync: false

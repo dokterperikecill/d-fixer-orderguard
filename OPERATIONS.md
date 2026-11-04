@@ -48,6 +48,21 @@ Simpan password melalui secret manager, bukan file yang masuk Git atau log shell
 
 Production harus menggunakan HTTPS. Cookie sesi hanya diberi flag `Secure` saat `NODE_ENV=production`.
 
+## Integrasi TikTok Shop
+
+Integrasi tersedia untuk aplikasi ISV yang sudah disetujui di TikTok Shop Partner Center. Sinkronisasi bersifat read-only: OrderGuard hanya mengambil pesanan yang telah memiliki nomor resi, dan pengguna harus meninjau hasil sebelum membuat manifest. Sinkronisasi mencari pesanan yang diperbarui dalam 30 hari terakhir; pesanan tanpa resi dilewati.
+
+1. Daftarkan OAuth redirect URL aplikasi di Partner Center dengan URL HTTPS persis berikut: `https://<domain-orderguard>/api/tiktok/callback`. Pastikan aplikasi disetujui untuk authorization toko dan akses baca daftar pesanan.
+2. Atur environment variable berikut di secret manager/deployment platform:
+   - `TIKTOK_APP_KEY`
+   - `TIKTOK_APP_SECRET` (rahasia)
+   - `TIKTOK_REDIRECT_URI` (URL callback yang sama persis)
+   - `ORDERGUARD_TOKEN_ENCRYPTION_KEY` (kunci 32-byte dalam hex 64 karakter atau base64)
+3. Buat kunci enkripsi dengan `openssl rand -hex 32`, lalu simpan sebagai secret. Gunakan kunci yang sama setelah restart dan saat restore database; menggantinya membuat token tersimpan tidak dapat dibaca.
+4. Di halaman **Impor data**, Store Admin atau Platform Admin memilih **Hubungkan toko**, menyelesaikan otorisasi TikTok Shop, lalu memilih toko dan menekan **Ambil pesanan dengan resi**. Hasil tetap melewati validasi dan konfirmasi pembuatan manifest.
+
+Access/refresh token disimpan terenkripsi di SQLite server dan tidak dikirim ke browser. Database serta kunci enkripsinya harus dicadangkan dan dipulihkan bersama. Jangan memasukkan kredensial aplikasi atau token ke repository, log, atau chat. Periksa Partner Center untuk endpoint, scope, dan persyaratan review ISV terbaru sebelum mengaktifkan integrasi produksi.
+
 ## Backup
 
 Jalankan backup konsisten saat server hidup:
