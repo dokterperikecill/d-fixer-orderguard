@@ -1,103 +1,15 @@
 const express = require('express');
-const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const Database = require('better-sqlite3');
 const { isDeepStrictEqual } = require('node:util');
+const { createPool } = require('./database');
 const TikTokShop = require('./tiktok-shop');
 
 const app = express();
 const port = Number(process.env.PORT || 4173);
 const appDir = __dirname;
-const dataDir = path.join(appDir, 'data');
-fs.mkdirSync(dataDir, { recursive: true });
-
-const dbPath = process.env.ORDERGUARD_DB_PATH || path.join(dataDir, 'orderguard.db');
-fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-const db = new Database(dbPath);
+const db = createPool();
 const tiktokTokenRefreshes = new Map();
-db.exec(`
-  CREATE TABLE IF NOT EXISTS app_state (
-    id TEXT PRIMARY KEY,
-    payload TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS tenant_state (
-    tenant_id TEXT PRIMARY KEY,
-    payload TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS tenants (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS tenant_audit (
-    id TEXT PRIMARY KEY,
-    actor_id TEXT NOT NULL,
-    actor_name TEXT NOT NULL,
-    tenant_id TEXT NOT NULL,
-    action TEXT NOT NULL,
-    created_at TEXT NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS users (
-    id TEXT PRIMARY KEY,
-    username TEXT NOT NULL UNIQUE COLLATE NOCASE,
-    name TEXT NOT NULL,
-    password_salt TEXT NOT NULL,
-    password_hash TEXT NOT NULL,
-    role TEXT NOT NULL,
-    tenant_id TEXT NOT NULL,
-    active INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS sessions (
-    token_hash TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    expires_at TEXT NOT NULL,
-    created_at TEXT NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS tiktok_oauth_states (
-    state_hash TEXT PRIMARY KEY,
-    tenant_id TEXT NOT NULL,
-    user_id TEXT NOT NULL,
-    expires_at TEXT NOT NULL,
-    created_at TEXT NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS tiktok_connections (
-    id TEXT PRIMARY KEY,
-    tenant_id TEXT NOT NULL,
-    open_id TEXT NOT NULL,
-    access_token TEXT NOT NULL,
-    refresh_token TEXT NOT NULL,
-    access_token_expires_at INTEGER NOT NULL,
-    refresh_token_expires_at INTEGER NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    UNIQUE (tenant_id, open_id)
-  );
-  CREATE TABLE IF NOT EXISTS tiktok_shops (
-    id TEXT PRIMARY KEY,
-    tenant_id TEXT NOT NULL,
-    connection_id TEXT NOT NULL,
-    shop_id TEXT NOT NULL,
-    shop_cipher TEXT NOT NULL,
-    name TEXT NOT NULL,
-    region TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL,
-    UNIQUE (tenant_id, shop_id)
-  );
-  CREATE TABLE IF NOT EXISTS employee_audit (
-    id TEXT PRIMARY KEY,
-    actor_id TEXT NOT NULL,
-    actor_name TEXT NOT NULL,
-    target_user_id TEXT NOT NULL,
-    action TEXT NOT NULL,
-    created_at TEXT NOT NULL
-  );
-`);
 
 const INITIAL_TENANTS = [
   { id: 'dfixer-store', name: "D'Fixer Store" },
@@ -109,24 +21,24 @@ const ROLE_PERMISSIONS = {
   'store-admin': ['dashboard', 'manifests', 'imports', 'incidents', 'reports', 'audit'],
   'handover-staff': ['dashboard', 'manifests'],
 };
-function seedTenants() {
-  const insert = db.prepare('INSERT OR IGNORE INTO tenants (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)');
+async function seedTenants() {
+  const insert = db.prepare('INSERT INTO tenants (id, name, created_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING');
   const now = new Date().toISOString();
-  for (const tenant of INITIAL_TENANTS) insert.run(tenant.id, tenant.name, now, now);
+  for (const tenant of INITIAL_TENANTS) await insert.run(tenant.id, tenant.name, now, now);
 }
 
-function getTenant(tenantId) {
-  return db.prepare('SELECT id, name, created_at AS createdAt, updated_at AS updatedAt FROM tenants WHERE id = ?').get(tenantId) || null;
+async function getTenant(tenantId) {
+  return db.prepare('SELECT id, name, created_at AS createdAt, updated_at AS updatedAt FROM tenants WHERE id = ?').get(tenantId);
 }
 
-function listTenants() {
+async function listTenants() {
   return db.prepare(`SELECT tenants.id, tenants.name, tenants.created_at AS createdAt, tenants.updated_at AS updatedAt,
-    COUNT(users.id) AS employeeCount FROM tenants LEFT JOIN users ON users.tenant_id = tenants.id
-    GROUP BY tenants.id ORDER BY tenants.name COLLATE NOCASE`).all();
+    COUNT(users.id)::INTEGER AS employeeCount FROM tenants LEFT JOIN users ON users.tenant_id = tenants.id
+    GROUP BY tenants.id ORDER BY LOWER(tenants.name)`).all();
 }
 
-function recordTenantAudit(actor, tenantId, action) {
-  db.prepare('INSERT INTO tenant_audit (id, actor_id, actor_name, tenant_id, action, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+async function recordTenantAudit(actor, tenantId, action) {
+  await db.prepare('INSERT INTO tenant_audit (id, actor_id, actor_name, tenant_id, action, created_at) VALUES (?, ?, ?, ?, ?, ?)')
     .run(crypto.randomUUID(), actor.id, actor.name, tenantId, action, new Date().toISOString());
 }
 
@@ -153,11 +65,11 @@ function verifyPassword(password, salt, hash) {
   return candidate.length === expected.length && crypto.timingSafeEqual(candidate, expected);
 }
 
-function seedInitialUsers() {
-  const count = db.prepare('SELECT COUNT(*) AS count FROM users').get().count;
+async function seedInitialUsers() {
+  const count = (await db.prepare('SELECT COUNT(*)::INTEGER AS count FROM users').get()).count;
   if (count) {
     if (process.env.NODE_ENV === 'production') {
-      const legacyDemoAccounts = db.prepare("SELECT username FROM users WHERE id IN ('admin', 'rani', 'handover', 'maya') AND active = 1").all();
+      const legacyDemoAccounts = await db.prepare("SELECT username FROM users WHERE id IN ('admin', 'rani', 'handover', 'maya') AND active = TRUE").all();
       if (legacyDemoAccounts.length) {
         const names = legacyDemoAccounts.map((user) => user.username).join(', ');
         throw new Error(`Database masih memiliki akun demo aktif (${names}). Nonaktifkan atau migrasikan akun tersebut sebelum menjalankan production.`);
@@ -183,19 +95,21 @@ function seedInitialUsers() {
   }
   if (!Array.isArray(initialUsers) || !initialUsers.length) throw new Error('Tidak ada akun awal untuk database kosong.');
 
-  const insert = db.prepare('INSERT INTO users (id, username, name, password_salt, password_hash, role, tenant_id, active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)');
   const now = new Date().toISOString();
-  const seed = db.transaction(() => {
+  await db.transaction(async (tx) => {
+    const insert = tx.prepare('INSERT INTO users (id, username, name, password_salt, password_hash, role, tenant_id, active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, TRUE, ?, ?)');
     for (const user of initialUsers) {
       const credentials = hashPassword(user.password);
-      insert.run(user.id, user.username, user.name, credentials.salt, credentials.hash, user.role, user.tenantId, now, now);
+      await insert.run(user.id, user.username, user.name, credentials.salt, credentials.hash, user.role, user.tenantId, now, now);
     }
   });
-  seed();
 }
 
-seedTenants();
-seedInitialUsers();
+async function initializeDatabase() {
+  await db.exec(db.schema);
+  await seedTenants();
+  await seedInitialUsers();
+}
 
 function parseCookies(header = '') {
   return header.split(';').map((segment) => segment.trim()).filter(Boolean).reduce((accumulator, segment) => {
@@ -205,36 +119,35 @@ function parseCookies(header = '') {
   }, {});
 }
 
-function getUserFromRequest(req) {
+async function getUserFromRequest(req) {
   const cookies = parseCookies(req.headers.cookie || '');
   const token = cookies.orderguard_session;
   if (!token) return null;
   const hashedToken = hashSessionToken(token);
-  const session = db.prepare('SELECT user_id AS userId FROM sessions WHERE token_hash = ? AND expires_at > ?').get(hashedToken, new Date().toISOString());
+  const session = await db.prepare('SELECT user_id AS userId FROM sessions WHERE token_hash = ? AND expires_at > ?').get(hashedToken, new Date().toISOString());
   if (!session) {
-    db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(hashedToken);
+    await db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(hashedToken);
     return null;
   }
-  const user = db.prepare('SELECT id, username, name, role, tenant_id AS tenantId FROM users WHERE id = ? AND active = 1').get(session.userId);
-  if (!user) db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(hashedToken);
+  const user = await db.prepare('SELECT id, username, name, role, tenant_id AS tenantId FROM users WHERE id = ? AND active = TRUE').get(session.userId);
+  if (!user) await db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(hashedToken);
   return user || null;
 }
 
-function revokeUserSessions(userId, exceptToken = '') {
+async function revokeUserSessions(userId, exceptToken = '') {
   if (exceptToken) {
-    db.prepare('DELETE FROM sessions WHERE user_id = ? AND token_hash <> ?').run(userId, hashSessionToken(exceptToken));
+    await db.prepare('DELETE FROM sessions WHERE user_id = ? AND token_hash <> ?').run(userId, hashSessionToken(exceptToken));
     return;
   }
-  db.prepare('DELETE FROM sessions WHERE user_id = ?').run(userId);
+  await db.prepare('DELETE FROM sessions WHERE user_id = ?').run(userId);
 }
 
 function requireAuth(req, res, next) {
-  const user = getUserFromRequest(req);
-  if (!user) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  req.user = user;
-  next();
+  getUserFromRequest(req).then((user) => {
+    if (!user) return res.status(401).json({ error: 'Unauthorized' });
+    req.user = user;
+    next();
+  }).catch(next);
 }
 
 function requireRole(requiredRoles) {
@@ -245,6 +158,10 @@ function requireRole(requiredRoles) {
     }
     next();
   };
+}
+
+function asyncRoute(handler) {
+  return (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
 }
 
 function tiktokTokenExpiry(value, now = Date.now()) {
@@ -258,7 +175,7 @@ function tiktokConfigStatus() {
   return { config, configured: config.missing.length === 0 };
 }
 
-function tiktokConnectionForShop(tenantId, shopId) {
+async function tiktokConnectionForShop(tenantId, shopId) {
   return db.prepare(`
     SELECT tiktok_shops.shop_id AS shopId, tiktok_shops.shop_cipher AS shopCipher,
       tiktok_shops.name AS shopName, tiktok_shops.region,
@@ -270,7 +187,7 @@ function tiktokConnectionForShop(tenantId, shopId) {
     FROM tiktok_shops
     JOIN tiktok_connections ON tiktok_connections.id = tiktok_shops.connection_id
     WHERE tiktok_shops.tenant_id = ? AND tiktok_shops.shop_id = ?
-  `).get(tenantId, shopId) || null;
+  `).get(tenantId, shopId);
 }
 
 async function ensureTikTokAccessToken(connection, config) {
@@ -287,7 +204,7 @@ async function ensureTikTokAccessToken(connection, config) {
     const refreshed = await TikTokShop.refreshAccessToken({ refreshToken, config });
     if (!refreshed.access_token || !refreshed.refresh_token) throw new Error('TikTok Shop tidak mengembalikan token baru yang valid.');
     const updatedAt = new Date().toISOString();
-    db.prepare(`
+    await db.prepare(`
       UPDATE tiktok_connections SET access_token = ?, refresh_token = ?,
         access_token_expires_at = ?, refresh_token_expires_at = ?, updated_at = ?
       WHERE id = ?
@@ -337,51 +254,51 @@ function baseState(tenantName = "D'Fixer Store") {
   };
 }
 
-function readState(tenantId) {
-  const row = db.prepare('SELECT payload FROM tenant_state WHERE tenant_id = ?').get(tenantId);
+async function readState(tenantId) {
+  const row = await db.prepare('SELECT payload FROM tenant_state WHERE tenant_id = ?').get(tenantId);
   if (!row) {
     if (tenantId === 'dfixer-store') {
-      const legacyRow = db.prepare("SELECT payload FROM app_state WHERE id = 'state'").get();
+      const legacyRow = await db.prepare("SELECT payload FROM app_state WHERE id = 'state'").get();
       if (legacyRow) {
         try {
           const legacyState = JSON.parse(legacyRow.payload);
-          writeState(tenantId, legacyState);
+          await writeState(tenantId, legacyState);
           return legacyState;
         } catch (error) {
           console.warn('State lama tidak dapat dibaca; membuat state tenant baru.', error);
         }
       }
     }
-    const initialState = baseState(getTenant(tenantId)?.name);
-    writeState(tenantId, initialState);
+    const initialState = baseState((await getTenant(tenantId))?.name);
+    await writeState(tenantId, initialState);
     return initialState;
   }
 
   try {
     return JSON.parse(row.payload);
   } catch (error) {
-    const initialState = baseState(getTenant(tenantId)?.name);
-    writeState(tenantId, initialState);
+    const initialState = baseState((await getTenant(tenantId))?.name);
+    await writeState(tenantId, initialState);
     return initialState;
   }
 }
 
-function writeState(tenantId, payload) {
-  const state = payload && typeof payload === 'object' ? payload : baseState(getTenant(tenantId)?.name);
+async function writeState(tenantId, payload) {
+  const state = payload && typeof payload === 'object' ? payload : baseState((await getTenant(tenantId))?.name);
   const issuedAt = new Date().toISOString();
-  db.prepare(
+  await db.prepare(
     `INSERT INTO tenant_state (tenant_id, payload, updated_at) VALUES (?, ?, ?) ON CONFLICT(tenant_id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at`
   ).run(tenantId, JSON.stringify(state), issuedAt);
 }
 
-function publicUser(user) {
+async function publicUser(user) {
   return {
     id: user.id,
     username: user.username,
     name: user.name,
     role: user.role,
     tenantId: user.tenantId || user.tenant_id,
-    tenantName: getTenant(user.tenantId || user.tenant_id)?.name,
+    tenantName: (await getTenant(user.tenantId || user.tenant_id))?.name,
     active: user.active === undefined ? true : Boolean(user.active),
     createdAt: user.createdAt || user.created_at,
     updatedAt: user.updatedAt || user.updated_at,
@@ -636,16 +553,19 @@ function validateHandoverUpdate(user, previous, next) {
 
 app.use(express.json({ limit: '10mb' }));
 
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', time: new Date().toISOString() });
-});
+app.get('/api/health', asyncRoute(async (req, res) => {
+  await db.prepare('SELECT 1').get();
+  res.json({ status: 'ok', database: 'ok', time: new Date().toISOString() });
+}));
 
 app.get('/api/session', (req, res) => {
-  const user = getUserFromRequest(req);
-  res.json({ user: user ? publicUser(user) : null });
+  getUserFromRequest(req)
+    .then((user) => user ? publicUser(user) : null)
+    .then((user) => res.json({ user }))
+    .catch((error) => res.status(500).json({ error: error.message }));
 });
 
-app.post('/api/tenants', requireAuth, requireRole(['super-admin']), (req, res) => {
+app.post('/api/tenants', requireAuth, requireRole(['super-admin']), asyncRoute(async (req, res) => {
   const id = String(req.body?.id || '').trim();
   const name = String(req.body?.name || '').trim();
   if (!/^[a-z0-9](?:[a-z0-9-]{0,48}[a-z0-9])$/.test(id)) {
@@ -655,41 +575,46 @@ app.post('/api/tenants', requireAuth, requireRole(['super-admin']), (req, res) =
 
   const now = new Date().toISOString();
   try {
-    db.prepare('INSERT INTO tenants (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)').run(id, name, now, now);
+    await db.prepare('INSERT INTO tenants (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)').run(id, name, now, now);
   } catch (error) {
-    if (error.code === 'SQLITE_CONSTRAINT_PRIMARYKEY') return res.status(409).json({ error: 'ID tenant sudah digunakan.' });
-    if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') return res.status(409).json({ error: 'Nama tenant sudah digunakan.' });
+    if (error.code === '23505') {
+      if (error.constraint?.includes('pkey')) return res.status(409).json({ error: 'ID tenant sudah digunakan.' });
+      return res.status(409).json({ error: 'Nama tenant sudah digunakan.' });
+    }
     throw error;
   }
-  recordTenantAudit(req.user, id, 'Tenant dibuat');
-  res.status(201).json({ tenant: getTenant(id) });
-});
+  await recordTenantAudit(req.user, id, 'Tenant dibuat');
+  res.status(201).json({ tenant: await getTenant(id) });
+}));
 
-app.patch('/api/tenants/:id', requireAuth, requireRole(['super-admin']), (req, res) => {
-  const tenant = getTenant(req.params.id);
+app.patch('/api/tenants/:id', requireAuth, requireRole(['super-admin']), asyncRoute(async (req, res) => {
+  const tenant = await getTenant(req.params.id);
   if (!tenant) return res.status(404).json({ error: 'Tenant tidak ditemukan.' });
   const name = String(req.body?.name || '').trim();
   if (name.length < 2 || name.length > 100) return res.status(400).json({ error: 'Nama tenant harus 2-100 karakter.' });
 
   const now = new Date().toISOString();
   try {
-    db.prepare('UPDATE tenants SET name = ?, updated_at = ? WHERE id = ?').run(name, now, tenant.id);
+    await db.prepare('UPDATE tenants SET name = ?, updated_at = ? WHERE id = ?').run(name, now, tenant.id);
   } catch (error) {
-    if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') return res.status(409).json({ error: 'Nama tenant sudah digunakan.' });
+    if (error.code === '23505') return res.status(409).json({ error: 'Nama tenant sudah digunakan.' });
     throw error;
   }
-  recordTenantAudit(req.user, tenant.id, 'Nama tenant diperbarui');
-  res.json({ tenant: getTenant(tenant.id) });
-});
+  await recordTenantAudit(req.user, tenant.id, 'Nama tenant diperbarui');
+  res.json({ tenant: await getTenant(tenant.id) });
+}));
 
-app.get('/api/users', requireAuth, requireRole(['super-admin']), (req, res) => {
-  const users = db.prepare('SELECT id, username, name, role, tenant_id AS tenantId, active, created_at AS createdAt, updated_at AS updatedAt FROM users ORDER BY tenant_id, name COLLATE NOCASE').all().map(publicUser);
-  const activity = db.prepare('SELECT actor_name AS actorName, target_user_id AS targetUserId, action, created_at AS createdAt FROM employee_audit ORDER BY created_at DESC LIMIT 100').all();
-  const tenantActivity = db.prepare('SELECT actor_name AS actorName, tenant_id AS tenantId, action, created_at AS createdAt FROM tenant_audit ORDER BY created_at DESC LIMIT 100').all();
-  res.json({ users, tenants: listTenants(), activity, tenantActivity });
-});
+app.get('/api/users', requireAuth, requireRole(['super-admin']), asyncRoute(async (req, res) => {
+  const users = await Promise.all((await db.prepare('SELECT id, username, name, role, tenant_id AS tenantId, active, created_at AS createdAt, updated_at AS updatedAt FROM users ORDER BY tenant_id, LOWER(name)').all()).map(publicUser));
+  const [activity, tenantActivity, tenants] = await Promise.all([
+    db.prepare('SELECT actor_name AS actorName, target_user_id AS targetUserId, action, created_at AS createdAt FROM employee_audit ORDER BY created_at DESC LIMIT 100').all(),
+    db.prepare('SELECT actor_name AS actorName, tenant_id AS tenantId, action, created_at AS createdAt FROM tenant_audit ORDER BY created_at DESC LIMIT 100').all(),
+    listTenants(),
+  ]);
+  res.json({ users, tenants, activity, tenantActivity });
+}));
 
-app.post('/api/users', requireAuth, requireRole(['super-admin']), (req, res) => {
+app.post('/api/users', requireAuth, requireRole(['super-admin']), asyncRoute(async (req, res) => {
   const body = req.body || {};
   const username = String(body.username || '').trim();
   const name = String(body.name || '').trim();
@@ -701,26 +626,26 @@ app.post('/api/users', requireAuth, requireRole(['super-admin']), (req, res) => 
   if (!name || name.length > 100) return res.status(400).json({ error: 'Nama wajib diisi dan maksimal 100 karakter.' });
   if (password.length < 8) return res.status(400).json({ error: 'Kata sandi minimal 8 karakter.' });
   if (!EMPLOYEE_ROLES.includes(role)) return res.status(400).json({ error: 'Peran tidak valid.' });
-  if (!getTenant(tenantId)) return res.status(400).json({ error: 'Tenant tidak valid.' });
+  if (!(await getTenant(tenantId))) return res.status(400).json({ error: 'Tenant tidak valid.' });
 
   const now = new Date().toISOString();
   const credentials = hashPassword(password);
   const id = crypto.randomUUID();
   try {
-    db.prepare('INSERT INTO users (id, username, name, password_salt, password_hash, role, tenant_id, active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)')
+    await db.prepare('INSERT INTO users (id, username, name, password_salt, password_hash, role, tenant_id, active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, TRUE, ?, ?)')
       .run(id, username, name, credentials.salt, credentials.hash, role, tenantId, now, now);
   } catch (error) {
-    if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') return res.status(409).json({ error: 'Username sudah digunakan.' });
+    if (error.code === '23505') return res.status(409).json({ error: 'Username sudah digunakan.' });
     throw error;
   }
-  db.prepare('INSERT INTO employee_audit (id, actor_id, actor_name, target_user_id, action, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+  await db.prepare('INSERT INTO employee_audit (id, actor_id, actor_name, target_user_id, action, created_at) VALUES (?, ?, ?, ?, ?, ?)')
     .run(crypto.randomUUID(), req.user.id, req.user.name, id, 'Karyawan ditambahkan', now);
-  const created = db.prepare('SELECT id, username, name, role, tenant_id AS tenantId, active, created_at AS createdAt, updated_at AS updatedAt FROM users WHERE id = ?').get(id);
-  res.status(201).json({ user: publicUser(created) });
-});
+  const created = await db.prepare('SELECT id, username, name, role, tenant_id AS tenantId, active, created_at AS createdAt, updated_at AS updatedAt FROM users WHERE id = ?').get(id);
+  res.status(201).json({ user: await publicUser(created) });
+}));
 
-app.patch('/api/users/:id', requireAuth, requireRole(['super-admin']), (req, res) => {
-  const existing = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
+app.patch('/api/users/:id', requireAuth, requireRole(['super-admin']), asyncRoute(async (req, res) => {
+  const existing = await db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
   if (!existing) return res.status(404).json({ error: 'Karyawan tidak ditemukan.' });
 
   const body = req.body || {};
@@ -735,13 +660,13 @@ app.patch('/api/users/:id', requireAuth, requireRole(['super-admin']), (req, res
   if (!/^[a-zA-Z0-9._-]{3,32}$/.test(username)) return res.status(400).json({ error: 'Username harus 3-32 karakter dan hanya berisi huruf, angka, titik, garis bawah, atau tanda hubung.' });
   if (!name || name.length > 100) return res.status(400).json({ error: 'Nama wajib diisi dan maksimal 100 karakter.' });
   if (!EMPLOYEE_ROLES.includes(role)) return res.status(400).json({ error: 'Peran tidak valid.' });
-  if (!getTenant(tenantId)) return res.status(400).json({ error: 'Tenant tidak valid.' });
+  if (!(await getTenant(tenantId))) return res.status(400).json({ error: 'Tenant tidak valid.' });
   if (password && password.length < 8) return res.status(400).json({ error: 'Kata sandi baru minimal 8 karakter.' });
   if (isSelf && (role !== existing.role || tenantId !== existing.tenant_id || !active)) {
     return res.status(400).json({ error: 'Akun sendiri tidak dapat dipindahkan, dinonaktifkan, atau diubah perannya.' });
   }
   if (existing.role === 'super-admin' && (role !== 'super-admin' || !active)) {
-    const activeAdmins = db.prepare("SELECT COUNT(*) AS count FROM users WHERE role = 'super-admin' AND active = 1").get().count;
+    const activeAdmins = (await db.prepare("SELECT COUNT(*)::INTEGER AS count FROM users WHERE role = 'super-admin' AND active = TRUE").get()).count;
     if (activeAdmins <= 1) return res.status(409).json({ error: 'Minimal satu Platform Admin aktif harus dipertahankan.' });
   }
 
@@ -749,46 +674,46 @@ app.patch('/api/users/:id', requireAuth, requireRole(['super-admin']), (req, res
   const credentials = password ? hashPassword(password) : null;
   try {
     if (credentials) {
-      db.prepare('UPDATE users SET username = ?, name = ?, role = ?, tenant_id = ?, active = ?, password_salt = ?, password_hash = ?, updated_at = ? WHERE id = ?')
-        .run(username, name, role, tenantId, Number(active), credentials.salt, credentials.hash, now, existing.id);
+      await db.prepare('UPDATE users SET username = ?, name = ?, role = ?, tenant_id = ?, active = ?, password_salt = ?, password_hash = ?, updated_at = ? WHERE id = ?')
+        .run(username, name, role, tenantId, active, credentials.salt, credentials.hash, now, existing.id);
     } else {
-      db.prepare('UPDATE users SET username = ?, name = ?, role = ?, tenant_id = ?, active = ?, updated_at = ? WHERE id = ?')
-        .run(username, name, role, tenantId, Number(active), now, existing.id);
+      await db.prepare('UPDATE users SET username = ?, name = ?, role = ?, tenant_id = ?, active = ?, updated_at = ? WHERE id = ?')
+        .run(username, name, role, tenantId, active, now, existing.id);
     }
   } catch (error) {
-    if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') return res.status(409).json({ error: 'Username sudah digunakan.' });
+    if (error.code === '23505') return res.status(409).json({ error: 'Username sudah digunakan.' });
     throw error;
   }
   if (password || role !== existing.role || tenantId !== existing.tenant_id || !active) {
-    revokeUserSessions(existing.id, existing.id === req.user.id ? parseCookies(req.headers.cookie || '').orderguard_session : '');
+    await revokeUserSessions(existing.id, existing.id === req.user.id ? parseCookies(req.headers.cookie || '').orderguard_session : '');
   }
   const action = password ? 'Data karyawan dan kata sandi diperbarui' : 'Data karyawan diperbarui';
-  db.prepare('INSERT INTO employee_audit (id, actor_id, actor_name, target_user_id, action, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+  await db.prepare('INSERT INTO employee_audit (id, actor_id, actor_name, target_user_id, action, created_at) VALUES (?, ?, ?, ?, ?, ?)')
     .run(crypto.randomUUID(), req.user.id, req.user.name, existing.id, action, now);
-  const updated = db.prepare('SELECT id, username, name, role, tenant_id AS tenantId, active, created_at AS createdAt, updated_at AS updatedAt FROM users WHERE id = ?').get(existing.id);
-  res.json({ user: publicUser(updated) });
-});
+  const updated = await db.prepare('SELECT id, username, name, role, tenant_id AS tenantId, active, created_at AS createdAt, updated_at AS updatedAt FROM users WHERE id = ?').get(existing.id);
+  res.json({ user: await publicUser(updated) });
+}));
 
-app.delete('/api/users/:id', requireAuth, requireRole(['super-admin']), (req, res) => {
-  const existing = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
+app.delete('/api/users/:id', requireAuth, requireRole(['super-admin']), asyncRoute(async (req, res) => {
+  const existing = await db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
   if (!existing) return res.status(404).json({ error: 'Karyawan tidak ditemukan.' });
   if (existing.id === req.user.id) return res.status(400).json({ error: 'Akun yang sedang digunakan tidak dapat dinonaktifkan.' });
   if (existing.role === 'super-admin') {
-    const activeAdmins = db.prepare("SELECT COUNT(*) AS count FROM users WHERE role = 'super-admin' AND active = 1").get().count;
+    const activeAdmins = (await db.prepare("SELECT COUNT(*)::INTEGER AS count FROM users WHERE role = 'super-admin' AND active = TRUE").get()).count;
     if (activeAdmins <= 1) return res.status(409).json({ error: 'Minimal satu Platform Admin aktif harus dipertahankan.' });
   }
 
   const now = new Date().toISOString();
-  db.prepare('UPDATE users SET active = 0, updated_at = ? WHERE id = ?').run(now, existing.id);
-  revokeUserSessions(existing.id);
-  db.prepare('INSERT INTO employee_audit (id, actor_id, actor_name, target_user_id, action, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+  await db.prepare('UPDATE users SET active = FALSE, updated_at = ? WHERE id = ?').run(now, existing.id);
+  await revokeUserSessions(existing.id);
+  await db.prepare('INSERT INTO employee_audit (id, actor_id, actor_name, target_user_id, action, created_at) VALUES (?, ?, ?, ?, ?, ?)')
     .run(crypto.randomUUID(), req.user.id, req.user.name, existing.id, 'Akun karyawan dinonaktifkan', now);
   res.json({ ok: true });
-});
+}));
 
-app.post('/api/login', (req, res) => {
+app.post('/api/login', asyncRoute(async (req, res) => {
   const { username, password } = req.body || {};
-  const user = db.prepare('SELECT id, username, name, password_salt, password_hash, role, tenant_id AS tenantId FROM users WHERE username = ? COLLATE NOCASE AND active = 1').get(String(username || '').trim());
+  const user = await db.prepare('SELECT id, username, name, password_salt, password_hash, role, tenant_id AS tenantId FROM users WHERE LOWER(username) = LOWER(?) AND active = TRUE').get(String(username || '').trim());
   if (!user || !verifyPassword(String(password || ''), user.password_salt, user.password_hash)) {
     return res.status(401).json({ error: 'Kredensial tidak valid.' });
   }
@@ -796,9 +721,9 @@ app.post('/api/login', (req, res) => {
   const token = signSessionToken();
   const createdAt = new Date();
   const expiresAt = new Date(createdAt.getTime() + 1000 * 60 * 60 * 8).toISOString();
-  db.prepare('INSERT INTO sessions (token_hash, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)')
+  await db.prepare('INSERT INTO sessions (token_hash, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)')
     .run(hashSessionToken(token), user.id, expiresAt, createdAt.toISOString());
-  db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(createdAt.toISOString());
+  await db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(createdAt.toISOString());
   const secureCookie = process.env.NODE_ENV === 'production';
   res.cookie('orderguard_session', token, {
     httpOnly: true,
@@ -806,32 +731,32 @@ app.post('/api/login', (req, res) => {
     secure: secureCookie,
     maxAge: 1000 * 60 * 60 * 8,
   });
-  res.json({ ok: true, user: publicUser(user) });
-});
+  res.json({ ok: true, user: await publicUser(user) });
+}));
 
-app.post('/api/logout', (req, res) => {
+app.post('/api/logout', asyncRoute(async (req, res) => {
   const cookies = parseCookies(req.headers.cookie || '');
   const token = cookies.orderguard_session;
-  if (token) db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(hashSessionToken(token));
+  if (token) await db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(hashSessionToken(token));
   res.clearCookie('orderguard_session', { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production' });
   res.json({ ok: true });
-});
+}));
 
-app.get('/api/tiktok/status', requireAuth, requireRole(['super-admin', 'store-admin']), (req, res) => {
+app.get('/api/tiktok/status', requireAuth, requireRole(['super-admin', 'store-admin']), asyncRoute(async (req, res) => {
   const { configured, config } = tiktokConfigStatus();
-  const shops = db.prepare('SELECT COUNT(*) AS count FROM tiktok_shops WHERE tenant_id = ?').get(req.user.tenantId).count;
+  const shops = (await db.prepare('SELECT COUNT(*)::INTEGER AS count FROM tiktok_shops WHERE tenant_id = ?').get(req.user.tenantId)).count;
   res.json({ configured, missing: configured ? [] : config.missing, connectedShops: shops });
-});
+}));
 
-app.get('/api/tiktok/connect', requireAuth, requireRole(['super-admin', 'store-admin']), (req, res) => {
+app.get('/api/tiktok/connect', requireAuth, requireRole(['super-admin', 'store-admin']), asyncRoute(async (req, res) => {
   const { configured, config } = tiktokConfigStatus();
   if (!configured) {
     return res.status(503).json({ error: `Integrasi TikTok Shop belum dikonfigurasi: ${config.missing.join(', ')}.` });
   }
   const state = crypto.randomBytes(32).toString('base64url');
   const now = new Date();
-  db.prepare('DELETE FROM tiktok_oauth_states WHERE expires_at <= ?').run(now.toISOString());
-  db.prepare('INSERT INTO tiktok_oauth_states (state_hash, tenant_id, user_id, expires_at, created_at) VALUES (?, ?, ?, ?, ?)')
+  await db.prepare('DELETE FROM tiktok_oauth_states WHERE expires_at <= ?').run(now.toISOString());
+  await db.prepare('INSERT INTO tiktok_oauth_states (state_hash, tenant_id, user_id, expires_at, created_at) VALUES (?, ?, ?, ?, ?)')
     .run(hashOpaqueValue(state), req.user.tenantId, req.user.id, new Date(now.getTime() + 10 * 60 * 1000).toISOString(), now.toISOString());
 
   const authorizationUrl = new URL(TikTokShop.AUTHORIZATION_URL);
@@ -839,17 +764,17 @@ app.get('/api/tiktok/connect', requireAuth, requireRole(['super-admin', 'store-a
   authorizationUrl.searchParams.set('state', state);
   res.set('Cache-Control', 'no-store');
   res.redirect(302, authorizationUrl.toString());
-});
+}));
 
-app.get('/api/tiktok/callback', async (req, res) => {
+app.get('/api/tiktok/callback', asyncRoute(async (req, res) => {
   const state = String(req.query.state || '');
   const authCode = String(req.query.auth_code || req.query.code || '');
   if (!state || !authCode) return res.status(400).send('Callback TikTok Shop tidak lengkap. Silakan mulai ulang proses koneksi.');
 
   const stateHash = hashOpaqueValue(state);
-  const pending = db.prepare('SELECT tenant_id AS tenantId FROM tiktok_oauth_states WHERE state_hash = ? AND expires_at > ?')
+  const pending = await db.prepare('SELECT tenant_id AS tenantId FROM tiktok_oauth_states WHERE state_hash = ? AND expires_at > ?')
     .get(stateHash, new Date().toISOString());
-  db.prepare('DELETE FROM tiktok_oauth_states WHERE state_hash = ?').run(stateHash);
+  await db.prepare('DELETE FROM tiktok_oauth_states WHERE state_hash = ?').run(stateHash);
   if (!pending) return res.status(400).send('Sesi koneksi TikTok Shop kedaluwarsa atau tidak valid. Silakan mulai ulang proses koneksi.');
 
   const { configured, config } = tiktokConfigStatus();
@@ -867,20 +792,19 @@ app.get('/api/tiktok/callback', async (req, res) => {
 
     const now = Date.now();
     const createdAt = new Date(now).toISOString();
-    const insertConnection = db.prepare(`
-      INSERT INTO tiktok_connections (
-        id, tenant_id, open_id, access_token, refresh_token,
-        access_token_expires_at, refresh_token_expires_at, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(tenant_id, open_id) DO UPDATE SET
-        access_token = excluded.access_token,
-        refresh_token = excluded.refresh_token,
-        access_token_expires_at = excluded.access_token_expires_at,
-        refresh_token_expires_at = excluded.refresh_token_expires_at,
-        updated_at = excluded.updated_at
-    `);
-    const saveConnection = db.transaction(() => {
-      insertConnection.run(
+    await db.transaction(async (tx) => {
+      await tx.prepare(`
+        INSERT INTO tiktok_connections (
+          id, tenant_id, open_id, access_token, refresh_token,
+          access_token_expires_at, refresh_token_expires_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(tenant_id, open_id) DO UPDATE SET
+          access_token = excluded.access_token,
+          refresh_token = excluded.refresh_token,
+          access_token_expires_at = excluded.access_token_expires_at,
+          refresh_token_expires_at = excluded.refresh_token_expires_at,
+          updated_at = excluded.updated_at
+      `).run(
         crypto.randomUUID(),
         pending.tenantId,
         String(tokenData.open_id),
@@ -891,10 +815,10 @@ app.get('/api/tiktok/callback', async (req, res) => {
         createdAt,
         createdAt,
       );
-      const connection = db.prepare('SELECT id FROM tiktok_connections WHERE tenant_id = ? AND open_id = ?')
+      const connection = await tx.prepare('SELECT id FROM tiktok_connections WHERE tenant_id = ? AND open_id = ?')
         .get(pending.tenantId, String(tokenData.open_id));
-      db.prepare('DELETE FROM tiktok_shops WHERE connection_id = ?').run(connection.id);
-      const insertShop = db.prepare(`
+      await tx.prepare('DELETE FROM tiktok_shops WHERE connection_id = ?').run(connection.id);
+      const insertShop = tx.prepare(`
         INSERT INTO tiktok_shops (id, tenant_id, connection_id, shop_id, shop_cipher, name, region, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(tenant_id, shop_id) DO UPDATE SET
@@ -904,7 +828,7 @@ app.get('/api/tiktok/callback', async (req, res) => {
           region = excluded.region
       `);
       for (const shop of validShops) {
-        insertShop.run(
+        await insertShop.run(
           crypto.randomUUID(),
           pending.tenantId,
           connection.id,
@@ -916,28 +840,27 @@ app.get('/api/tiktok/callback', async (req, res) => {
         );
       }
     });
-    saveConnection();
     return res.redirect('/?view=imports&tiktok=connected');
   } catch (error) {
     console.error('Koneksi TikTok Shop gagal:', error.message);
     return res.redirect('/?view=imports&tiktok=error');
   }
-});
+}));
 
-app.get('/api/tiktok/shops', requireAuth, requireRole(['super-admin', 'store-admin']), (req, res) => {
-  const shops = db.prepare(`
+app.get('/api/tiktok/shops', requireAuth, requireRole(['super-admin', 'store-admin']), asyncRoute(async (req, res) => {
+  const shops = await db.prepare(`
     SELECT shop_id AS shopId, name, region FROM tiktok_shops
-    WHERE tenant_id = ? ORDER BY name COLLATE NOCASE
+    WHERE tenant_id = ? ORDER BY LOWER(name)
   `).all(req.user.tenantId);
   res.json({ shops });
-});
+}));
 
-app.post('/api/tiktok/sync', requireAuth, requireRole(['super-admin', 'store-admin']), async (req, res) => {
+app.post('/api/tiktok/sync', requireAuth, requireRole(['super-admin', 'store-admin']), asyncRoute(async (req, res) => {
   const shopId = String(req.body?.shopId || '').trim();
   if (!shopId) return res.status(400).json({ error: 'Pilih toko TikTok Shop terlebih dahulu.' });
   const { configured, config } = tiktokConfigStatus();
   if (!configured) return res.status(503).json({ error: `Integrasi TikTok Shop belum dikonfigurasi: ${config.missing.join(', ')}.` });
-  const connection = tiktokConnectionForShop(req.user.tenantId, shopId);
+  const connection = await tiktokConnectionForShop(req.user.tenantId, shopId);
   if (!connection) return res.status(404).json({ error: 'Toko TikTok Shop tidak ditemukan pada tenant ini.' });
 
   try {
@@ -949,7 +872,7 @@ app.post('/api/tiktok/sync', requireAuth, requireRole(['super-admin', 'store-adm
     });
     const date = new Date().toISOString().slice(0, 10);
     const shopName = connection.shopName.trim().toLocaleLowerCase('id-ID');
-    const knownPackages = readState(req.user.tenantId).manifests
+    const knownPackages = (await readState(req.user.tenantId)).manifests
       .filter((manifest) => String(manifest.shop || '').trim().toLocaleLowerCase('id-ID') === shopName)
       .flatMap((manifest) => Array.isArray(manifest.packages) ? manifest.packages : []);
     const { orders: eligibleOrders, withoutTracking, alreadyImported, duplicateOrders } = TikTokShop.prepareImportOrders(orders, connection.shopName, date, {
@@ -968,16 +891,16 @@ app.post('/api/tiktok/sync', requireAuth, requireRole(['super-admin', 'store-adm
     console.error('Sinkronisasi TikTok Shop gagal:', error.message);
     res.status(502).json({ error: error.message || 'Sinkronisasi TikTok Shop gagal.' });
   }
-});
+}));
 
-app.get('/api/state', requireAuth, requireRole(['super-admin', 'store-admin', 'handover-staff']), (req, res) => {
-  res.json(readState(req.user.tenantId));
-});
+app.get('/api/state', requireAuth, requireRole(['super-admin', 'store-admin', 'handover-staff']), asyncRoute(async (req, res) => {
+  res.json(await readState(req.user.tenantId));
+}));
 
-app.post('/api/state', requireAuth, requireRole(['super-admin', 'store-admin', 'handover-staff']), (req, res) => {
+app.post('/api/state', requireAuth, requireRole(['super-admin', 'store-admin', 'handover-staff']), asyncRoute(async (req, res) => {
   const payload = req.body && typeof req.body === 'object' ? req.body : null;
   if (!payload) return res.status(400).json({ error: 'Payload state tidak valid.' });
-  const previous = readState(req.user.tenantId);
+  const previous = await readState(req.user.tenantId);
   if (!Array.isArray(payload.audit)) return res.status(400).json({ error: 'Data audit tidak valid.' });
   const auditError = validateAuditAppend(req.user, previous.audit, payload.audit);
   if (auditError) return res.status(403).json({ error: auditError });
@@ -988,9 +911,9 @@ app.post('/api/state', requireAuth, requireRole(['super-admin', 'store-admin', '
     const validationError = validateStoreAdminUpdate(req.user, previous, payload);
     if (validationError) return res.status(403).json({ error: validationError });
   }
-  writeState(req.user.tenantId, payload);
+  await writeState(req.user.tenantId, payload);
   res.json({ ok: true, updatedAt: new Date().toISOString() });
-});
+}));
 
 app.get('/', (req, res) => {
   res.sendFile(path.join(appDir, 'index.html'));
@@ -1012,6 +935,12 @@ app.get('/icons/:icon', (req, res) => {
   res.sendFile(path.join(appDir, 'icons', req.params.icon));
 });
 
-app.listen(port, () => {
-  console.log(`OrderGuard backend running on http://localhost:${port}`);
+initializeDatabase().then(() => {
+  app.listen(port, () => {
+    console.log(`OrderGuard backend connected to PostgreSQL and running on http://localhost:${port}`);
+  });
+}).catch(async (error) => {
+  console.error(`Gagal menginisialisasi PostgreSQL: ${error.message}`);
+  await db.pool.end();
+  process.exitCode = 1;
 });

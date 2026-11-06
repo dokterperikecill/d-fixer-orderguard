@@ -1,5 +1,8 @@
 node_modules/
 release/
+.env
+.env.*
+!.env.example
 data/*.db
 data/*.db-shm
 data/*.db-wal

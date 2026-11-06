@@ -1,10 +1,11 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
-const fs = require('node:fs');
-const os = require('node:os');
-const path = require('node:path');
-const Database = require('better-sqlite3');
+const { Pool } = require('pg');
+const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
+if (!TEST_DATABASE_URL) throw new Error('TEST_DATABASE_URL wajib menunjuk ke database PostgreSQL khusus untuk tes.');
+const testDatabase = new Pool({ connectionString: TEST_DATABASE_URL });
+test.after(async () => testDatabase.end());
 
 const TEST_USERS = [
   { id: 'admin', username: 'admin', password: 'admin123', name: 'Platform Admin', role: 'super-admin', tenantId: 'dfixer-store' },
@@ -13,37 +14,40 @@ const TEST_USERS = [
   { id: 'maya', username: 'maya', password: 'maya123', name: 'Maya Admin', role: 'store-admin', tenantId: 'maya-commerce' },
 ];
 
-function startTestServer(port, dbPath) {
+function startTestServer(port, schema, extraEnv = {}) {
   const child = spawn(process.execPath, ['server.js'], {
     cwd: __dirname,
     env: {
       ...process.env,
       PORT: String(port),
-      ORDERGUARD_DB_PATH: dbPath,
+      DATABASE_URL: TEST_DATABASE_URL,
+      DATABASE_SCHEMA: schema,
       NODE_ENV: 'test',
       ORDERGUARD_TEST_USERS: JSON.stringify(TEST_USERS),
       TIKTOK_APP_KEY: '',
       TIKTOK_APP_SECRET: '',
       TIKTOK_REDIRECT_URI: '',
       ORDERGUARD_TOKEN_ENCRYPTION_KEY: '',
+      ...extraEnv,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   return child;
 }
 
-function createTestServer(port, prepareDatabase) {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orderguard-test-'));
-  const dbPath = path.join(directory, 'orderguard.db');
-  if (prepareDatabase) prepareDatabase(dbPath);
-  return { child: startTestServer(port, dbPath), dbPath, directory, port };
+async function createTestServer(port, prepareDatabase, schema = `orderguard_test_${port}`) {
+  if (!/^[a-z_][a-z0-9_]{0,62}$/.test(schema)) throw new Error('Invalid test schema.');
+  await testDatabase.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+  await testDatabase.query(`CREATE SCHEMA "${schema}"`);
+  if (prepareDatabase) await prepareDatabase(schema);
+  return { child: startTestServer(port, schema), schema, port };
 }
 
-async function stopTestServer(server, removeDirectory = true) {
+async function stopTestServer(server, removeSchema = true) {
   const exited = new Promise((resolve) => server.child.once('exit', resolve));
   server.child.kill('SIGTERM');
   await exited;
-  if (removeDirectory) fs.rmSync(server.directory, { recursive: true, force: true });
+  if (removeSchema) await testDatabase.query(`DROP SCHEMA IF EXISTS "${server.schema}" CASCADE`);
 }
 
 function waitForServer(port) {
@@ -66,7 +70,7 @@ function waitForServer(port) {
 
 test('server exposes health endpoint and state API', async () => {
   const port = 4310;
-  const server = createTestServer(port);
+  const server = await createTestServer(port);
 
   try {
     await waitForServer(port);
@@ -140,7 +144,7 @@ test('server exposes health endpoint and state API', async () => {
 
 test('session remains valid after server restart and is removed on logout', async () => {
   const port = 4315;
-  let server = createTestServer(port);
+  let server = await createTestServer(port);
 
   try {
     await waitForServer(port);
@@ -153,7 +157,7 @@ test('session remains valid after server restart and is removed on logout', asyn
     assert.ok(cookie);
     await stopTestServer(server, false);
 
-    server = { ...server, child: startTestServer(port, server.dbPath) };
+    server = { ...server, child: startTestServer(port, server.schema) };
     await waitForServer(port);
     const session = await fetch(`http://127.0.0.1:${port}/api/session`, {
       headers: { Cookie: `orderguard_session=${cookie}` },
@@ -176,11 +180,15 @@ test('session remains valid after server restart and is removed on logout', asyn
 
 test('production requires explicit bootstrap credentials and marks session cookies secure', async () => {
   const port = 4316;
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orderguard-production-test-'));
-  const emptyDatabase = path.join(directory, 'empty.sqlite');
+  const emptySchema = 'orderguard_test_4316_empty';
+  const productionSchema = 'orderguard_test_4316_production';
+  await testDatabase.query(`DROP SCHEMA IF EXISTS "${emptySchema}" CASCADE`);
+  await testDatabase.query(`DROP SCHEMA IF EXISTS "${productionSchema}" CASCADE`);
+  await testDatabase.query(`CREATE SCHEMA "${emptySchema}"`);
+  await testDatabase.query(`CREATE SCHEMA "${productionSchema}"`);
   const missingBootstrap = spawn(process.execPath, ['server.js'], {
     cwd: __dirname,
-    env: { ...process.env, NODE_ENV: 'production', PORT: String(port), ORDERGUARD_DB_PATH: emptyDatabase },
+    env: { ...process.env, NODE_ENV: 'production', PORT: String(port), DATABASE_URL: TEST_DATABASE_URL, DATABASE_SCHEMA: emptySchema },
     stdio: ['ignore', 'ignore', 'pipe'],
   });
   let startupError = '';
@@ -189,7 +197,6 @@ test('production requires explicit bootstrap credentials and marks session cooki
   assert.equal(exitCode, 1);
   assert.match(startupError, /ORDERGUARD_BOOTSTRAP_PASSWORD/);
 
-  const databasePath = path.join(directory, 'production.sqlite');
   const server = {
     child: spawn(process.execPath, ['server.js'], {
       cwd: __dirname,
@@ -197,14 +204,15 @@ test('production requires explicit bootstrap credentials and marks session cooki
         ...process.env,
         NODE_ENV: 'production',
         PORT: String(port),
-        ORDERGUARD_DB_PATH: databasePath,
+        DATABASE_URL: TEST_DATABASE_URL,
+        DATABASE_SCHEMA: productionSchema,
         ORDERGUARD_BOOTSTRAP_USERNAME: 'production-owner',
         ORDERGUARD_BOOTSTRAP_NAME: 'Production Owner',
         ORDERGUARD_BOOTSTRAP_PASSWORD: 'production-test-password-123',
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     }),
-    directory,
+    schema: productionSchema,
   };
 
   try {
@@ -218,12 +226,13 @@ test('production requires explicit bootstrap credentials and marks session cooki
     assert.match(login.headers.get('set-cookie') || '', /; Secure(?:;|$)/i);
   } finally {
     await stopTestServer(server);
+    await testDatabase.query(`DROP SCHEMA IF EXISTS "${emptySchema}" CASCADE`);
   }
 });
 
 test('handover staff can scan packages but cannot change administrative state', async () => {
   const port = 4311;
-  const server = createTestServer(port);
+  const server = await createTestServer(port);
 
   try {
     await waitForServer(port);
@@ -327,15 +336,13 @@ test('handover staff can scan packages but cannot change administrative state', 
 
 test('tenant state is isolated and legacy D\'Fixer data is preserved', async () => {
   const port = 4312;
-  const server = createTestServer(port, (dbPath) => {
-    const db = new Database(dbPath);
-    db.exec(`CREATE TABLE app_state (id TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at TEXT NOT NULL)`);
-    db.prepare('INSERT INTO app_state (id, payload, updated_at) VALUES (?, ?, ?)').run(
+  const server = await createTestServer(port, async (schema) => {
+    await testDatabase.query(`CREATE TABLE "${schema}".app_state (id TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at TEXT NOT NULL)`);
+    await testDatabase.query(`INSERT INTO "${schema}".app_state (id, payload, updated_at) VALUES ($1, $2, $3)`, [
       'state',
       JSON.stringify({ manifests: [{ id: 'legacy-dfixer' }], incidents: [], audit: [], importJobs: [], marker: 'legacy-state' }),
       new Date().toISOString(),
-    );
-    db.close();
+    ]);
   });
 
   try {
@@ -444,7 +451,7 @@ test('tenant state is isolated and legacy D\'Fixer data is preserved', async () 
 
 test('employee management is super-admin only and updates credentials and access', async () => {
   const port = 4313;
-  const server = createTestServer(port);
+  const server = await createTestServer(port);
 
   try {
     await waitForServer(port);
@@ -557,7 +564,7 @@ test('employee management is super-admin only and updates credentials and access
 
 test('tenant creation and rename are restricted and reflected in employee accounts', async () => {
   const port = 4314;
-  const server = createTestServer(port);
+  const server = await createTestServer(port);
 
   try {
     await waitForServer(port);

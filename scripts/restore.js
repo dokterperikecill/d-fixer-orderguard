@@ -1,71 +1,45 @@
 const fs = require('node:fs');
 const path = require('node:path');
-const Database = require('better-sqlite3');
+const { spawnSync } = require('node:child_process');
 
-const appDir = path.resolve(__dirname, '..');
-const databasePath = path.resolve(process.env.ORDERGUARD_DB_PATH || path.join(appDir, 'data', 'orderguard.db'));
-const backupDirectory = path.resolve(process.env.ORDERGUARD_BACKUP_DIR || path.join(appDir, 'data', 'backups'));
+const databaseUrl = process.env.DATABASE_URL;
+const backupDirectory = path.resolve(process.env.ORDERGUARD_BACKUP_DIR || path.join(__dirname, '..', 'data', 'backups'));
 const backupPath = process.argv[2] ? path.resolve(process.argv[2]) : '';
 const timestamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
 
-function verifyDatabase(filePath) {
-  const database = new Database(filePath, { readonly: true, fileMustExist: true });
-  try {
-    const integrity = database.pragma('integrity_check', { simple: true });
-    if (integrity !== 'ok') throw new Error(`integrity_check gagal: ${integrity}`);
-    const tables = new Set(database.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((row) => row.name));
-    for (const required of ['users', 'tenants', 'tenant_state']) {
-      if (!tables.has(required)) throw new Error(`Backup tidak memiliki tabel ${required}.`);
-    }
-  } finally {
-    database.close();
-  }
+function postgresEnvironment() {
+  if (!databaseUrl) throw new Error('DATABASE_URL wajib diatur untuk restore PostgreSQL.');
+  const url = new URL(databaseUrl);
+  return {
+    PGHOST: url.hostname,
+    PGPORT: url.port || '5432',
+    PGDATABASE: decodeURIComponent(url.pathname.slice(1)),
+    PGUSER: decodeURIComponent(url.username),
+    ...(url.password ? { PGPASSWORD: decodeURIComponent(url.password) } : {}),
+    ...(url.searchParams.get('sslmode') ? { PGSSLMODE: url.searchParams.get('sslmode') } : {}),
+  };
 }
 
-async function main() {
-  if (!backupPath || !fs.existsSync(backupPath)) throw new Error('Berikan path file backup SQLite yang tersedia.');
-  if (backupPath === databasePath) throw new Error('File backup dan database aktif tidak boleh sama.');
-  verifyDatabase(backupPath);
-  fs.mkdirSync(path.dirname(databasePath), { recursive: true });
+function run(command, args) {
+  const result = spawnSync(command, args, { env: { ...process.env, ...postgresEnvironment() }, encoding: 'utf8' });
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw new Error(result.stderr.trim() || `${command} exited with status ${result.status}.`);
+}
+
+try {
+  if (!backupPath || !fs.existsSync(backupPath) || path.extname(backupPath) !== '.dump') {
+    throw new Error('Berikan path file backup PostgreSQL .dump yang tersedia.');
+  }
+  run('pg_restore', ['--list', backupPath]);
+
   fs.mkdirSync(backupDirectory, { recursive: true, mode: 0o700 });
   fs.chmodSync(backupDirectory, 0o700);
-
-  const stagedPath = `${databasePath}.restore-${process.pid}.tmp`;
-  const safetyBackupPath = path.join(backupDirectory, `orderguard-pre-restore-${timestamp}.sqlite`);
-  let liveDatabase;
-  try {
-    if (fs.existsSync(databasePath)) {
-      liveDatabase = new Database(databasePath, { fileMustExist: true });
-      await liveDatabase.backup(safetyBackupPath);
-      liveDatabase.close();
-      liveDatabase = null;
-      fs.chmodSync(safetyBackupPath, 0o600);
-    }
-
-    const backup = new Database(backupPath, { readonly: true, fileMustExist: true });
-    try {
-      await backup.backup(stagedPath);
-    } finally {
-      backup.close();
-    }
-    fs.chmodSync(stagedPath, 0o600);
-    verifyDatabase(stagedPath);
-
-    for (const suffix of ['-wal', '-shm']) {
-      const sidecar = `${databasePath}${suffix}`;
-      if (fs.existsSync(sidecar)) fs.unlinkSync(sidecar);
-    }
-    fs.renameSync(stagedPath, databasePath);
-    verifyDatabase(databasePath);
-    console.log(`Database dipulihkan dari ${backupPath}${fs.existsSync(safetyBackupPath) ? `. Backup sebelum restore: ${safetyBackupPath}` : ''}`);
-  } catch (error) {
-    liveDatabase?.close();
-    if (fs.existsSync(stagedPath)) fs.unlinkSync(stagedPath);
-    throw error;
-  }
-}
-
-main().catch((error) => {
+  const safetyBackupPath = path.join(backupDirectory, `orderguard-pre-restore-${timestamp}.dump`);
+  run('pg_dump', ['--format=custom', '--no-owner', '--no-acl', '--file', safetyBackupPath]);
+  fs.chmodSync(safetyBackupPath, 0o600);
+  run('pg_restore', ['--clean', '--if-exists', '--no-owner', '--no-acl', '--exit-on-error', backupPath]);
+  console.log(`Database PostgreSQL dipulihkan dari ${backupPath}. Backup sebelum restore: ${safetyBackupPath}`);
+} catch (error) {
   console.error(`Restore gagal: ${error.message}`);
   process.exitCode = 1;
-});
+}
