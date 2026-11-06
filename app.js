@@ -6,14 +6,15 @@ const VIEW_LABELS = {
   manifests: "Manifest",
   imports: "Impor data",
   incidents: "Insiden",
+  returns: "Pembatalan & Retur",
   reports: "Laporan",
   audit: "Audit log",
   employees: "Karyawan",
 };
 const ROLE_PERMISSIONS = {
-  'super-admin': ['dashboard', 'manifests', 'imports', 'incidents', 'reports', 'audit', 'employees'],
-  'store-admin': ['dashboard', 'manifests', 'imports', 'incidents', 'reports', 'audit'],
-  'handover-staff': ['dashboard', 'manifests'],
+  'super-admin': ['dashboard', 'manifests', 'imports', 'incidents', 'returns', 'reports', 'audit', 'employees'],
+  'store-admin': ['dashboard', 'manifests', 'imports', 'incidents', 'returns', 'reports', 'audit'],
+  'handover-staff': ['dashboard', 'manifests', 'returns'],
 };
 const ROLE_LABELS = {
   'super-admin': 'Platform Admin',
@@ -39,6 +40,10 @@ const PACKAGE_LABELS = {
   HANDED_OVER: "Diterima kurir",
   REJECTED: "Ditolak kurir",
   CANCELLED: "Dibatalkan",
+  CANCELLED_BEFORE_HANDOVER: "Dibatalkan pembeli",
+  CANCELLATION_AFTER_HANDOVER: "Batal setelah pickup",
+  RETURN_IN_TRANSIT: "Dalam retur",
+  RETURN_RECEIVED: "Retur diterima",
 };
 const SCAN_LABELS = {
   MATCH: "Cocok",
@@ -47,6 +52,16 @@ const SCAN_LABELS = {
   ALREADY_HANDED_OVER: "Sudah diserahkan",
   INVALID_PACKAGE: "Kode tidak dikenal",
   CANCELLED: "Paket dibatalkan",
+  CANCELLED_BY_BUYER: "Dibatalkan pembeli",
+  RETURN_IN_TRANSIT: "Dalam retur",
+  RETURN_RECEIVED: "Retur diterima",
+};
+const ORDER_EVENT_LABELS = {
+  CANCELLED_BEFORE_HANDOVER: "Pembatalan pembeli",
+  CANCELLATION_AFTER_HANDOVER: "Pembatalan setelah pickup",
+  RETURN_IN_TRANSIT: "Retur dalam perjalanan",
+  RETURN_RECEIVED: "Retur diterima",
+  CANCELLATION_REJECTED: "Pembatalan ditolak",
 };
 
 const todayISO = () => new Date().toISOString().slice(0, 10);
@@ -56,7 +71,6 @@ const escapeHtml = (value = "") => String(value).replace(/[&<>"']/g, (character)
   "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
 }[character]));
 const normalize = (value = "") => String(value).trim().toLocaleLowerCase("id-ID");
-const trackingScope = (tracking, shop, courier, date) => [normalize(tracking), normalize(shop), normalize(courier), date].join("|");
 const formatDate = (value) => value ? new Intl.DateTimeFormat("id-ID", { day: "numeric", month: "short", year: "numeric" }).format(new Date(`${value.slice(0, 10)}T12:00:00`)) : "-";
 const formatDateTime = (value) => value ? new Intl.DateTimeFormat("id-ID", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }).format(new Date(value)) : "-";
 const statusClass = (status) => ({
@@ -65,7 +79,8 @@ const statusClass = (status) => ({
   CLOSED: "closed", CANCELLED: "cancelled", RESOLVED: "confirmed", MATCH: "confirmed",
   DUPLICATE_SCAN: "partial", NOT_IN_MANIFEST: "exception", ALREADY_HANDED_OVER: "exception",
   INVALID_PACKAGE: "exception", EXPECTED: "required", SCANNED: "open", HANDED_OVER: "confirmed",
-  REJECTED: "exception",
+  REJECTED: "exception", CANCELLED_BEFORE_HANDOVER: "cancelled", CANCELLATION_AFTER_HANDOVER: "exception",
+  RETURN_IN_TRANSIT: "partial", RETURN_RECEIVED: "confirmed", CANCELLED_BY_BUYER: "cancelled",
 }[status] || "");
 
 function sampleState(shopName = "D'Fixer Store") {
@@ -85,7 +100,7 @@ function sampleState(shopName = "D'Fixer Store") {
     ["ORD-5790", "JNE0008114201", "HANDED_OVER"],
     ["ORD-5791", "JNE0008114202", "HANDED_OVER"],
     ["ORD-5792", "JNE0008114203", "EXPECTED"],
-  ].map(([order, tracking, status]) => ({ order, tracking, status, scannedAt: null }));
+  ].map(([order, tracking, status]) => ({ order, tracking, status, scannedAt: null, ...(status === "HANDED_OVER" ? { handedOverAt: new Date(Date.now() - 86400000 + 3600000).toISOString(), handedOverSessionId: `TR-${yesterday.replaceAll("-", "")}-01` } : {}) }));
   return {
     manifests: [
       { id: firstId, shop: shopName, courier: "J&T Express", location: "Gudang Jakarta Selatan", date: today, status: "HANDOVER_IN_PROGRESS", createdAt: nowISO(), createdBy: ACTOR, packages: firstPackages, scans: ["SPXID028451101", "SPXID028451102"].map((tracking) => ({ tracking, result: "MATCH", createdAt: nowISO(), actor: ACTOR })), sessions: [] },
@@ -98,6 +113,7 @@ function sampleState(shopName = "D'Fixer Store") {
       { id: makeId("AU"), actor: ACTOR, action: "Insiden dicatat: Paket di luar manifest", object: "INC-2601", createdAt: nowISO() },
     ],
     importJobs: [],
+    orderEvents: [],
   };
 }
 
@@ -106,7 +122,7 @@ function loadState(storageKey = STORAGE_KEY, shopName = "D'Fixer Store") {
     const saved = localStorage.getItem(storageKey);
     if (saved) {
       const parsed = JSON.parse(saved);
-      return { manifests: [], incidents: [], audit: [], importJobs: [], ...parsed };
+      return { manifests: [], incidents: [], audit: [], importJobs: [], orderEvents: [], ...parsed };
     }
   } catch (error) {
     console.warn("Data lokal tidak dapat dibaca.", error);
@@ -140,7 +156,7 @@ async function hydrateStateFromServer() {
   }
 }
 
-const state = { manifests: [], incidents: [], audit: [], importJobs: [] };
+const state = { manifests: [], incidents: [], audit: [], importJobs: [], orderEvents: [] };
 let currentUser = null;
 let currentView = "dashboard";
 let selectedManifestId = null;
@@ -154,6 +170,21 @@ let tiktokShops = [];
 const content = document.querySelector("#page-content");
 const modalBackdrop = document.querySelector("#modal-backdrop");
 const modal = document.querySelector("#modal");
+let runtimeConfig = { environment: "sandbox" };
+
+async function loadRuntimeConfig() {
+  try {
+    const response = await fetch("/api/config", { credentials: "same-origin" });
+    if (response.ok) {
+      const config = await response.json();
+      if (config?.environment) runtimeConfig = config;
+    }
+  } catch (error) {
+    console.warn("Konfigurasi runtime tidak dapat dibaca.", error);
+  }
+  const label = document.querySelector("#environment-label");
+  if (label) label.textContent = runtimeConfig.environment === "production" ? "PRODUCTION" : "SANDBOX";
+}
 
 async function getSession() {
   try {
@@ -283,12 +314,17 @@ function getManifest(id) {
 
 function getManifestCounts(manifest) {
   const packages = manifest.packages || [];
+  const sessionTrackings = new Set((manifest.sessions || []).flatMap((session) => Array.isArray(session.items) ? session.items : []));
+  const handed = packages.filter((parcel) => parcel.handedOverAt || parcel.status === "HANDED_OVER" || sessionTrackings.has(parcel.tracking)).length;
   const expected = packages.filter((parcel) => parcel.status !== "CANCELLED").length;
-  const scanned = packages.filter((parcel) => ["SCANNED", "HANDED_OVER", "REJECTED"].includes(parcel.status)).length;
-  const handed = packages.filter((parcel) => parcel.status === "HANDED_OVER").length;
-  const outstanding = packages.filter((parcel) => ["EXPECTED", "SCANNED", "REJECTED", "EXCEPTION"].includes(parcel.status)).length;
+  const scanned = packages.filter((parcel) => parcel.scannedAt || ["SCANNED", "HANDED_OVER", "REJECTED", "CANCELLATION_AFTER_HANDOVER", "RETURN_IN_TRANSIT", "RETURN_RECEIVED"].includes(parcel.status)).length;
+  const cancelledBefore = packages.filter((parcel) => parcel.status === "CANCELLED_BEFORE_HANDOVER").length;
+  const cancelledAfter = packages.filter((parcel) => parcel.status === "CANCELLATION_AFTER_HANDOVER").length;
+  const inReturn = packages.filter((parcel) => parcel.status === "RETURN_IN_TRANSIT").length;
+  const returned = packages.filter((parcel) => parcel.status === "RETURN_RECEIVED").length;
+  const outstanding = packages.filter((parcel) => ["EXPECTED", "SCANNED", "REJECTED", "EXCEPTION", "CANCELLATION_AFTER_HANDOVER", "RETURN_IN_TRANSIT"].includes(parcel.status)).length;
   const incidents = state.incidents.filter((incident) => incident.manifestId === manifest.id && incident.status === "OPEN").length;
-  return { expected, scanned, handed, outstanding, incidents };
+  return { expected, scanned, handed, outstanding, incidents, cancelledBefore, cancelledAfter, inReturn, returned };
 }
 
 function computedManifestStatus(manifest) {
@@ -321,22 +357,15 @@ function renderLogin() {
           </div>
         </div>
         <h1>Masuk ke sistem</h1>
-        <p class="page-subtitle">Gunakan akun demo untuk membuka manifest dan serah terima.</p>
+        <p class="page-subtitle">Masuk dengan akun yang diberikan administrator.</p>
         <form id="login-form" class="login-form">
           <div class="field">
             <label for="login-username">Username</label>
-            <input id="login-username" name="username" required value="rani" />
+            <input id="login-username" name="username" autocomplete="username" required />
           </div>
           <div class="field">
             <label for="login-password">Password</label>
-            <input id="login-password" name="password" type="password" required value="rani123" />
-          </div>
-          <div class="login-account-list">
-            <span>Demo akun:</span>
-            <button type="button" class="mini-role" data-role="admin" data-user="admin" data-pass="admin123">admin / admin123</button>
-            <button type="button" class="mini-role" data-role="rani" data-user="rani" data-pass="rani123">rani / rani123</button>
-            <button type="button" class="mini-role" data-role="handover" data-user="handover" data-pass="handover123">handover / handover123</button>
-            <button type="button" class="mini-role" data-role="maya" data-user="maya" data-pass="maya123">maya / maya123</button>
+            <input id="login-password" name="password" type="password" autocomplete="current-password" required />
           </div>
           <button class="button button-primary" type="submit" style="width:100%"><i data-lucide="log-in"></i> Masuk</button>
         </form>
@@ -347,6 +376,7 @@ function renderLogin() {
 }
 
 function renderPage() {
+  document.body.classList.toggle("auth-mode", !currentUser);
   if (!currentUser) {
     renderLogin();
     return;
@@ -372,11 +402,13 @@ function renderPage() {
   document.querySelector("#breadcrumb-current").textContent = selectedManifestId && currentView === "manifest-detail" ? selectedManifestId : VIEW_LABELS[currentView] || "Manifest";
   document.querySelector("#nav-manifest-count").textContent = state.manifests.filter((manifest) => !["CLOSED", "CANCELLED"].includes(computedManifestStatus(manifest))).length;
   document.querySelector("#nav-incident-count").textContent = state.incidents.filter((incident) => incident.status === "OPEN").length;
+  document.querySelector("#nav-return-count").textContent = state.manifests.flatMap((manifest) => manifest.packages || []).filter((parcel) => ["CANCELLATION_AFTER_HANDOVER", "RETURN_IN_TRANSIT"].includes(parcel.status)).length;
   const renderers = {
     dashboard: renderDashboard,
     manifests: renderManifests,
     imports: renderImports,
     incidents: renderIncidents,
+    returns: renderReturns,
     reports: renderReports,
     audit: renderAudit,
     employees: renderEmployees,
@@ -407,6 +439,28 @@ function manifestRow(manifest) {
   </tr>`;
 }
 
+function renderEventEntryPanel() {
+  const handoverOnly = currentUser?.role === "handover-staff";
+  const options = (handoverOnly
+    ? [["RETURN_RECEIVED", "Retur diterima"]]
+    : [
+        ["CANCELLATION_AFTER_HANDOVER", "Pembatalan pembeli setelah pickup"],
+        ["CANCELLED_BEFORE_HANDOVER", "Pembatalan pembeli sebelum pickup"],
+        ["RETURN_IN_TRANSIT", "Retur dalam perjalanan"],
+        ["RETURN_RECEIVED", "Retur diterima"],
+        ["CANCELLATION_REJECTED", "Pembatalan ditolak marketplace"],
+      ]).map(([value, label]) => `<option value="${value}">${label}</option>`).join("");
+  return `<section class="panel event-entry-panel">
+    <div class="panel-heading"><div><h2>Catat pembatalan atau retur</h2><p>Masukkan resi yang sudah ada pada manifest tenant ini.</p></div><span class="status-pill ${handoverOnly ? "confirmed" : "partial"}">${handoverOnly ? "Retur diterima" : "Store Admin"}</span></div>
+    <form id="event-lookup-form" class="event-entry-form">
+      <div class="field"><label for="event-tracking">Nomor resi</label><input id="event-tracking" name="tracking" required autocomplete="off" placeholder="Contoh: SPXID028451101" /></div>
+      <div class="field"><label for="event-type">Jenis kejadian</label><select id="event-type" name="type">${options}</select></div>
+      <button class="button button-primary" type="submit"><i data-lucide="search"></i> Cari resi</button>
+    </form>
+    <div id="event-lookup-result" class="event-lookup-result"></div>
+  </section>`;
+}
+
 function renderDashboard() {
   const manifests = [...state.manifests].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   const totals = state.manifests.reduce((summary, manifest) => {
@@ -422,13 +476,15 @@ function renderDashboard() {
   const recentRows = manifests.slice(0, 5).map(manifestRow).join("");
   const scannedPercent = totals.planned ? Math.round((totals.scanned / totals.planned) * 100) : 0;
   const handedPercent = totals.planned ? Math.round((totals.handed / totals.planned) * 100) : 0;
-  content.innerHTML = `${pageHeading("PUSAT OPERASIONAL", "Ringkasan serah terima", "Pantau paket yang direncanakan, dipindai, dan diterima kurir.", '<button class="button button-secondary" data-action="go-import"><i data-lucide="file-up"></i> Impor data</button><button class="button button-primary" data-action="new-manifest"><i data-lucide="plus"></i> Manifest baru</button>')}
+  const manageActions = hasAccess("imports") ? '<button class="button button-secondary" data-action="go-import"><i data-lucide="file-up"></i> Impor data</button><button class="button button-primary" data-action="new-manifest"><i data-lucide="plus"></i> Manifest baru</button>' : "";
+  content.innerHTML = `${pageHeading("PUSAT OPERASIONAL", "Ringkasan serah terima", "Pantau paket yang direncanakan, dipindai, dan diterima kurir.", manageActions)}
     <div class="stats-grid">
       <article class="stat-card"><div class="stat-top"><span>Paket direncanakan</span><span class="stat-icon"><i data-lucide="package"></i></span></div><div class="stat-value">${totals.planned}<span class="stat-context">semua manifest</span></div></article>
       <article class="stat-card"><div class="stat-top"><span>Paket dipindai unik</span><span class="stat-icon blue"><i data-lucide="scan-line"></i></span></div><div class="stat-value">${totals.scanned}<span class="stat-context">${scannedPercent}% dari rencana</span></div></article>
       <article class="stat-card"><div class="stat-top"><span>Diterima kurir</span><span class="stat-icon"><i data-lucide="badge-check"></i></span></div><div class="stat-value">${totals.handed}<span class="stat-context">terkonfirmasi</span></div></article>
       <article class="stat-card"><div class="stat-top"><span>Perlu ditindaklanjuti</span><span class="stat-icon ${issues ? "coral" : "amber"}"><i data-lucide="triangle-alert"></i></span></div><div class="stat-value">${issues}<span class="stat-context">${active} manifest aktif</span></div></article>
     </div>
+    ${renderEventEntryPanel()}
     <div class="dashboard-grid">
       <section class="panel"><div class="panel-heading"><div><h2>Manifest terbaru</h2><p>Aktivitas operasional lintas jadwal</p></div><button class="text-button" data-action="go-manifests">Semua manifest <i data-lucide="arrow-right"></i></button></div>
         ${manifests.length ? `<div class="table-wrap"><table class="manifest-table"><thead><tr><th>MANIFEST / TOKO</th><th>KURIR</th><th>JADWAL</th><th>REKONSILIASI</th><th>STATUS</th><th></th></tr></thead><tbody>${recentRows}</tbody></table></div>` : emptyState("boxes", "Belum ada manifest", "Impor data atau buat manifest baru untuk mulai mencatat serah terima.")}
@@ -440,16 +496,16 @@ function renderDashboard() {
         <div class="activity-strip"><i data-lucide="shield-check"></i><p>Jumlah diterima dihitung dari daftar resi di sesi serah terima terkonfirmasi, bukan dari angka yang diketik.</p></div>
       </section>
     </div>
-    <div class="footer-note">Data demo tersimpan di server dan dipisahkan per tenant. Gunakan akun demo saja; kredensial dan pengelolaan tenant belum disiapkan untuk produksi.</div>`;
+    <div class="footer-note">Data operasional tersimpan di server dan dipisahkan per tenant. Gunakan akun sesuai peran yang diberikan administrator.</div>`;
 }
 
 function renderManifests() {
   const manifests = [...state.manifests].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-  const actions = '<button class="button button-secondary" data-action="go-import"><i data-lucide="file-up"></i> Impor data</button><button class="button button-primary" data-action="new-manifest"><i data-lucide="plus"></i> Buat manifest</button>';
+  const actions = hasAccess("imports") ? '<button class="button button-secondary" data-action="go-import"><i data-lucide="file-up"></i> Impor data</button><button class="button button-primary" data-action="new-manifest"><i data-lucide="plus"></i> Buat manifest</button>' : "";
   content.innerHTML = `${pageHeading("OPERASIONAL", "Semua manifest", "Daftar paket rencana dan status serah terima per kurir.", actions)}
     <section class="panel"><div class="section-toolbar"><div class="toolbar-left"><label class="search-box"><i data-lucide="search"></i><input id="manifest-search" type="search" placeholder="Cari ID, toko, atau resi" aria-label="Cari manifest" /></label><select id="manifest-status-filter" class="filter-select" aria-label="Filter status"><option value="">Semua status</option><option value="active">Aktif</option><option value="PARTIALLY_HANDED_OVER">Diterima sebagian</option><option value="CONFIRMED">Terkonfirmasi</option><option value="CLOSED">Ditutup</option><option value="CANCELLED">Dibatalkan</option></select></div><div class="toolbar-right"><span class="cell-secondary">${manifests.length} manifest</span></div></div>
       ${manifests.length ? `<div class="table-wrap"><table class="manifest-table"><thead><tr><th>MANIFEST / TOKO</th><th>KURIR</th><th>JADWAL</th><th>REKONSILIASI</th><th>STATUS</th><th>AKSI</th></tr></thead><tbody id="manifest-table-body">${manifests.map(manifestRow).join("")}</tbody></table></div>` : emptyState("boxes", "Manifest belum dibuat", "Impor CSV atau buat manifest secara manual untuk mulai.")}
-    </section><div class="footer-note">Satu resi hanya dapat berada pada satu manifest aktif. Pemindahan paket antarmanifest memerlukan proses koreksi tercatat.</div>`;
+    </section><div class="footer-note">Satu resi hanya dapat berada pada satu manifest. Pemindahan paket antarmanifest memerlukan proses koreksi tercatat.</div>`;
 }
 
 function filterManifestRows() {
@@ -506,10 +562,10 @@ function renderImports() {
   const previousJob = lastImportJob ? `<div class="callout" style="margin-bottom:14px"><i data-lucide="circle-check"></i><p><strong>Impor selesai.</strong> ${lastImportJob.valid} baris valid masuk ke ${lastImportJob.manifestCount} manifest; ${lastImportJob.failed} baris ditolak dan tercatat.${lastImportJob.failed ? ` <button class="text-button" data-action="export-failed" data-id="${escapeHtml(lastImportJob.id)}">Unduh baris gagal</button>` : ""}</p></div>` : "";
   content.innerHTML = `${pageHeading("DATA MASUK", "Impor pesanan", "Unggah CSV atau Excel, petakan kolom, lalu tinjau hasil validasi sebelum membuat manifest.")}
     ${previousJob}<section class="panel history-panel tiktok-panel"><div class="panel-heading"><div><h2>Integrasi TikTok Shop</h2><p>Ambil pesanan dari toko yang sudah mengotorisasi aplikasi.</p></div></div><div id="tiktok-integration"><p class="page-subtitle">Memeriksa koneksi TikTok Shop...</p></div></section>
-    <div class="import-layout"><section class="panel import-main"><div class="step-line"><span class="step-number">1</span><div><strong>Pilih file dan petakan kolom</strong><small>Data diproses di browser ini; pelanggan tidak perlu ikut diimpor.</small></div></div>
+    <div class="import-layout"><section class="panel import-main"><div class="step-line"><span class="step-number">1</span><div><strong>Pilih file dan petakan kolom</strong><small>File diproses di browser ini; pelanggan tidak perlu ikut diimpor.</small></div></div>
       <label class="upload-zone" id="upload-zone" for="import-file"><span class="upload-icon"><i data-lucide="file-up"></i></span><strong>Letakkan file di sini atau pilih dari perangkat</strong><p>CSV, XLS, atau XLSX · satu baris untuk satu resi/paket</p><button class="button button-secondary button-small" type="button" id="choose-file">Pilih file</button><input id="import-file" type="file" accept=".csv,.xlsx,.xls,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel" /><span class="file-name" id="file-name">Belum ada file dipilih</span></label>
       <div id="import-mapping">${importDraft ? renderMapping() : ""}</div><div id="import-preview"></div>
-    </section><aside class="import-sidebar"><div class="guide-card"><h3>Validasi sebelum manifest</h3><ul><li><i data-lucide="check"></i>Nomor pesanan, resi, dan kurir harus terisi.</li><li><i data-lucide="check"></i>Resi duplikat di file atau manifest aktif ditolak, tidak dihapus diam-diam.</li><li><i data-lucide="check"></i>Kolom toko dan jadwal dapat dipetakan untuk pengelompokan.</li><li><i data-lucide="check"></i>Hanya baris valid yang masuk ke manifest.</li></ul></div><div class="guide-note"><strong>Privasi data</strong><p>File tidak dikirim ke server. Data yang disimpan dalam demo ini tetap berada di penyimpanan browser pada perangkat yang digunakan.</p></div><div class="guide-card"><h3>Riwayat impor terakhir</h3>${state.importJobs.length ? state.importJobs.slice(0, 5).map((job) => `<div class="history-session"><div><strong>${escapeHtml(job.fileName)}</strong><small>${formatDateTime(job.createdAt)} · ${job.valid} valid · ${job.failed} ditolak</small></div></div>`).join("") : '<p class="page-subtitle">Belum ada riwayat impor.</p>'}</div></aside></div>`;
+    </section><aside class="import-sidebar"><div class="guide-card"><h3>Validasi sebelum manifest</h3><ul><li><i data-lucide="check"></i>Nomor pesanan, resi, dan kurir harus terisi.</li><li><i data-lucide="check"></i>Resi duplikat di file atau manifest aktif ditolak, tidak dihapus diam-diam.</li><li><i data-lucide="check"></i>Kolom toko dan jadwal dapat dipetakan untuk pengelompokan.</li><li><i data-lucide="check"></i>Hanya baris valid yang masuk ke manifest.</li></ul></div><div class="guide-note"><strong>Privasi data</strong><p>Isi file diproses di browser. Setelah konfirmasi, manifest dan hasil validasi disimpan ke server.</p></div><div class="guide-card"><h3>Riwayat impor terakhir</h3>${state.importJobs.length ? state.importJobs.slice(0, 5).map((job) => `<div class="history-session"><div><strong>${escapeHtml(job.fileName)}</strong><small>${formatDateTime(job.createdAt)} · ${job.valid} valid · ${job.failed} ditolak</small></div></div>`).join("") : '<p class="page-subtitle">Belum ada riwayat impor.</p>'}</div></aside></div>`;
   if (importDraft) {
     document.querySelector("#file-name").textContent = importDraft.fileName;
     renderImportPreview();
@@ -593,20 +649,19 @@ function analyzeImport() {
   if (!validMapping) return importDraft.rows.map((cells, index) => ({ line: index + 2, order: "", tracking: "", courier: "", shop: "", date: "", issue: "Petakan nomor pesanan, nomor resi, dan kurir terlebih dahulu." }));
   const seen = new Set();
   const existingTracking = new Map();
-  state.manifests.forEach((manifest) => manifest.packages.forEach((parcel) => existingTracking.set(trackingScope(parcel.tracking, manifest.shop, manifest.courier, manifest.date), manifest.id)));
+  state.manifests.forEach((manifest) => manifest.packages.forEach((parcel) => existingTracking.set(normalize(parcel.tracking), manifest.id)));
   return importDraft.rows.map((cells, index) => {
     const get = (key) => mapping[key] === "" || mapping[key] === undefined ? "" : String(cells[Number(mapping[key])] ?? "").trim();
     const dateInput = get("date");
     const item = { line: index + 2, order: get("order"), tracking: get("tracking"), courier: get("courier"), shop: get("shop") || "D'Fixer Store", date: dateInput ? normalizeImportDate(dateInput) : todayISO(), quantity: get("quantity") };
     const trackingKey = normalize(item.tracking);
-    const scopedTracking = trackingScope(item.tracking, item.shop, item.courier, item.date);
     if (!item.order) item.issue = "Nomor pesanan kosong.";
     else if (!item.tracking) item.issue = "Nomor resi kosong.";
     else if (!item.courier) item.issue = "Kurir/ekspedisi kosong.";
     else if (item.quantity && Number(item.quantity) !== 1) item.issue = "Jumlah paket harus 1 per resi.";
     else if (!item.date) item.issue = "Tanggal rencana tidak valid. Gunakan YYYY-MM-DD atau DD/MM/YYYY.";
     else if (seen.has(trackingKey)) item.issue = "Nomor resi duplikat dalam file.";
-    else if (existingTracking.has(scopedTracking)) item.issue = `Resi sudah ada di manifest ${existingTracking.get(scopedTracking)}.`;
+    else if (existingTracking.has(trackingKey)) item.issue = `Resi sudah ada di manifest ${existingTracking.get(trackingKey)}.`;
     if (trackingKey) seen.add(trackingKey);
     return item;
   });
@@ -725,6 +780,139 @@ function commitImport() {
   renderImports();
 }
 
+function findPackageByTracking(tracking) {
+  const wanted = normalize(tracking);
+  for (const manifest of state.manifests) {
+    for (const parcel of manifest.packages || []) {
+      if (normalize(parcel.tracking) === wanted) return { manifest, parcel };
+    }
+  }
+  return null;
+}
+
+function latestOrderEvent(tracking) {
+  return (state.orderEvents || []).find((event) => normalize(event.tracking) === normalize(tracking)) || null;
+}
+
+function localDateTimeInput(date = new Date()) {
+  const offset = date.getTimezoneOffset() * 60000;
+  return new Date(date.getTime() - offset).toISOString().slice(0, 16);
+}
+
+function openOrderEventModal(manifest, parcel, type) {
+  const label = ORDER_EVENT_LABELS[type] || type;
+  const needsReason = ["CANCELLED_BEFORE_HANDOVER", "CANCELLATION_AFTER_HANDOVER", "CANCELLATION_REJECTED"].includes(type);
+  const needsPhoto = type === "RETURN_RECEIVED";
+  openModal(label, `${parcel.tracking} · ${manifest.id}`, `<form class="modal-form" id="order-event-form" data-tracking="${escapeHtml(parcel.tracking)}" data-type="${escapeHtml(type)}">
+    <div class="event-detail-grid">
+      <div><span>Pesanan</span><strong>${escapeHtml(parcel.order)}</strong></div>
+      <div><span>Manifest</span><strong>${escapeHtml(manifest.id)}</strong></div>
+      <div><span>Toko</span><strong>${escapeHtml(manifest.shop)}</strong></div>
+      <div><span>Kurir</span><strong>${escapeHtml(manifest.courier)}</strong></div>
+      <div><span>Status saat ini</span><strong>${packageStatusPill(parcel.status)}</strong></div>
+    </div>
+    ${needsReason ? '<div class="field"><label for="event-reason">Alasan <span class="required-mark">*</span></label><textarea id="event-reason" name="reason" required maxlength="500" placeholder="Contoh: pembeli membatalkan pesanan"></textarea></div>' : ""}
+    <div class="modal-grid">
+      <div class="field"><label for="event-occurred-at">Waktu kejadian</label><input id="event-occurred-at" name="occurredAt" type="datetime-local" value="${localDateTimeInput()}" /></div>
+      ${needsPhoto ? '<div class="field"><label for="event-photo">Foto bukti retur <span class="required-mark">*</span></label><input id="event-photo" name="photo" type="file" accept="image/*" required /><span class="field-help">Wajib. Foto dikompres sebelum disimpan.</span></div>' : ""}
+    </div>
+    <div class="field"><label for="event-note">Catatan</label><textarea id="event-note" name="note" maxlength="1000" placeholder="Opsional"></textarea></div>
+    <div class="modal-actions"><button type="button" class="button button-secondary" data-action="close-modal">Batal</button><button type="submit" class="button button-primary"><i data-lucide="save"></i> Simpan kejadian</button></div>
+  </form>`);
+}
+
+async function submitOrderEvent(form) {
+  const tracking = form.dataset.tracking;
+  const type = form.dataset.type;
+  const formData = new FormData(form);
+  const photo = formData.get("photo");
+  let evidence = null;
+  if (type === "RETURN_RECEIVED") {
+    if (!(photo instanceof File) || !photo.size) return toast("Foto bukti retur wajib diunggah.", true);
+    try { evidence = await loadImageData(photo); }
+    catch (error) { return toast(error.message, true); }
+  }
+  const response = await fetch("/api/order-events", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "same-origin",
+    body: JSON.stringify({
+      tracking,
+      type,
+      reason: String(formData.get("reason") || "").trim(),
+      note: String(formData.get("note") || "").trim(),
+      occurredAt: String(formData.get("occurredAt") || ""),
+      evidence,
+    }),
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) return toast(result.error || "Kejadian gagal disimpan.", true);
+  closeModal();
+  await hydrateStateFromServer();
+  renderPage();
+  toast(`${ORDER_EVENT_LABELS[type] || "Kejadian"} tersimpan untuk ${tracking}.`);
+}
+
+function handleEventLookup(form) {
+  const data = new FormData(form);
+  const tracking = String(data.get("tracking") || "").trim();
+  const type = String(data.get("type") || "");
+  const target = document.querySelector("#event-lookup-result");
+  const found = findPackageByTracking(tracking);
+  if (!tracking) return toast("Nomor resi wajib diisi.", true);
+  if (!found) {
+    const allPackages = state.manifests.flatMap((manifest) => manifest.packages || []);
+    const orderMatch = allPackages.find((parcel) => normalize(parcel.order) === normalize(tracking));
+    const examples = allPackages.slice(0, 5).map((parcel) => parcel.tracking).filter(Boolean);
+    if (target) {
+      target.innerHTML = orderMatch
+        ? `<div class="callout callout-error"><i data-lucide="circle-alert"></i><p><strong>Itu nomor pesanan, bukan nomor resi.</strong> Pesanan <span class="mono">${escapeHtml(orderMatch.order)}</span> memakai resi <span class="mono">${escapeHtml(orderMatch.tracking)}</span>. Masukkan nomor resi tersebut.</p></div>`
+        : `<div class="callout callout-error"><i data-lucide="circle-alert"></i><p><strong>Resi tidak ditemukan.</strong> Resi harus sudah tercatat pada manifest tenant ini. Periksa kembali nomor resi atau impor pesanan terlebih dahulu.${examples.length ? ` Contoh resi yang tersedia: ${examples.map((value) => `<span class="mono">${escapeHtml(value)}</span>`).join(", ")}.` : ""}</p></div>`;
+    }
+    renderIcons(target);
+    return;
+  }
+  if (target) target.innerHTML = "";
+  openOrderEventModal(found.manifest, found.parcel, type);
+}
+
+function renderReturns() {
+  const events = state.orderEvents || [];
+  const packages = state.manifests.flatMap((manifest) => manifest.packages || []);
+  const cancelled = packages.filter((parcel) => parcel.status === "CANCELLATION_AFTER_HANDOVER").length;
+  const inReturn = packages.filter((parcel) => parcel.status === "RETURN_IN_TRANSIT").length;
+  const returned = packages.filter((parcel) => parcel.status === "RETURN_RECEIVED").length;
+  const rejected = events.filter((event) => event.type === "CANCELLATION_REJECTED").length;
+  const rows = events.map((event) => {
+    const manifest = getManifest(event.manifestId);
+    const parcel = findPackageByTracking(event.tracking)?.parcel;
+    const canReceive = event.type === "RETURN_IN_TRANSIT" && parcel?.status === "RETURN_IN_TRANSIT";
+    const canStartReturn = event.type === "CANCELLATION_AFTER_HANDOVER" && parcel?.status === "CANCELLATION_AFTER_HANDOVER" && hasAccess("imports");
+    const canReject = event.type === "CANCELLATION_AFTER_HANDOVER" && parcel?.status === "CANCELLATION_AFTER_HANDOVER" && hasAccess("imports");
+    return `<tr>
+      <td><span class="cell-primary">${formatDateTime(event.recordedAt)}</span><span class="cell-secondary">${escapeHtml(event.recordedBy || "")}</span></td>
+      <td><span class="cell-primary mono">${escapeHtml(event.tracking)}</span><span class="cell-secondary">${escapeHtml(event.order || "-")}</span></td>
+      <td>${manifest ? `<button class="manifest-link" data-action="open-manifest" data-id="${escapeHtml(manifest.id)}">${escapeHtml(manifest.id)}</button>` : escapeHtml(event.manifestId || "-")}</td>
+      <td>${escapeHtml(ORDER_EVENT_LABELS[event.type] || event.type)}</td>
+      <td><span class="cell-secondary">${escapeHtml(PACKAGE_LABELS[event.previousStatus] || event.previousStatus || "-")} → ${escapeHtml(PACKAGE_LABELS[event.newStatus] || event.newStatus || "-")}</span></td>
+      <td>${escapeHtml(event.reason || event.note || "-")}</td>
+      <td>${event.evidence ? `<button class="table-action" data-action="view-order-evidence" data-id="${escapeHtml(event.id)}"><i data-lucide="image"></i> Bukti</button>` : '<span class="cell-secondary">-</span>'}</td>
+      <td>${canStartReturn ? `<button class="table-action" data-action="start-return" data-tracking="${escapeHtml(event.tracking)}"><i data-lucide="rotate-ccw"></i> Ajukan retur</button>` : ""}${canReject ? `<button class="table-action" data-action="reject-cancellation" data-tracking="${escapeHtml(event.tracking)}"><i data-lucide="undo-2"></i> Tolak</button>` : ""}${canReceive ? `<button class="table-action" data-action="receive-return" data-tracking="${escapeHtml(event.tracking)}"><i data-lucide="package-check"></i> Retur diterima</button>` : ""}</td>
+    </tr>`;
+  }).join("");
+  content.innerHTML = `${pageHeading("PEMBATALAN & RETUR", "Pembatalan dan retur", "Pantau pembatalan pembeli, proses retur, dan bukti penerimaan kembali.", hasAccess("imports") ? '<button class="button button-secondary" data-action="go-dashboard-events"><i data-lucide="plus"></i> Catat kejadian</button>' : "")}
+    <div class="report-summary"><div class="report-card"><span>Batal setelah pickup</span><strong>${cancelled}</strong></div><div class="report-card"><span>Dalam retur</span><strong>${inReturn}</strong></div><div class="report-card"><span>Retur diterima</span><strong>${returned}</strong></div><div class="report-card"><span>Pembatalan ditolak</span><strong>${rejected}</strong></div></div>
+    <section class="panel"><div class="panel-heading"><div><h2>Riwayat kejadian</h2><p>Pembatalan dan retur bersifat append-only.</p></div><span class="status-pill">${events.length} kejadian</span></div>${events.length ? `<div class="table-wrap"><table><thead><tr><th>WAKTU / PETUGAS</th><th>RESI / PESANAN</th><th>MANIFEST</th><th>KEJADIAN</th><th>STATUS</th><th>ALASAN / CATATAN</th><th>BUKTI</th><th>AKSI</th></tr></thead><tbody>${rows}</tbody></table></div>` : emptyState("rotate-ccw", "Belum ada pembatalan atau retur", "Gunakan input di dashboard untuk mencatat kejadian pertama.")}</section>
+    <div class="footer-note">Retur memakai nomor resi yang sama. Status penerimaan kurir tetap dihitung dari riwayat serah terima, bukan status terkini.</div>`;
+  renderIcons(content);
+}
+
+function showOrderEventEvidence(eventId) {
+  const event = (state.orderEvents || []).find((item) => item.id === eventId);
+  if (!event?.evidence) return;
+  openModal("Bukti retur diterima", `${event.tracking} · ${formatDateTime(event.recordedAt)}`, `<img src="${event.evidence}" alt="Bukti retur ${escapeHtml(event.tracking)}" style="display:block;width:100%;max-height:62vh;object-fit:contain;border-radius:5px;background:#f2f3f1" /><div class="modal-actions" style="margin-top:12px"><button type="button" class="button button-secondary" data-action="close-modal">Tutup</button></div>`);
+}
+
 function renderManifestDetail(manifest) {
   if (!manifest) {
     currentView = "manifests";
@@ -737,6 +925,7 @@ function renderManifestDetail(manifest) {
   const canScan = !["CLOSED", "CANCELLED", "CONFIRMED"].includes(computedManifestStatus(manifest));
   const canHandover = scannedPackages.length > 0 && canScan;
   const sessionList = [...(manifest.sessions || [])].reverse().map((session) => `<div class="history-session"><div><strong>${escapeHtml(session.id)} · ${session.items.length} paket diterima</strong><small>${formatDateTime(session.createdAt)} · Penerima: ${escapeHtml(session.receiver)}</small>${session.note ? `<small>${escapeHtml(session.note)}</small>` : ""}</div>${session.evidence ? `<button class="table-action" data-action="view-evidence" data-id="${escapeHtml(session.id)}"><i data-lucide="image"></i> Bukti foto</button>` : '<span class="cell-secondary">Tanpa foto</span>'}</div>`).join("");
+  const manifestEvents = (state.orderEvents || []).filter((event) => event.manifestId === manifest.id);
   content.innerHTML = `<div class="detail-header"><div class="detail-title"><button class="back-button" data-action="back-manifests" aria-label="Kembali"><i data-lucide="arrow-left"></i></button><div><h1>${escapeHtml(manifest.id)}</h1><p class="page-subtitle">${escapeHtml(manifest.shop)} · ${escapeHtml(manifest.courier)} · ${formatDate(manifest.date)}</p></div></div><div class="heading-actions">${manifestStatusPill(manifest)}${computedManifestStatus(manifest) === "CONFIRMED" ? `<button class="button button-secondary" data-action="close-manifest" data-id="${escapeHtml(manifest.id)}"><i data-lucide="archive"></i> Tutup manifest</button>` : ""}${!["CLOSED", "CANCELLED", "CONFIRMED"].includes(computedManifestStatus(manifest)) ? `<button class="button button-secondary" data-action="cancel-manifest" data-id="${escapeHtml(manifest.id)}"><i data-lucide="ban"></i> Batalkan</button>` : ""}</div></div>
     <div class="detail-overview"><div class="detail-mini"><span>Direncanakan</span><strong>${counts.expected}</strong></div><div class="detail-mini"><span>Dipindai unik</span><strong>${counts.scanned}</strong></div><div class="detail-mini"><span>Diterima kurir</span><strong>${counts.handed}</strong></div><div class="detail-mini"><span>Belum terselesaikan</span><strong>${counts.outstanding}</strong></div></div>
     <div class="detail-grid"><section class="panel scanner-panel"><div class="scanner-title"><div><h2>Pindai paket</h2><p>Pindai kode dengan scanner keyboard atau masukkan nomor resi manual.</p></div><span class="status-pill open">${manifest.packages.filter((parcel) => parcel.status === "EXPECTED").length} menunggu</span></div>
@@ -745,12 +934,13 @@ function renderManifestDetail(manifest) {
       <div class="scanner-actions"><button class="button button-secondary button-small" id="camera-toggle" type="button"><i data-lucide="camera"></i> Buka kamera</button></div><video class="camera-frame" id="camera-frame" playsinline muted></video>
       <div class="scan-log" id="scan-log">${scanEntries.map((entry) => `<div class="scan-log-entry"><div><strong>${escapeHtml(entry.tracking)}</strong><small style="display:block;margin-top:4px">${formatDateTime(entry.createdAt)} · ${escapeHtml(entry.actor || ACTOR)}</small></div><span class="status-pill ${statusClass(entry.result)}">${escapeHtml(SCAN_LABELS[entry.result] || entry.result)}</span></div>`).join("") || '<span class="field-help">Belum ada aktivitas pemindaian.</span>'}</div>
     </section><section class="panel handover-panel"><h2>Konfirmasi serah terima</h2><p>Setiap sesi menyimpan daftar resi yang dipilih, penerima, waktu, dan bukti secara terpisah.</p>
-      <form id="handover-form"><div class="handover-fields"><div class="field"><label for="receiver-name">Nama penerima / kurir <span class="required-mark">*</span></label><input id="receiver-name" name="receiver" required placeholder="Nama petugas kurir" /></div><div class="field"><label for="handover-note">Catatan sesi</label><input id="handover-note" name="note" placeholder="Opsional" /></div><div class="field"><label for="handover-photo">Foto bukti</label><input id="handover-photo" name="photo" type="file" accept="image/*" /><span class="field-help">Opsional. Foto disimpan di browser ini.</span></div></div>
+      <form id="handover-form"><div class="handover-fields"><div class="field"><label for="receiver-name">Nama penerima / kurir <span class="required-mark">*</span></label><input id="receiver-name" name="receiver" required placeholder="Nama petugas kurir" /></div><div class="field"><label for="handover-note">Catatan sesi</label><input id="handover-note" name="note" placeholder="Opsional" /></div><div class="field"><label for="handover-photo">Foto bukti</label><input id="handover-photo" name="photo" type="file" accept="image/*" /><span class="field-help">Opsional. Foto dikompres di perangkat lalu disimpan bersama data serah terima di server.</span></div></div>
         ${scannedPackages.length ? `<div class="field" style="margin-top:12px"><label>Paket yang diterima (${scannedPackages.length} dipindai)</label>${scannedPackages.map((parcel) => `<label class="handover-ready"><span><input type="checkbox" name="accepted" value="${escapeHtml(parcel.tracking)}" checked /> <span class="mono">${escapeHtml(parcel.tracking)}</span></span><span>Diterima</span></label>`).join("")}<span class="field-help">Hapus centang pada paket yang ditolak kurir. Paket tersebut tidak diberi status diterima.</span></div>` : `<div class="handover-ready"><span>Belum ada paket yang siap diserahkan</span><strong>0 paket</strong></div>`}
         <button class="button button-primary" type="submit" style="width:100%;margin-top:12px" ${canHandover ? "" : "disabled"}><i data-lucide="badge-check"></i> Konfirmasi penerimaan</button>
       </form></section></div>
     <section class="panel history-panel"><div class="panel-heading"><div><h2>Daftar paket manifest</h2><p>Paket aktual tetap terikat pada sesi penerimaannya.</p></div><span class="status-pill ${counts.outstanding ? "partial" : "confirmed"}">${counts.outstanding} belum selesai</span></div><div class="table-wrap"><table><thead><tr><th>NOMOR PESANAN</th><th>NOMOR RESI</th><th>STATUS PAKET</th><th>WAKTU PINDAI</th></tr></thead><tbody>${manifest.packages.map((parcel) => `<tr><td>${escapeHtml(parcel.order)}</td><td class="mono">${escapeHtml(parcel.tracking)}</td><td>${packageStatusPill(parcel.status)}</td><td>${formatDateTime(parcel.scannedAt)}</td></tr>`).join("")}</tbody></table></div></section>
     <section class="panel history-panel"><div class="panel-heading"><div><h2>Riwayat serah terima</h2><p>Sesi terkonfirmasi tidak dapat ditimpa oleh sesi berikutnya.</p></div><span class="status-pill">${manifest.sessions.length} sesi</span></div>${sessionList || emptyState("handshake", "Belum ada sesi serah terima", "Pindai paket lalu konfirmasikan paket yang diterima kurir.")}</section>
+    <section class="panel history-panel"><div class="panel-heading"><div><h2>Riwayat pembatalan & retur</h2><p>Kejadian append-only yang terkait manifest ini.</p></div><span class="status-pill ${counts.cancelledAfter + counts.inReturn ? "partial" : "confirmed"}">${manifestEvents.length} kejadian</span></div>${manifestEvents.length ? `<div class="event-timeline">${manifestEvents.map((event) => `<div class="event-timeline-item"><span class="event-dot"></span><div><strong>${escapeHtml(ORDER_EVENT_LABELS[event.type] || event.type)} · ${escapeHtml(event.tracking)}</strong><small>${formatDateTime(event.recordedAt)} · ${escapeHtml(event.recordedBy || "")}${event.reason ? ` · ${escapeHtml(event.reason)}` : ""}</small></div><span class="status-pill ${statusClass(event.newStatus)}">${escapeHtml(PACKAGE_LABELS[event.newStatus] || event.newStatus)}</span></div>`).join("")}</div>` : emptyState("rotate-ccw", "Belum ada pembatalan atau retur", "Kejadian akan muncul setelah dicatat dari dashboard atau halaman Pembatalan & Retur.")}</section>
     <div class="footer-note">Lokasi: ${escapeHtml(manifest.location)} · Dibuat ${formatDateTime(manifest.createdAt)} oleh ${escapeHtml(manifest.createdBy || ACTOR)}.</div>`;
   const scanInput = document.querySelector("#scan-input");
   if (scanInput && canHandover) scanInput.focus();
@@ -766,6 +956,9 @@ function recordScan(manifest, rawTracking) {
     if (parcel.status === "HANDED_OVER") result = "ALREADY_HANDED_OVER";
     else if (parcel.status === "SCANNED") result = "DUPLICATE_SCAN";
     else if (parcel.status === "CANCELLED") result = "CANCELLED";
+    else if (["CANCELLED_BEFORE_HANDOVER", "CANCELLATION_AFTER_HANDOVER"].includes(parcel.status)) result = "CANCELLED_BY_BUYER";
+    else if (parcel.status === "RETURN_IN_TRANSIT") result = "RETURN_IN_TRANSIT";
+    else if (parcel.status === "RETURN_RECEIVED") result = "RETURN_RECEIVED";
     else if (parcel.status === "REJECTED") result = "INVALID_PACKAGE";
     else if (parcel.status === "EXPECTED") {
       parcel.status = "SCANNED";
@@ -831,6 +1024,8 @@ async function confirmHandover(form) {
   accepted.forEach((tracking) => {
     const parcel = manifest.packages.find((item) => item.tracking === tracking);
     parcel.status = "HANDED_OVER";
+    parcel.handedOverAt = session.createdAt;
+    parcel.handedOverSessionId = session.id;
   });
   rejected.forEach((parcel) => {
     parcel.status = "REJECTED";
@@ -896,29 +1091,33 @@ function renderIncidents() {
 }
 
 function renderReports() {
-  const packageRows = [];
-  state.manifests.forEach((manifest) => manifest.packages.forEach((parcel) => packageRows.push({ manifest, parcel })));
-  const totals = packageRows.reduce((result, entry) => {
-    result.planned += entry.parcel.status !== "CANCELLED" ? 1 : 0;
-    result.handed += entry.parcel.status === "HANDED_OVER" ? 1 : 0;
-    result.open += ["EXPECTED", "SCANNED", "REJECTED", "EXCEPTION"].includes(entry.parcel.status) ? 1 : 0;
+  const totals = state.manifests.reduce((result, manifest) => {
+    const counts = getManifestCounts(manifest);
+    result.planned += counts.expected;
+    result.handed += counts.handed;
+    result.open += counts.outstanding;
+    result.cancelledAfter += counts.cancelledAfter;
+    result.inReturn += counts.inReturn;
+    result.returned += counts.returned;
     return result;
-  }, { planned: 0, handed: 0, open: 0 });
+  }, { planned: 0, handed: 0, open: 0, cancelledAfter: 0, inReturn: 0, returned: 0 });
+  totals.effective = Math.max(0, totals.handed - totals.cancelledAfter - totals.inReturn - totals.returned);
   const rows = [...state.manifests].sort((a, b) => b.createdAt.localeCompare(a.createdAt)).map((manifest) => {
     const counts = getManifestCounts(manifest);
-    return `<tr><td><button class="manifest-link" data-action="open-manifest" data-id="${escapeHtml(manifest.id)}">${escapeHtml(manifest.id)}</button></td><td>${escapeHtml(manifest.shop)}</td><td>${escapeHtml(manifest.courier)}</td><td>${formatDate(manifest.date)}</td><td>${counts.expected}</td><td>${counts.scanned}</td><td>${counts.handed}</td><td>${counts.outstanding}</td><td>${manifestStatusPill(manifest)}</td></tr>`;
+    const exceptions = counts.cancelledAfter + counts.inReturn + counts.returned;
+    return `<tr><td><button class="manifest-link" data-action="open-manifest" data-id="${escapeHtml(manifest.id)}">${escapeHtml(manifest.id)}</button></td><td>${escapeHtml(manifest.shop)}</td><td>${escapeHtml(manifest.courier)}</td><td>${formatDate(manifest.date)}</td><td>${counts.expected}</td><td>${counts.scanned}</td><td>${counts.handed}</td><td>${exceptions}</td><td>${counts.outstanding}</td><td>${manifestStatusPill(manifest)}</td></tr>`;
   }).join("");
   content.innerHTML = `${pageHeading("ANALISIS OPERASIONAL", "Laporan rekonsiliasi", "Perbandingan paket rencana, pemindaian unik, dan daftar yang benar-benar diterima.", '<button class="button button-primary" data-action="export-report"><i data-lucide="download"></i> Ekspor CSV</button>')}
-    <div class="report-summary"><div class="report-card"><span>Paket direncanakan</span><strong>${totals.planned}</strong></div><div class="report-card"><span>Diterima kurir</span><strong>${totals.handed}</strong></div><div class="report-card"><span>Belum terselesaikan</span><strong>${totals.open}</strong></div></div>
-    <section class="panel"><div class="panel-heading"><div><h2>Rekonsiliasi per manifest</h2><p>Setiap kategori dihitung dari status paket, bukan total manual.</p></div></div>${rows ? `<div class="table-wrap"><table><thead><tr><th>MANIFEST</th><th>TOKO</th><th>KURIR</th><th>JADWAL</th><th>RENCANA</th><th>DIPINDAI</th><th>DITERIMA</th><th>SELISIH</th><th>STATUS</th></tr></thead><tbody>${rows}</tbody></table></div>` : emptyState("chart-no-axes-column-increasing", "Belum ada data", "Data rekonsiliasi akan tampil setelah manifest dibuat.")}</section>
-    <div class="footer-note">Ekspor memuat nomor pesanan, resi, toko, kurir, jadwal, status paket, dan manifest. Data pelanggan yang tidak diperlukan tidak disertakan.</div>`;
+    <div class="report-summary"><div class="report-card"><span>Paket direncanakan</span><strong>${totals.planned}</strong></div><div class="report-card"><span>Diterima kurir</span><strong>${totals.handed}</strong></div><div class="report-card"><span>Batal setelah pickup</span><strong>${totals.cancelledAfter}</strong></div><div class="report-card"><span>Dalam retur</span><strong>${totals.inReturn}</strong></div><div class="report-card"><span>Retur diterima</span><strong>${totals.returned}</strong></div><div class="report-card"><span>Efektif terkirim</span><strong>${totals.effective}</strong></div></div>
+    <section class="panel"><div class="panel-heading"><div><h2>Rekonsiliasi per manifest</h2><p>Setiap kategori dihitung dari status paket dan riwayat handover.</p></div></div>${rows ? `<div class="table-wrap"><table><thead><tr><th>MANIFEST</th><th>TOKO</th><th>KURIR</th><th>JADWAL</th><th>RENCANA</th><th>DIPINDAI</th><th>DITERIMA</th><th>BATAL/RETUR</th><th>SELISIH</th><th>STATUS</th></tr></thead><tbody>${rows}</tbody></table></div>` : emptyState("chart-no-axes-column-increasing", "Belum ada data", "Data rekonsiliasi akan tampil setelah manifest dibuat.")}</section>
+    <div class="footer-note">Ekspor memuat nomor pesanan, resi, toko, kurir, jadwal, status paket, kejadian pembatalan/retur terakhir, dan manifest. Data pelanggan yang tidak diperlukan tidak disertakan.</div>`;
 }
 
 function renderAudit() {
   const rows = state.audit.slice(0, 250).map((entry) => `<div class="audit-entry"><span class="audit-icon"><i data-lucide="history"></i></span><p><strong>${escapeHtml(entry.actor)}</strong> ${escapeHtml(entry.action)}<span class="cell-secondary">Objek: ${escapeHtml(entry.object)}</span></p><small>${formatDateTime(entry.createdAt)}</small></div>`).join("");
-  content.innerHTML = `${pageHeading("JEJAK PERUBAHAN", "Audit log", "Riwayat tindakan operasional yang tercatat di browser ini.", '<button class="button button-secondary" data-action="export-audit"><i data-lucide="download"></i> Ekspor log</button>')}
+  content.innerHTML = `${pageHeading("JEJAK PERUBAHAN", "Audit log", "Riwayat tindakan operasional yang tercatat di server.", '<button class="button button-secondary" data-action="export-audit"><i data-lucide="download"></i> Ekspor log</button>')}
     <section class="panel"><div class="panel-heading"><div><h2>Aktivitas terbaru</h2><p>Menampilkan hingga 250 catatan terbaru.</p></div><span class="status-pill">${state.audit.length} catatan</span></div>${rows || emptyState("history", "Belum ada aktivitas", "Perubahan pada manifest dan paket akan tercatat di sini.")}</section>
-    <div class="footer-note">Audit log pada versi demo ini tersimpan di penyimpanan browser, bukan log server yang immutable. Pengguna dengan akses ke browser dapat mengubah data lokal.</div>`;
+    <div class="footer-note">Audit log disimpan di server dan API hanya mengizinkan penambahan. Log immutable terpisah di level database belum tersedia.</div>`;
 }
 
 function employeeRow(employee) {
@@ -1042,7 +1241,7 @@ function submitNewManifest(form) {
   for (const tracking of trackingNumbers) {
     const key = normalize(tracking);
     if (seen.has(key)) return toast(`Nomor resi ${tracking} tercantum lebih dari sekali.`, true);
-    if (state.manifests.some((manifest) => manifest.packages.some((parcel) => trackingScope(parcel.tracking, manifest.shop, manifest.courier, manifest.date) === trackingScope(tracking, String(data.get("shop")).trim(), String(data.get("courier")).trim(), String(data.get("date")))))) return toast(`Resi ${tracking} sudah ada pada manifest untuk toko, kurir, dan tanggal tersebut.`, true);
+    if (state.manifests.some((manifest) => manifest.packages.some((parcel) => normalize(parcel.tracking) === key))) return toast(`Resi ${tracking} sudah tercatat pada manifest lain.`, true);
     seen.add(key);
   }
   const manifest = createManifest({ shop: String(data.get("shop")).trim(), courier: String(data.get("courier")).trim(), date: String(data.get("date")), location: String(data.get("location") || "").trim(), parcels: trackingNumbers.map((tracking) => ({ tracking, order: tracking })), source: "manual" });
@@ -1113,9 +1312,10 @@ function downloadCsv(filename, headers, rows) {
 function exportReport() {
   const rows = [];
   state.manifests.forEach((manifest) => manifest.packages.forEach((parcel) => {
-    rows.push([manifest.id, manifest.shop, manifest.courier, manifest.date, parcel.order, parcel.tracking, PACKAGE_LABELS[parcel.status] || parcel.status, parcel.scannedAt || "", (manifest.sessions || []).filter((session) => session.items.includes(parcel.tracking)).map((session) => `${session.id}:${session.receiver}`).join(" | ")]);
+    const event = latestOrderEvent(parcel.tracking);
+    rows.push([manifest.id, manifest.shop, manifest.courier, manifest.date, parcel.order, parcel.tracking, PACKAGE_LABELS[parcel.status] || parcel.status, parcel.scannedAt || "", (manifest.sessions || []).filter((session) => session.items.includes(parcel.tracking)).map((session) => `${session.id}:${session.receiver}`).join(" | "), event ? (ORDER_EVENT_LABELS[event.type] || event.type) : "", event ? event.recordedAt : "", event ? event.reason : ""]);
   }));
-  downloadCsv(`orderguard-rekonsiliasi-${todayISO()}.csv`, ["ID Manifest", "Toko", "Kurir", "Tanggal", "Nomor Pesanan", "Nomor Resi", "Status Paket", "Waktu Pindai", "Sesi Penerimaan"], rows);
+  downloadCsv(`orderguard-rekonsiliasi-${todayISO()}.csv`, ["ID Manifest", "Toko", "Kurir", "Tanggal", "Nomor Pesanan", "Nomor Resi", "Status Paket", "Waktu Pindai", "Sesi Penerimaan", "Kejadian Terakhir", "Waktu Kejadian", "Alasan"], rows);
   logAudit("Laporan rekonsiliasi diekspor", "CSV");
   persist();
 }
@@ -1145,7 +1345,8 @@ function changeManifestStatus(id, action) {
     manifest.status = "CLOSED";
     logAudit("Manifest ditutup", manifest.id);
   } else {
-    if (manifest.packages.some((parcel) => parcel.status === "HANDED_OVER")) return toast("Manifest yang sudah memiliki penerimaan tidak dapat dibatalkan. Buat koreksi melalui insiden.", true);
+    const hasHandover = manifest.packages.some((parcel) => parcel.status === "HANDED_OVER" || parcel.handedOverAt || ["CANCELLATION_AFTER_HANDOVER", "RETURN_IN_TRANSIT", "RETURN_RECEIVED"].includes(parcel.status));
+    if (hasHandover) return toast("Manifest yang sudah memiliki penerimaan tidak dapat dibatalkan. Catat pembatalan/retur melalui input dashboard.", true);
     if (!window.confirm(`Batalkan manifest ${manifest.id}? Tindakan ini tercatat.`)) return;
     manifest.status = "CANCELLED";
     manifest.packages.forEach((parcel) => { if (parcel.status !== "HANDED_OVER") parcel.status = "CANCELLED"; });
@@ -1157,7 +1358,7 @@ function changeManifestStatus(id, action) {
 }
 
 function openHelp() {
-  openModal("Tentang OrderGuard", "Demo MVP untuk alur kontrol manifest dan serah terima.", `<div class="help-copy"><p><strong>Yang tersedia:</strong> impor CSV/XLSX dengan pemetaan dan laporan validasi, manifest, scanner keyboard/kamera yang didukung browser, rekonsiliasi per paket, serah terima parsial, insiden, audit log, serta ekspor CSV.</p><p><strong>Penyimpanan:</strong> state utama tersimpan di PostgreSQL server dan cache browser dipisahkan per tenant. File impor dan foto bukti diproses di perangkat; pembaca XLSX dimuat dari CDN saat diperlukan.</p><p><strong>Batas demo:</strong> akun dan kredensial bersifat demo, sesi disimpan di database, tenant dapat dibuat dan diganti nama tetapi belum dapat dinonaktifkan/dihapus, serta backup terkelola dan log immutable belum tersedia. Jangan gunakan data produksi.</p><p>Untuk membaca barcode dengan kamera, gunakan browser yang mendukung BarcodeDetector dan berikan izin kamera. Scanner USB/Bluetooth keyboard serta entri manual tetap dapat digunakan.</p></div><div class="modal-actions"><button type="button" class="button button-primary" data-action="close-modal">Mengerti</button></div>`);
+  openModal("Tentang OrderGuard", "Kontrol manifest dan serah terima paket.", `<div class="help-copy"><p><strong>Yang tersedia:</strong> impor CSV/XLSX dengan pemetaan dan laporan validasi, manifest, scanner keyboard/kamera yang didukung browser, rekonsiliasi per paket, serah terima parsial, insiden, audit log, serta ekspor CSV.</p><p><strong>Penyimpanan:</strong> state utama tersimpan di PostgreSQL server dan cache browser dipisahkan per tenant. Isi file impor diproses di perangkat; foto bukti dikompres di perangkat lalu disimpan bersama state di server. Pembaca XLSX dimuat dari CDN saat diperlukan.</p><p><strong>Batas saat ini:</strong> tersedia tiga peran operasional; tenant dapat dibuat dan diganti namanya tetapi belum dapat dihapus; audit log dijaga append-only oleh API tetapi belum berupa log immutable terpisah; backup dan restore dijalankan manual.</p><p>Untuk membaca barcode dengan kamera, gunakan browser yang mendukung BarcodeDetector dan berikan izin kamera. Scanner USB/Bluetooth keyboard serta entri manual tetap dapat digunakan.</p></div><div class="modal-actions"><button type="button" class="button button-primary" data-action="close-modal">Mengerti</button></div>`);
 }
 
 document.addEventListener("click", async (event) => {
@@ -1177,6 +1378,15 @@ document.addEventListener("click", async (event) => {
     const { action: name, id } = action.dataset;
     if (name === "go-import") { if (!hasAccess('imports')) return toast('Anda tidak memiliki izin untuk impor data.', true); currentView = "imports"; selectedManifestId = null; renderPage(); }
     else if (name === "go-manifests") { if (!hasAccess('manifests')) return toast('Anda tidak memiliki izin untuk mengakses manifest.', true); currentView = "manifests"; selectedManifestId = null; renderPage(); }
+    else if (name === "go-dashboard-events") { currentView = "dashboard"; selectedManifestId = null; renderPage(); window.setTimeout(() => document.querySelector("#event-tracking")?.focus(), 50); }
+    else if (name === "view-order-evidence") showOrderEventEvidence(id);
+    else if (name === "receive-return" || name === "start-return" || name === "reject-cancellation") {
+      if (name !== "receive-return" && !hasAccess('imports')) return toast('Hanya Store Admin atau Platform Admin yang dapat mengubah pembatalan/retur.', true);
+      const found = findPackageByTracking(action.dataset.tracking);
+      if (!found) return toast('Resi tidak ditemukan pada manifest tenant ini.', true);
+      const type = name === "receive-return" ? "RETURN_RECEIVED" : name === "start-return" ? "RETURN_IN_TRANSIT" : "CANCELLATION_REJECTED";
+      openOrderEventModal(found.manifest, found.parcel, type);
+    }
     else if (name === "new-manifest") { if (!hasAccess('imports')) return toast('Hanya Store Admin atau Super Admin yang dapat membuat manifest manual.', true); openNewManifestModal(); }
     else if (name === "new-incident") { if (!hasAccess('incidents')) return toast('Anda tidak memiliki izin untuk mencatat insiden.', true); openNewIncidentModal(); }
     else if (name === "open-manifest") { if (!hasAccess('manifests')) return toast('Anda tidak memiliki izin untuk membuka manifest.', true); selectedManifestId = id; currentView = "manifest-detail"; renderPage(); }
@@ -1214,6 +1424,12 @@ document.addEventListener("submit", async (event) => {
     return;
   }
 
+  if (event.target.id === "event-lookup-form") {
+    event.preventDefault();
+    handleEventLookup(event.target);
+    return;
+  }
+
   if (event.target.id === "scan-form") {
     event.preventDefault();
     const manifest = getManifest(selectedManifestId);
@@ -1222,6 +1438,9 @@ document.addEventListener("submit", async (event) => {
   } else if (event.target.id === "handover-form") {
     event.preventDefault();
     confirmHandover(event.target);
+  } else if (event.target.id === "order-event-form") {
+    event.preventDefault();
+    submitOrderEvent(event.target).catch((error) => toast(error.message, true));
   } else if (event.target.id === "new-manifest-form") {
     event.preventDefault();
     submitNewManifest(event.target);
@@ -1256,18 +1475,6 @@ document.addEventListener("change", async (event) => {
 });
 
 document.addEventListener("click", async (event) => {
-  const miniRole = event.target.closest(".mini-role");
-  if (miniRole) {
-    const username = miniRole.dataset.user;
-    const password = miniRole.dataset.pass;
-    try {
-      await login(username, password);
-    } catch (error) {
-      toast(error.message, true);
-    }
-    return;
-  }
-
   if (event.target.closest("#camera-toggle")) toggleCamera();
   const chooseFileButton = event.target.closest("#choose-file");
   if (chooseFileButton) { event.preventDefault(); document.querySelector("#import-file")?.click(); }
@@ -1306,6 +1513,7 @@ if ("serviceWorker" in navigator && window.isSecureContext) {
   });
 }
 (async () => {
+  await loadRuntimeConfig();
   const query = new URLSearchParams(window.location.search);
   if (query.get('view') === 'imports') currentView = 'imports';
   const tiktokResult = query.get('tiktok');

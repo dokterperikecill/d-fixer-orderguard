@@ -80,6 +80,8 @@ test('server exposes health endpoint and state API', async () => {
     assert.equal(health.status, 200);
     const healthJson = await health.json();
     assert.equal(healthJson.status, 'ok');
+    const config = await fetch(`http://127.0.0.1:${port}/api/config`).then((response) => response.json());
+    assert.equal(config.environment, 'sandbox');
     assert.equal(unauthenticatedState.status, 401);
     const home = await fetch(`http://127.0.0.1:${port}/`);
     assert.equal(home.status, 200);
@@ -217,6 +219,8 @@ test('production requires explicit bootstrap credentials and marks session cooki
 
   try {
     await waitForServer(port);
+    const config = await fetch(`http://127.0.0.1:${port}/api/config`).then((response) => response.json());
+    assert.equal(config.environment, 'production');
     const login = await fetch(`http://127.0.0.1:${port}/api/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -562,6 +566,96 @@ test('employee management is super-admin only and updates credentials and access
   }
 });
 
+test('super-admin state updates are validated and duplicate tracking numbers are rejected', async () => {
+  const port = 4317;
+  const server = await createTestServer(port);
+
+  try {
+    await waitForServer(port);
+
+    const login = await fetch(`http://127.0.0.1:${port}/api/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin123' }),
+    });
+    const cookie = /orderguard_session=([^;]+)/.exec(login.headers.get('set-cookie') || '')?.[1];
+    assert.equal(login.status, 200);
+    assert.ok(cookie);
+
+    const state = await fetch(`http://127.0.0.1:${port}/api/state`, {
+      headers: { Cookie: `orderguard_session=${cookie}` },
+    }).then((response) => response.json());
+
+    const tampered = structuredClone(state);
+    tampered.manifests[0].courier = 'DIUBAH-PLATFORM-ADMIN';
+    const tamperedSave = await fetch(`http://127.0.0.1:${port}/api/state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${cookie}` },
+      body: JSON.stringify(tampered),
+    });
+    assert.equal(tamperedSave.status, 403);
+
+    const duplicateTracking = state.manifests[0].packages[0].tracking;
+    const createdAt = new Date().toISOString();
+    const duplicateState = structuredClone(state);
+    const duplicateManifest = { id: 'OG-DUPLICATE-TEST', shop: "D'Fixer Store", courier: 'JNE', date: createdAt.slice(0, 10), location: 'Gudang', status: 'OPEN', createdAt, createdBy: 'Platform Admin', source: 'manual', packages: [{ order: 'ORD-DUPLICATE', tracking: duplicateTracking, status: 'EXPECTED', scannedAt: null }], scans: [], sessions: [] };
+    duplicateState.manifests.unshift(duplicateManifest);
+    duplicateState.audit.unshift({ id: 'AU-DUPLICATE-TEST', actor: 'Platform Admin', action: 'Manifest dibuat manual dengan 1 paket', object: duplicateManifest.id, createdAt });
+    const duplicateSave = await fetch(`http://127.0.0.1:${port}/api/state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${cookie}` },
+      body: JSON.stringify(duplicateState),
+    });
+    const duplicateResult = await duplicateSave.json();
+    assert.equal(duplicateSave.status, 403);
+    assert.match(duplicateResult.error, /sudah tercatat/);
+
+    const validState = structuredClone(state);
+    const validManifest = { ...structuredClone(duplicateManifest), id: 'OG-VALID-TEST', packages: [{ order: 'ORD-VALID', tracking: 'JNE-VALID-TEST-001', status: 'EXPECTED', scannedAt: null }] };
+    validState.manifests.unshift(validManifest);
+    validState.audit.unshift({ id: 'AU-VALID-TEST', actor: 'Platform Admin', action: 'Manifest dibuat manual dengan 1 paket', object: validManifest.id, createdAt });
+    const validSave = await fetch(`http://127.0.0.1:${port}/api/state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${cookie}` },
+      body: JSON.stringify(validState),
+    });
+    const validResult = await validSave.json();
+    assert.equal(validSave.status, 200, validResult.error);
+
+    const persisted = await fetch(`http://127.0.0.1:${port}/api/state`, {
+      headers: { Cookie: `orderguard_session=${cookie}` },
+    }).then((response) => response.json());
+    assert.equal(persisted.manifests.some((manifest) => manifest.id === 'OG-VALID-TEST'), true);
+    assert.equal(persisted.manifests.some((manifest) => manifest.id === 'OG-DUPLICATE-TEST'), false);
+
+    const storeLogin = await fetch(`http://127.0.0.1:${port}/api/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'rani', password: 'rani123' }),
+    });
+    const storeCookie = /orderguard_session=([^;]+)/.exec(storeLogin.headers.get('set-cookie') || '')?.[1];
+    const storeState = await fetch(`http://127.0.0.1:${port}/api/state`, {
+      headers: { Cookie: `orderguard_session=${storeCookie}` },
+    }).then((response) => response.json());
+    const scannedManifest = storeState.manifests.find((manifest) => manifest.id === 'OG-VALID-TEST');
+    const scannedParcel = scannedManifest.packages[0];
+    const scannedAt = new Date().toISOString();
+    scannedParcel.status = 'SCANNED';
+    scannedParcel.scannedAt = scannedAt;
+    scannedManifest.scans.push({ tracking: scannedParcel.tracking, result: 'MATCH', createdAt: scannedAt, actor: 'Rani Admin' });
+    storeState.audit.unshift({ id: 'AU-SCAN-TEST', actor: 'Rani Admin', action: `Paket dipindai: ${scannedParcel.tracking}`, object: scannedManifest.id, createdAt: scannedAt });
+    const scanSave = await fetch(`http://127.0.0.1:${port}/api/state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${storeCookie}` },
+      body: JSON.stringify(storeState),
+    });
+    const scanResult = await scanSave.json();
+    assert.equal(scanSave.status, 200, scanResult.error);
+  } finally {
+    await stopTestServer(server);
+  }
+});
+
 test('tenant creation and rename are restricted and reflected in employee accounts', async () => {
   const port = 4314;
   const server = await createTestServer(port);
@@ -640,6 +734,79 @@ test('tenant creation and rename are restricted and reflected in employee accoun
     }).then((response) => response.json());
     assert.equal(directory.tenants.length, 3);
     assert.equal(directory.tenants.find((item) => item.id === tenant.id).employeeCount, 1);
+  } finally {
+    await stopTestServer(server);
+  }
+});
+
+test('order events support cancellation, return receipt, rejection, and unknown tracking rejection', async () => {
+  const port = 4318;
+  const server = await createTestServer(port);
+
+  try {
+    await waitForServer(port);
+    const loginAs = async (username, password) => {
+      const response = await fetch(`http://127.0.0.1:${port}/api/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password }),
+      });
+      return { response, cookie: /orderguard_session=([^;]+)/.exec(response.headers.get('set-cookie') || '')?.[1] };
+    };
+    const postEvent = (cookie, body) => fetch(`http://127.0.0.1:${port}/api/order-events`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${cookie}` },
+      body: JSON.stringify(body),
+    });
+    const readState = (cookie) => fetch(`http://127.0.0.1:${port}/api/state`, {
+      headers: { Cookie: `orderguard_session=${cookie}` },
+    }).then((response) => response.json());
+
+    const admin = await loginAs('admin', 'admin123');
+    const handover = await loginAs('handover', 'handover123');
+    assert.equal(admin.response.status, 200);
+    assert.equal(handover.response.status, 200);
+
+    const unknown = await postEvent(admin.cookie, { tracking: 'RESI-TIDAK-ADA', type: 'CANCELLATION_AFTER_HANDOVER', reason: 'Uji' });
+    assert.equal(unknown.status, 404);
+
+    const handoverCancel = await postEvent(handover.cookie, { tracking: 'JNE0008114201', type: 'CANCELLATION_AFTER_HANDOVER', reason: 'Uji' });
+    assert.equal(handoverCancel.status, 403);
+
+    const cancel = await postEvent(admin.cookie, { tracking: 'JNE0008114201', type: 'CANCELLATION_AFTER_HANDOVER', reason: 'Pembeli membatalkan' });
+    assert.equal(cancel.status, 201);
+    let state = await readState(admin.cookie);
+    let parcel = state.manifests.flatMap((manifest) => manifest.packages).find((item) => item.tracking === 'JNE0008114201');
+    assert.equal(parcel.status, 'CANCELLATION_AFTER_HANDOVER');
+    assert.equal(state.orderEvents[0].type, 'CANCELLATION_AFTER_HANDOVER');
+
+    const startReturn = await postEvent(admin.cookie, { tracking: 'JNE0008114201', type: 'RETURN_IN_TRANSIT', note: 'Kurir menjemput retur' });
+    assert.equal(startReturn.status, 201);
+
+    const noPhoto = await postEvent(handover.cookie, { tracking: 'JNE0008114201', type: 'RETURN_RECEIVED' });
+    assert.equal(noPhoto.status, 400);
+
+    const received = await postEvent(handover.cookie, { tracking: 'JNE0008114201', type: 'RETURN_RECEIVED', evidence: 'data:image/png;base64,iVBORw0KGgo=' });
+    assert.equal(received.status, 201);
+    state = await readState(admin.cookie);
+    parcel = state.manifests.flatMap((manifest) => manifest.packages).find((item) => item.tracking === 'JNE0008114201');
+    assert.equal(parcel.status, 'RETURN_RECEIVED');
+    assert.ok(parcel.returnReceivedAt);
+
+    const cancelSecond = await postEvent(admin.cookie, { tracking: 'JNE0008114202', type: 'CANCELLATION_AFTER_HANDOVER', reason: 'Pembeli membatalkan' });
+    assert.equal(cancelSecond.status, 201);
+    const reject = await postEvent(admin.cookie, { tracking: 'JNE0008114202', type: 'CANCELLATION_REJECTED', reason: 'Marketplace menolak pembatalan' });
+    assert.equal(reject.status, 201);
+    state = await readState(admin.cookie);
+    parcel = state.manifests.flatMap((manifest) => manifest.packages).find((item) => item.tracking === 'JNE0008114202');
+    assert.equal(parcel.status, 'HANDED_OVER');
+    assert.equal(state.orderEvents[0].type, 'CANCELLATION_REJECTED');
+
+    const cancelBefore = await postEvent(admin.cookie, { tracking: 'JNE0008114203', type: 'CANCELLED_BEFORE_HANDOVER', reason: 'Batal sebelum pickup' });
+    assert.equal(cancelBefore.status, 201);
+    state = await readState(admin.cookie);
+    parcel = state.manifests.flatMap((manifest) => manifest.packages).find((item) => item.tracking === 'JNE0008114203');
+    assert.equal(parcel.status, 'CANCELLED_BEFORE_HANDOVER');
   } finally {
     await stopTestServer(server);
   }

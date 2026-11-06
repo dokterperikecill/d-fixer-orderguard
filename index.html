@@ -34,6 +34,7 @@
           <button class="nav-link" data-view="manifests"><i data-lucide="boxes"></i><span>Manifest</span><span class="nav-count" id="nav-manifest-count">0</span></button>
           <button class="nav-link" data-view="imports"><i data-lucide="file-up"></i><span>Impor data</span></button>
           <button class="nav-link" data-view="incidents"><i data-lucide="triangle-alert"></i><span>Insiden</span><span class="nav-count alert-count" id="nav-incident-count">0</span></button>
+          <button class="nav-link" data-view="returns"><i data-lucide="rotate-ccw"></i><span>Pembatalan & Retur</span><span class="nav-count" id="nav-return-count">0</span></button>
           <p class="nav-label nav-label-spaced">KONTROL</p>
           <button class="nav-link" data-view="reports"><i data-lucide="chart-no-axes-column-increasing"></i><span>Laporan</span></button>
           <button class="nav-link" data-view="audit"><i data-lucide="history"></i><span>Audit log</span></button>
@@ -52,7 +53,7 @@
             <div class="breadcrumb"><span>Operasional</span><i data-lucide="chevron-right"></i><strong id="breadcrumb-current">Ringkasan</strong></div>
           </div>
           <div class="topbar-actions">
-            <span class="environment-tag"><span></span> SANDBOX</span>
+            <span class="environment-tag" id="environment-label"><span></span> SANDBOX</span>
             <button class="icon-button" id="help-button" aria-label="Tentang aplikasi" title="Tentang aplikasi"><i data-lucide="circle-help"></i></button>
             <button class="button button-secondary button-small" id="logout-button" type="button"><i data-lucide="log-out"></i> Keluar</button>
             <span class="topbar-divider"></span>

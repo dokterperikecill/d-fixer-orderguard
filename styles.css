@@ -22,7 +22,13 @@
   text-rendering: optimizeLegibility;
 }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 body { margin: 0; min-width: 320px; min-height: 100vh; background: var(--paper); color: var(--ink); }
+body.auth-mode .sidebar,
+body.auth-mode .topbar { display: none; }
+body.auth-mode .main-area { margin-left: 0; }
+body.auth-mode .page-content { max-width: none; padding: 0; }
+body.auth-mode .login-shell { min-height: 100vh; }
 button, input, select, textarea { font: inherit; }
 button { color: inherit; }
 button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 3px solid rgba(80, 124, 145, .28); outline-offset: 2px; }
@@ -339,4 +345,21 @@ tbody tr:hover { background: #fbfcfa; }
   .detail-title h1 { font-size: 17px; }
   .scan-entry { flex-wrap: wrap; }
   .scan-entry input { flex-basis: 100%; }
+}
+.event-entry-panel { margin-bottom: 18px; }
+.event-entry-form { display: grid; grid-template-columns: minmax(220px, 2fr) minmax(220px, 1.4fr) auto; gap: 12px; align-items: end; }
+.event-lookup-result { margin-top: 12px; }
+.callout-error { border-color: #ecc7bd; background: var(--coral-soft); color: var(--coral); }
+.event-detail-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-bottom: 14px; }
+.event-detail-grid > div { display: flex; flex-direction: column; gap: 4px; padding: 9px 11px; border: 1px solid var(--line); border-radius: 6px; background: #fafbf8; }
+.event-detail-grid span { color: var(--muted); font-size: 10px; }
+.event-detail-grid strong { font-size: 12px; }
+.event-timeline { display: flex; flex-direction: column; }
+.event-timeline-item { display: flex; gap: 12px; align-items: flex-start; padding: 11px 0; border-bottom: 1px solid var(--line); }
+.event-timeline-item:last-child { border-bottom: 0; }
+.event-dot { flex: 0 0 8px; width: 8px; height: 8px; margin-top: 5px; border-radius: 50%; background: var(--amber); }
+.event-timeline-item > div { display: flex; flex: 1; flex-direction: column; gap: 3px; }
+.event-timeline-item small { color: var(--muted); font-size: 11px; }
+@media (max-width: 760px) {
+  .event-entry-form, .event-detail-grid { grid-template-columns: 1fr; }
 }

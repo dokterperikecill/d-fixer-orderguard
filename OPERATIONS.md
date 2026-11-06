@@ -107,6 +107,25 @@ Access/refresh token disimpan terenkripsi di PostgreSQL dan tidak dikirim ke bro
 
 Pastikan kredensial pada URL database disimpan sebagai secret. Jangan mengetik URL berisi password ke shell bersama atau memasukkannya ke log.
 
+## Pembatalan dan Retur
+
+Pembatalan pembeli dan retur dicatat sebagai event append-only pada state tenant. Retur memakai nomor resi yang sama; tidak ada nomor resi retur terpisah.
+
+- Store Admin dan Platform Admin dapat mencatat pembatalan sebelum pickup, pembatalan setelah pickup, awal retur, penolakan pembatalan, dan penerimaan retur.
+- Handover Staff hanya dapat menandai retur diterima.
+- Resi harus sudah ada pada manifest tenant. Resi di luar manifest ditolak.
+- Foto bukti wajib saat menandai retur diterima.
+- Pembatalan yang ditolak marketplace mengembalikan status paket ke status normal sebelumnya.
+- Angka “diterima kurir” dihitung dari riwayat handover, sehingga tetap 100 meskipun 3 paket dibatalkan setelah pickup.
+
+Endpoint yang dipakai:
+
+```text
+POST /api/order-events
+```
+
+Jenis event: `CANCELLED_BEFORE_HANDOVER`, `CANCELLATION_AFTER_HANDOVER`, `RETURN_IN_TRANSIT`, `RETURN_RECEIVED`, dan `CANCELLATION_REJECTED`.
+
 ## Backup
 
 Jalankan backup konsisten saat server hidup:
