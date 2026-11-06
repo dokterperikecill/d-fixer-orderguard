@@ -2,6 +2,34 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
 const { Pool } = require('pg');
+
+// Test helper: keep CSRF handling out of individual test calls while still
+// exercising the real server-side CSRF checks in dedicated negative tests.
+const nativeFetch = globalThis.fetch;
+const csrfTokensByCookie = new Map();
+globalThis.fetch = async (input, init = {}) => {
+  const url = typeof input === 'string' ? input : String(input?.url || input);
+  const method = String(init.method || input?.method || 'GET').toUpperCase();
+  const headers = new Headers(init.headers || input?.headers || undefined);
+  const cookie = headers.get('cookie') || '';
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(method) && cookie && !headers.has('x-csrf-token')) {
+    const token = csrfTokensByCookie.get(cookie);
+    if (token) headers.set('x-csrf-token', token);
+  }
+  const response = await nativeFetch(input, { ...init, headers });
+  if (url.endsWith('/api/login') && response.ok) {
+    const payload = await response.clone().json().catch(() => null);
+    const setCookie = response.headers.get('set-cookie') || '';
+    const session = /orderguard_session=([^;]+)/.exec(setCookie);
+    if (session && payload?.csrfToken) csrfTokensByCookie.set(`orderguard_session=${session[1]}`, payload.csrfToken);
+  }
+  if (url.endsWith('/api/session') && response.ok && cookie) {
+    const payload = await response.clone().json().catch(() => null);
+    if (payload?.csrfToken) csrfTokensByCookie.set(cookie, payload.csrfToken);
+  }
+  return response;
+};
+
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 if (!TEST_DATABASE_URL) throw new Error('TEST_DATABASE_URL wajib menunjuk ke database PostgreSQL khusus untuk tes.');
 const testDatabase = new Pool({ connectionString: TEST_DATABASE_URL });
@@ -1178,6 +1206,334 @@ test('legacy tenant_state tables gain a version column without losing data', asy
     const after = await fetch(`http://127.0.0.1:${port}/api/state`, { headers: { Cookie: `orderguard_session=${cookie}` } });
     assert.equal(after.headers.get('x-state-version'), '1');
     assert.equal((await after.json()).incidents.some((item) => item.id === incident.id), true);
+  } finally {
+    await stopTestServer(server);
+  }
+});
+
+function withTestIncident(state, suffix, actor = 'Platform Admin') {
+  const next = structuredClone(state);
+  const createdAt = new Date().toISOString();
+  const incident = { id: `INC-AUTH-${suffix}`, category: 'Masalah lain', manifestId: '', tracking: '', description: `Uji auth ${suffix}`, reportedBy: actor, createdAt, status: 'OPEN', resolution: '' };
+  next.incidents.unshift(incident);
+  next.audit.unshift({ id: `AU-AUTH-${suffix}`, actor, action: `Insiden dicatat: ${incident.category}`, object: incident.id, createdAt });
+  return next;
+}
+
+test('CSRF, Origin validation, cookie flags, and API error consistency', async () => {
+  const port = 4327;
+  const server = await createTestServer(port);
+  const origin = `http://127.0.0.1:${port}`;
+
+  try {
+    await waitForServer(port);
+    const login = await nativeFetch(`http://127.0.0.1:${port}/api/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin123' }),
+    });
+    assert.equal(login.status, 200);
+    const loginBody = await login.json();
+    assert.ok(loginBody.csrfToken);
+    const sessionCookie = /orderguard_session=([^;]+)/.exec(login.headers.get('set-cookie') || '')?.[1];
+    assert.ok(sessionCookie);
+    const cookies = login.headers.getSetCookie ? login.headers.getSetCookie() : [login.headers.get('set-cookie') || ''];
+    const sessionSetCookie = cookies.find((value) => value.startsWith('orderguard_session='));
+    const csrfSetCookie = cookies.find((value) => value.startsWith('orderguard_csrf='));
+    assert.match(sessionSetCookie, /HttpOnly/i);
+    assert.match(sessionSetCookie, /SameSite=Lax/i);
+    assert.match(sessionSetCookie, /Path=\//i);
+    assert.ok(csrfSetCookie);
+    assert.doesNotMatch(csrfSetCookie, /HttpOnly/i);
+
+    const evilLogin = await nativeFetch(`http://127.0.0.1:${port}/api/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Origin: 'https://evil.example' },
+      body: JSON.stringify({ username: 'admin', password: 'admin123' }),
+    });
+    assert.equal(evilLogin.status, 403);
+
+    const secondLogin = await nativeFetch(`http://127.0.0.1:${port}/api/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin123' }),
+    });
+    assert.equal(secondLogin.status, 200);
+    const secondBody = await secondLogin.json();
+    const secondCookie = /orderguard_session=([^;]+)/.exec(secondLogin.headers.get('set-cookie') || '')?.[1];
+    assert.ok(secondCookie);
+    assert.notEqual(secondCookie, sessionCookie);
+    assert.notEqual(secondBody.csrfToken, loginBody.csrfToken);
+
+    const stateResponse = await fetch(`http://127.0.0.1:${port}/api/state`, { headers: { Cookie: `orderguard_session=${sessionCookie}` } });
+    const state = await stateResponse.json();
+    const version = Number(stateResponse.headers.get('x-state-version'));
+
+    const noToken = await nativeFetch(`http://127.0.0.1:${port}/api/state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${sessionCookie}`, Origin: origin },
+      body: JSON.stringify(withTestIncident(state, 'NO-TOKEN')),
+    });
+    assert.equal(noToken.status, 403);
+    assert.equal((await noToken.json()).code, 'CSRF_INVALID');
+
+    const noTokenNoOrigin = await nativeFetch(`http://127.0.0.1:${port}/api/state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${sessionCookie}` },
+      body: JSON.stringify(withTestIncident(state, 'NO-TOKEN-NO-ORIGIN')),
+    });
+    assert.equal(noTokenNoOrigin.status, 403);
+
+    const untrusted = await nativeFetch(`http://127.0.0.1:${port}/api/state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${sessionCookie}`, Origin: 'https://evil.example', 'X-CSRF-Token': loginBody.csrfToken },
+      body: JSON.stringify(withTestIncident(state, 'UNTRUSTED')),
+    });
+    assert.equal(untrusted.status, 403);
+    assert.equal((await untrusted.json()).code, 'ORIGIN_REJECTED');
+
+    const refererUntrusted = await nativeFetch(`http://127.0.0.1:${port}/api/state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${sessionCookie}`, Referer: 'https://evil.example/page', 'X-CSRF-Token': loginBody.csrfToken },
+      body: JSON.stringify(withTestIncident(state, 'UNTRUSTED-REFERER')),
+    });
+    assert.equal(refererUntrusted.status, 403);
+    assert.equal((await refererUntrusted.json()).code, 'ORIGIN_REJECTED');
+
+    const crossSessionToken = await nativeFetch(`http://127.0.0.1:${port}/api/state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${sessionCookie}`, Origin: origin, 'X-CSRF-Token': secondBody.csrfToken },
+      body: JSON.stringify(withTestIncident(state, 'CROSS-SESSION-TOKEN')),
+    });
+    assert.equal(crossSessionToken.status, 403);
+    assert.equal((await crossSessionToken.json()).code, 'CSRF_INVALID');
+
+    const valid = await nativeFetch(`http://127.0.0.1:${port}/api/state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${sessionCookie}`, Origin: origin, 'X-CSRF-Token': loginBody.csrfToken },
+      body: JSON.stringify(withTestIncident(state, 'VALID')),
+    });
+    assert.equal(valid.status, 200, JSON.stringify(await valid.clone().json().catch(() => ({}))));
+
+    const wrongToken = await nativeFetch(`http://127.0.0.1:${port}/api/state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${sessionCookie}`, Origin: origin, 'X-CSRF-Token': 'wrong-token' },
+      body: JSON.stringify(withTestIncident(state, 'WRONG-TOKEN')),
+    });
+    assert.equal(wrongToken.status, 403);
+    assert.equal((await wrongToken.json()).code, 'CSRF_INVALID');
+
+    const logoutNoToken = await nativeFetch(`http://127.0.0.1:${port}/api/logout`, {
+      method: 'POST',
+      headers: { Cookie: `orderguard_session=${sessionCookie}`, Origin: origin },
+    });
+    assert.equal(logoutNoToken.status, 403);
+    const logout = await nativeFetch(`http://127.0.0.1:${port}/api/logout`, {
+      method: 'POST',
+      headers: { Cookie: `orderguard_session=${sessionCookie}`, Origin: origin, 'X-CSRF-Token': loginBody.csrfToken },
+    });
+    assert.equal(logout.status, 200);
+
+    const malformedCookie = await nativeFetch(`http://127.0.0.1:${port}/api/session`, { headers: { Cookie: 'orderguard_session=%E0%A4%A' } });
+    assert.equal(malformedCookie.status, 200);
+    assert.deepEqual(await malformedCookie.json(), { user: null, csrfToken: null });
+
+    const missingApi = await nativeFetch(`http://127.0.0.1:${port}/api/does-not-exist`);
+    assert.equal(missingApi.status, 404);
+    assert.match(missingApi.headers.get('content-type') || '', /application\/json/);
+
+    const session = await nativeFetch(`http://127.0.0.1:${port}/api/session`, { headers: { Cookie: `orderguard_session=${sessionCookie}` } });
+    assert.equal(session.status, 200);
+    assert.deepEqual(await session.json(), { user: null, csrfToken: null });
+  } finally {
+    await stopTestServer(server);
+  }
+});
+
+test('login rate limiting and authentication audit log', async () => {
+  const port = 4328;
+  const server = await createTestServer(port);
+  const origin = `http://127.0.0.1:${port}`;
+
+  try {
+    await waitForServer(port);
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const response = await nativeFetch(`http://127.0.0.1:${port}/api/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'rani', password: `wrong-${attempt}` }),
+      });
+      assert.equal(response.status, 401);
+    }
+    const blocked = await nativeFetch(`http://127.0.0.1:${port}/api/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'rani', password: 'rani123' }),
+    });
+    assert.equal(blocked.status, 429);
+    assert.equal(blocked.headers.get('retry-after'), '60');
+    const blockedBody = await blocked.json();
+    assert.equal(blockedBody.code, 'LOGIN_RATE_LIMITED');
+
+    const adminLogin = await nativeFetch(`http://127.0.0.1:${port}/api/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin123' }),
+    });
+    assert.equal(adminLogin.status, 200);
+    const adminBody = await adminLogin.json();
+    const adminCookie = /orderguard_session=([^;]+)/.exec(adminLogin.headers.get('set-cookie') || '')?.[1];
+    assert.ok(adminCookie);
+
+    const adminLogout = await nativeFetch(`http://127.0.0.1:${port}/api/logout`, {
+      method: 'POST',
+      headers: { Cookie: `orderguard_session=${adminCookie}`, Origin: origin, 'X-CSRF-Token': adminBody.csrfToken },
+    });
+    assert.equal(adminLogout.status, 200);
+
+    const handoverLogin = await nativeFetch(`http://127.0.0.1:${port}/api/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'handover', password: 'handover123' }),
+    });
+    assert.equal(handoverLogin.status, 200);
+    const handoverBody = await handoverLogin.json();
+    const handoverCookie = /orderguard_session=([^;]+)/.exec(handoverLogin.headers.get('set-cookie') || '')?.[1];
+    assert.ok(handoverCookie);
+    await testDatabase.query(`UPDATE "${server.schema}".sessions SET expires_at = $1 WHERE user_id = $2`, [new Date(Date.now() - 1000).toISOString(), 'handover']);
+    const expiredSession = await nativeFetch(`http://127.0.0.1:${port}/api/session`, { headers: { Cookie: `orderguard_session=${handoverCookie}` } });
+    assert.equal(expiredSession.status, 200);
+    assert.deepEqual(await expiredSession.json(), { user: null, csrfToken: null });
+
+    const invalidSession = await nativeFetch(`http://127.0.0.1:${port}/api/session`, { headers: { Cookie: 'orderguard_session=invalid-session-token' } });
+    assert.equal(invalidSession.status, 200);
+    assert.deepEqual(await invalidSession.json(), { user: null, csrfToken: null });
+
+    const adminLoginAgain = await nativeFetch(`http://127.0.0.1:${port}/api/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin123' }),
+    });
+    assert.equal(adminLoginAgain.status, 200);
+    const adminAgainBody = await adminLoginAgain.json();
+    const adminAgainCookie = /orderguard_session=([^;]+)/.exec(adminLoginAgain.headers.get('set-cookie') || '')?.[1];
+    assert.ok(adminAgainCookie);
+    const change = await nativeFetch(`http://127.0.0.1:${port}/api/users/handover`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${adminAgainCookie}`, Origin: origin, 'X-CSRF-Token': adminAgainBody.csrfToken },
+      body: JSON.stringify({ password: 'newpassword123' }),
+    });
+    assert.equal(change.status, 200, JSON.stringify(await change.clone().json().catch(() => ({}))));
+
+    const weak = await nativeFetch(`http://127.0.0.1:${port}/api/users`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${adminAgainCookie}`, Origin: origin, 'X-CSRF-Token': adminAgainBody.csrfToken },
+      body: JSON.stringify({ username: 'weakpass', password: '12345678', name: 'Weak Pass', role: 'handover-staff', tenantId: 'dfixer-store' }),
+    });
+    assert.equal(weak.status, 400);
+
+    const audit = await testDatabase.query(`SELECT action, username, user_id, tenant_id, metadata FROM "${server.schema}".auth_audit ORDER BY created_at`);
+    const actions = audit.rows.map((row) => row.action);
+    for (const action of ['LOGIN_FAILED', 'LOGIN_BLOCKED', 'LOGIN_SUCCESS', 'LOGOUT', 'SESSION_EXPIRED', 'SESSION_INVALID', 'CREDENTIAL_CHANGED', 'SESSIONS_REVOKED']) {
+      assert.equal(actions.includes(action), true, `missing auth audit action ${action}`);
+    }
+    const serialized = JSON.stringify(audit.rows);
+    for (const secret of ['admin123', 'rani123', 'handover123', 'newpassword123', adminBody.csrfToken, handoverBody.csrfToken, adminCookie, handoverCookie]) {
+      assert.equal(serialized.includes(secret), false, 'auth audit contains secret material');
+    }
+
+    const attempts = await testDatabase.query(`SELECT COUNT(*)::INTEGER AS count FROM "${server.schema}".login_attempts`);
+    assert.ok(attempts.rows[0].count >= 5);
+  } finally {
+    await stopTestServer(server);
+  }
+});
+
+test('existing sessions tables gain CSRF storage during startup migration', async () => {
+  const port = 4329;
+  const server = await createTestServer(port, async (schema) => {
+    await testDatabase.query(`CREATE TABLE "${schema}".sessions (token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL)`);
+  });
+
+  try {
+    await waitForServer(port);
+    const login = await nativeFetch(`http://127.0.0.1:${port}/api/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin123' }),
+    });
+    assert.equal(login.status, 200);
+    const body = await login.json();
+    assert.ok(body.csrfToken);
+    const cookie = /orderguard_session=([^;]+)/.exec(login.headers.get('set-cookie') || '')?.[1];
+    const session = await nativeFetch(`http://127.0.0.1:${port}/api/session`, { headers: { Cookie: `orderguard_session=${cookie}` } });
+    const sessionBody = await session.json();
+    assert.equal(sessionBody.csrfToken, body.csrfToken);
+    const columns = await testDatabase.query(`SELECT column_name FROM information_schema.columns WHERE table_schema = $1 AND table_name = 'sessions' AND column_name = 'csrf_token'`, [server.schema]);
+    assert.equal(columns.rowCount, 1);
+  } finally {
+    await stopTestServer(server);
+  }
+});
+
+test('configured production origins are accepted while wildcard-style/untrusted origins are rejected', async () => {
+  const port = 4331;
+  const schema = 'orderguard_test_4331_origins';
+  await testDatabase.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+  await testDatabase.query(`CREATE SCHEMA "${schema}"`);
+  const child = startTestServer(port, schema, { ORDERGUARD_ALLOWED_ORIGINS: 'https://app.example.com' });
+  const server = { child, schema, port };
+
+  try {
+    await waitForServer(port);
+    const login = await nativeFetch(`http://127.0.0.1:${port}/api/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'admin123' }),
+    });
+    assert.equal(login.status, 200);
+    const body = await login.json();
+    const cookie = /orderguard_session=([^;]+)/.exec(login.headers.get('set-cookie') || '')?.[1];
+    const stateResponse = await nativeFetch(`http://127.0.0.1:${port}/api/state`, { headers: { Cookie: `orderguard_session=${cookie}` } });
+    const state = await stateResponse.json();
+    const version = Number(stateResponse.headers.get('x-state-version'));
+    const allowed = await nativeFetch(`http://127.0.0.1:${port}/api/state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${cookie}`, Origin: 'https://app.example.com', 'X-CSRF-Token': body.csrfToken },
+      body: JSON.stringify(withTestIncident(state, 'ALLOWED-ORIGIN')),
+    });
+    assert.equal(allowed.status, 200);
+    const untrusted = await nativeFetch(`http://127.0.0.1:${port}/api/state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${cookie}`, Origin: 'https://other.example', 'X-CSRF-Token': body.csrfToken },
+      body: JSON.stringify(withTestIncident(state, 'OTHER-ORIGIN')),
+    });
+    assert.equal(untrusted.status, 403);
+    assert.equal((await untrusted.json()).code, 'ORIGIN_REJECTED');
+    assert.equal(version, 0);
+  } finally {
+    await stopTestServer(server);
+  }
+});
+
+test('concurrent failed logins cannot bypass the rate limit', async () => {
+  const port = 4332;
+  const server = await createTestServer(port);
+
+  try {
+    await waitForServer(port);
+    const attempts = await Promise.all(Array.from({ length: 10 }, (_, index) => nativeFetch(`http://127.0.0.1:${port}/api/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'rani', password: `parallel-wrong-${index}` }),
+    })));
+    for (const attempt of attempts) assert.ok([401, 429].includes(attempt.status), `unexpected status ${attempt.status}`);
+    const afterBatch = await nativeFetch(`http://127.0.0.1:${port}/api/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'rani', password: 'rani123' }),
+    });
+    assert.equal(afterBatch.status, 429);
   } finally {
     await stopTestServer(server);
   }

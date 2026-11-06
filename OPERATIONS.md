@@ -49,6 +49,43 @@ Simpan password melalui secret manager, bukan file yang masuk Git atau log shell
 
 Production harus menggunakan HTTPS. Cookie sesi hanya diberi flag `Secure` saat `NODE_ENV=production`.
 
+## Keamanan Autentikasi dan CSRF
+
+OrderGuard memakai cookie sesi dan CSRF token yang terikat ke sesi.
+
+- Setiap login atau `GET /api/session` mengembalikan `csrfToken`.
+- Request `POST`, `PATCH`, dan `DELETE` wajib mengirim header `X-CSRF-Token`.
+- Frontend resmi sudah mengirim header tersebut secara otomatis.
+- API client non-browser harus mengambil token dari login/session lalu mengirim header yang sama.
+- Request tanpa token, token salah, atau token dari sesi lain ditolak `403` dengan kode `CSRF_INVALID`.
+
+Konfigurasi origin produksi:
+
+```sh
+ORDERGUARD_ALLOWED_ORIGINS="https://app.domainanda.com"
+ORDERGUARD_TRUST_PROXY=1
+```
+
+- `ORDERGUARD_ALLOWED_ORIGINS` berisi origin persis, dipisahkan koma. Wildcard `*` tidak diizinkan dan akan menggagalkan startup.
+- Same-origin selalu diizinkan.
+- Di Render/reverse proxy, `ORDERGUARD_TRUST_PROXY=1` diperlukan agar Origin dan IP client dibaca benar.
+- Origin/Referer tidak tepercaya ditolak `403` dengan kode `ORIGIN_REJECTED`.
+
+Rate limit login (opsional; default ditampilkan):
+
+```sh
+ORDERGUARD_LOGIN_WINDOW_MINUTES=15
+ORDERGUARD_LOGIN_MAX_ATTEMPTS=5
+ORDERGUARD_LOGIN_MAX_IP_ATTEMPTS=20
+ORDERGUARD_SESSION_HOURS=8
+```
+
+Percobaan login berulang menghasilkan `429` dengan `Retry-After`. Batas berlaku per jendela waktu; akun tidak dikunci permanen.
+
+Audit autentikasi disimpan di tabel `auth_audit` (login sukses/gagal/blocked, logout, session expired/invalid, perubahan kredensial, pencabutan sesi). Password, session token, CSRF token, dan secret tidak disimpan. Lihat `SECURITY.md` untuk detail dan contoh query.
+
+Password user baru dan perubahan password minimal 10 karakter; password bootstrap Platform Admin minimal 12 karakter.
+
 ## PostgreSQL Lokal
 
 Docker Compose menyediakan PostgreSQL persisten untuk pengembangan:

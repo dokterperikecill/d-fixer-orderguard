@@ -43,9 +43,34 @@ const SCHEMA = `
   CREATE TABLE IF NOT EXISTS sessions (
     token_hash TEXT PRIMARY KEY,
     user_id TEXT NOT NULL,
+    csrf_token TEXT,
     expires_at TEXT NOT NULL,
     created_at TEXT NOT NULL
   );
+  CREATE INDEX IF NOT EXISTS sessions_user_id_idx ON sessions (user_id);
+  CREATE INDEX IF NOT EXISTS sessions_expires_at_idx ON sessions (expires_at);
+  CREATE TABLE IF NOT EXISTS auth_audit (
+    id TEXT PRIMARY KEY,
+    user_id TEXT,
+    username TEXT,
+    tenant_id TEXT,
+    action TEXT NOT NULL,
+    ip_hash TEXT NOT NULL DEFAULT '',
+    metadata TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS auth_audit_created_at_idx ON auth_audit (created_at DESC);
+  CREATE INDEX IF NOT EXISTS auth_audit_action_idx ON auth_audit (action, created_at DESC);
+  CREATE INDEX IF NOT EXISTS auth_audit_user_idx ON auth_audit (user_id, created_at DESC);
+  CREATE TABLE IF NOT EXISTS login_attempts (
+    id TEXT PRIMARY KEY,
+    username TEXT NOT NULL,
+    ip_hash TEXT NOT NULL,
+    attempted_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS login_attempts_pair_idx ON login_attempts (username, ip_hash, attempted_at);
+  CREATE INDEX IF NOT EXISTS login_attempts_ip_idx ON login_attempts (ip_hash, attempted_at);
+  CREATE INDEX IF NOT EXISTS login_attempts_attempted_at_idx ON login_attempts (attempted_at);
   CREATE TABLE IF NOT EXISTS tiktok_oauth_states (
     state_hash TEXT PRIMARY KEY,
     tenant_id TEXT NOT NULL,
@@ -88,6 +113,7 @@ const SCHEMA = `
 
 const MIGRATIONS = [
   'ALTER TABLE tenant_state ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 0',
+  'ALTER TABLE sessions ADD COLUMN IF NOT EXISTS csrf_token TEXT',
 ];
 
 function placeholders(sql) {

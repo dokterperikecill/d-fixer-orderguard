@@ -11,6 +11,18 @@ services:
         value: 24
       - key: NODE_ENV
         value: production
+      - key: ORDERGUARD_TRUST_PROXY
+        value: "1"
+      - key: ORDERGUARD_ALLOWED_ORIGINS
+        sync: false
+      - key: ORDERGUARD_LOGIN_WINDOW_MINUTES
+        value: "15"
+      - key: ORDERGUARD_LOGIN_MAX_ATTEMPTS
+        value: "5"
+      - key: ORDERGUARD_LOGIN_MAX_IP_ATTEMPTS
+        value: "20"
+      - key: ORDERGUARD_SESSION_HOURS
+        value: "8"
       - key: DATABASE_URL
         sync: false
       - key: ORDERGUARD_BOOTSTRAP_USERNAME

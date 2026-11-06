@@ -144,7 +144,7 @@ function activateTenantCache() {
 
 async function hydrateStateFromServer() {
   try {
-    const response = await fetch('/api/state');
+    const response = await apiFetch('/api/state');
     if (!response.ok) return;
     const remote = await response.json();
     if (remote && Array.isArray(remote.manifests)) {
@@ -160,6 +160,17 @@ async function hydrateStateFromServer() {
 
 const state = { manifests: [], incidents: [], audit: [], importJobs: [], orderEvents: [] };
 let stateVersion = null;
+let csrfToken = null;
+const nativeFetch = window.fetch.bind(window);
+
+function apiFetch(url, options = {}) {
+  const method = String(options.method || "GET").toUpperCase();
+  const headers = new Headers(options.headers || {});
+  if (!["GET", "HEAD", "OPTIONS"].includes(method) && csrfToken) {
+    headers.set("X-CSRF-Token", csrfToken);
+  }
+  return nativeFetch(url, { ...options, headers, credentials: options.credentials || "same-origin" });
+}
 let currentUser = null;
 let currentView = "dashboard";
 let selectedManifestId = null;
@@ -177,7 +188,7 @@ let runtimeConfig = { environment: "sandbox" };
 
 async function loadRuntimeConfig() {
   try {
-    const response = await fetch("/api/config", { credentials: "same-origin" });
+    const response = await apiFetch("/api/config", { credentials: "same-origin" });
     if (response.ok) {
       const config = await response.json();
       if (config?.environment) runtimeConfig = config;
@@ -191,10 +202,11 @@ async function loadRuntimeConfig() {
 
 async function getSession() {
   try {
-    const response = await fetch('/api/session', { credentials: 'same-origin' });
+    const response = await apiFetch('/api/session', { credentials: 'same-origin' });
     if (!response.ok) return null;
     const data = await response.json();
     currentUser = data.user;
+    csrfToken = data.csrfToken || null;
     if (currentUser) {
       localStorage.setItem(CURRENT_USER_KEY, JSON.stringify(currentUser));
       activateTenantCache();
@@ -208,7 +220,7 @@ async function getSession() {
 }
 
 async function login(username, password) {
-  const response = await fetch('/api/login', {
+  const response = await apiFetch('/api/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ username, password }),
@@ -221,6 +233,7 @@ async function login(username, password) {
   }
 
   currentUser = data.user;
+  csrfToken = data.csrfToken || null;
   localStorage.setItem(CURRENT_USER_KEY, JSON.stringify(currentUser));
   activateTenantCache();
   await hydrateStateFromServer();
@@ -231,8 +244,14 @@ async function login(username, password) {
 }
 
 async function logout() {
-  await fetch('/api/logout', { method: 'POST', credentials: 'same-origin' });
+  const response = await apiFetch('/api/logout', { method: 'POST', credentials: 'same-origin' });
+  if (!response.ok) {
+    const result = await response.json().catch(() => ({}));
+    toast(result.error || 'Logout gagal. Muat ulang halaman lalu coba lagi.', true);
+    return;
+  }
   currentUser = null;
+  csrfToken = null;
   stateVersion = null;
   localStorage.removeItem(CURRENT_USER_KEY);
   currentView = 'dashboard';
@@ -265,7 +284,7 @@ async function persist() {
   try {
     const headers = { 'Content-Type': 'application/json' };
     if (Number.isInteger(stateVersion)) headers['If-Match'] = `"state-${stateVersion}"`;
-    const response = await fetch('/api/state', {
+    const response = await apiFetch('/api/state', {
       method: 'POST',
       headers,
       body: snapshot,
@@ -606,7 +625,7 @@ async function loadTikTokIntegration() {
   const target = document.querySelector("#tiktok-integration");
   if (!target) return;
   try {
-    const statusResponse = await fetch('/api/tiktok/status');
+    const statusResponse = await apiFetch('/api/tiktok/status');
     const status = await statusResponse.json();
     if (!statusResponse.ok) throw new Error(status.error || 'Status integrasi TikTok Shop tidak dapat dibaca.');
     if (!status.configured) {
@@ -614,7 +633,7 @@ async function loadTikTokIntegration() {
       return;
     }
 
-    const shopsResponse = await fetch('/api/tiktok/shops');
+    const shopsResponse = await apiFetch('/api/tiktok/shops');
     const shopData = await shopsResponse.json();
     if (!shopsResponse.ok) throw new Error(shopData.error || 'Daftar toko TikTok Shop tidak dapat dibaca.');
     tiktokShops = shopData.shops || [];
@@ -635,7 +654,7 @@ async function syncTikTokOrders(button) {
   if (!shopId) return toast('Pilih toko TikTok Shop terlebih dahulu.', true);
   button.disabled = true;
   try {
-    const response = await fetch('/api/tiktok/sync', {
+    const response = await apiFetch('/api/tiktok/sync', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ shopId }),
@@ -865,7 +884,7 @@ async function submitOrderEvent(form) {
     try { evidence = await loadImageData(photo); }
     catch (error) { return toast(error.message, true); }
   }
-  const response = await fetch("/api/order-events", {
+  const response = await apiFetch("/api/order-events", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     credentials: "same-origin",
@@ -1166,7 +1185,7 @@ async function renderEmployees() {
   const loadingActions = '<button class="button button-secondary" disabled><i data-lucide="building-2"></i> Tambah tenant</button><button class="button button-primary" disabled><i data-lucide="user-plus"></i> Tambah karyawan</button>';
   content.innerHTML = `${pageHeading("ADMINISTRASI", "Karyawan dan tenant", "Kelola akun, peran, serta organisasi yang menggunakan OrderGuard.", loadingActions)}<section class="panel"><div class="section-toolbar"><label class="search-box"><i data-lucide="search"></i><input id="employee-search" type="search" placeholder="Cari nama atau username" aria-label="Cari karyawan" /></label><span class="cell-secondary">Memuat daftar karyawan...</span></div></section>`;
   try {
-    const response = await fetch('/api/users', { credentials: 'same-origin' });
+    const response = await apiFetch('/api/users', { credentials: 'same-origin' });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || 'Daftar karyawan tidak dapat dimuat.');
     employeeDirectory = data;
@@ -1216,7 +1235,7 @@ async function saveTenant(form) {
   const payload = editing
     ? { name: String(formData.get('name') || '').trim() }
     : { id: String(formData.get('id') || '').trim(), name: String(formData.get('name') || '').trim() };
-  const response = await fetch(endpoint, {
+  const response = await apiFetch(endpoint, {
     method: editing ? 'PATCH' : 'POST',
     headers: { 'Content-Type': 'application/json' },
     credentials: 'same-origin',
@@ -1241,7 +1260,7 @@ async function saveEmployee(form) {
   const password = String(formData.get('password') || '');
   if (password) payload.password = password;
   const editing = Boolean(form.dataset.id);
-  const response = await fetch(editing ? `/api/users/${encodeURIComponent(form.dataset.id)}` : '/api/users', {
+  const response = await apiFetch(editing ? `/api/users/${encodeURIComponent(form.dataset.id)}` : '/api/users', {
     method: editing ? 'PATCH' : 'POST',
     headers: { 'Content-Type': 'application/json' },
     credentials: 'same-origin',
@@ -1257,7 +1276,7 @@ async function saveEmployee(form) {
 async function deactivateEmployee(id) {
   const employee = employeeDirectory.users.find((item) => item.id === id);
   if (!employee || !window.confirm(`Nonaktifkan akun ${employee.name} (${employee.username})?`)) return;
-  const response = await fetch(`/api/users/${encodeURIComponent(id)}`, { method: 'DELETE', credentials: 'same-origin' });
+  const response = await apiFetch(`/api/users/${encodeURIComponent(id)}`, { method: 'DELETE', credentials: 'same-origin' });
   const result = await response.json();
   if (!response.ok) return toast(result.error || 'Akun gagal dinonaktifkan.', true);
   toast('Akun karyawan dinonaktifkan.');

@@ -12,6 +12,47 @@ const port = Number(process.env.PORT || 4173);
 const appDir = __dirname;
 const db = createPool();
 const tiktokTokenRefreshes = new Map();
+const isProduction = process.env.NODE_ENV === 'production';
+
+function positiveInteger(value, fallback) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+const trustProxySetting = process.env.ORDERGUARD_TRUST_PROXY;
+if (trustProxySetting !== undefined && trustProxySetting !== '') {
+  if (/^\d+$/.test(trustProxySetting)) app.set('trust proxy', Number(trustProxySetting));
+  else if (trustProxySetting === 'true' || trustProxySetting === 'false') app.set('trust proxy', trustProxySetting === 'true');
+  else throw new Error('ORDERGUARD_TRUST_PROXY harus berupa angka, true, atau false.');
+} else if (isProduction) {
+  app.set('trust proxy', 1);
+}
+
+const LOGIN_WINDOW_MINUTES = positiveInteger(process.env.ORDERGUARD_LOGIN_WINDOW_MINUTES, 15);
+const LOGIN_MAX_ATTEMPTS = positiveInteger(process.env.ORDERGUARD_LOGIN_MAX_ATTEMPTS, 5);
+const LOGIN_MAX_IP_ATTEMPTS = positiveInteger(process.env.ORDERGUARD_LOGIN_MAX_IP_ATTEMPTS, 20);
+const SESSION_HOURS = positiveInteger(process.env.ORDERGUARD_SESSION_HOURS, 8);
+const PASSWORD_MIN_LENGTH = 10;
+const UNSAFE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+function parseAllowedOrigins(value) {
+  const origins = String(value || '').split(',').map((item) => item.trim()).filter(Boolean);
+  for (const origin of origins) {
+    if (origin === '*') throw new Error('ORDERGUARD_ALLOWED_ORIGINS tidak boleh memakai wildcard.');
+    let parsed;
+    try {
+      parsed = new URL(origin);
+    } catch {
+      throw new Error(`ORDERGUARD_ALLOWED_ORIGINS berisi origin tidak valid: ${origin}`);
+    }
+    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash || parsed.pathname !== '/') {
+      throw new Error(`ORDERGUARD_ALLOWED_ORIGINS harus berupa origin saja, tanpa path/query: ${origin}`);
+    }
+  }
+  return new Set(origins.map((origin) => new URL(origin).origin));
+}
+
+const ALLOWED_ORIGINS = parseAllowedOrigins(process.env.ORDERGUARD_ALLOWED_ORIGINS);
 
 const INITIAL_TENANTS = [
   { id: 'dfixer-store', name: "D'Fixer Store" },
@@ -54,6 +95,130 @@ function hashSessionToken(token) {
 
 function hashOpaqueValue(value) {
   return crypto.createHash('sha256').update(value).digest('hex');
+}
+
+function timingSafeEqualString(left, right) {
+  const a = Buffer.from(String(left || ''));
+  const b = Buffer.from(String(right || ''));
+  if (!a.length || a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+function clientIpHash(req) {
+  return crypto.createHash('sha256').update(String(req?.ip || '')).digest('hex');
+}
+
+function requestOriginCandidates(req) {
+  const candidates = [];
+  const origin = req.get('origin');
+  if (origin !== undefined) candidates.push(origin);
+  const referer = req.get('referer');
+  if (referer) {
+    try {
+      candidates.push(new URL(referer).origin);
+    } catch {
+      candidates.push(null);
+    }
+  }
+  return candidates;
+}
+
+function isTrustedOrigin(req, origin) {
+  if (!origin || origin === 'null') return false;
+  const expected = `${req.protocol}://${req.get('host')}`;
+  return origin === expected || ALLOWED_ORIGINS.has(origin);
+}
+
+function validateOriginHeader(req, res, next) {
+  const candidates = requestOriginCandidates(req);
+  if (!candidates.length) return next();
+  if (candidates.some((origin) => !isTrustedOrigin(req, origin))) {
+    return res.status(403).json({ error: 'Origin atau Referer tidak diizinkan.', code: 'ORIGIN_REJECTED' });
+  }
+  next();
+}
+
+function validateRequestOrigin(req, res, next) {
+  if (!UNSAFE_METHODS.has(req.method)) return next();
+  return validateOriginHeader(req, res, next);
+}
+
+function csrfTokenMatches(req, user) {
+  const provided = req.get('x-csrf-token') || '';
+  const expected = user?.csrfToken || '';
+  return timingSafeEqualString(provided, expected);
+}
+
+function requireCsrf(req, res, next) {
+  if (!UNSAFE_METHODS.has(req.method)) return next();
+  if (!csrfTokenMatches(req, req.user)) {
+    return res.status(403).json({ error: 'CSRF token tidak valid atau tidak tersedia.', code: 'CSRF_INVALID' });
+  }
+  next();
+}
+
+function sessionCookieOptions() {
+  return {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: isProduction,
+    path: '/',
+    maxAge: SESSION_HOURS * 60 * 60 * 1000,
+  };
+}
+
+function csrfCookieOptions() {
+  return {
+    httpOnly: false,
+    sameSite: 'lax',
+    secure: isProduction,
+    path: '/',
+    maxAge: SESSION_HOURS * 60 * 60 * 1000,
+  };
+}
+
+async function recordAuthAudit(action, { user = null, username = '', tenantId = '', req = null } = {}) {
+  const safeUsername = String(username || user?.username || '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 200);
+  try {
+    await db.prepare(
+      'INSERT INTO auth_audit (id, user_id, username, tenant_id, action, ip_hash, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+    ).run(
+      crypto.randomUUID(),
+      user?.id || null,
+      safeUsername || null,
+      tenantId || user?.tenantId || null,
+      action,
+      clientIpHash(req),
+      '{}',
+      new Date().toISOString(),
+    );
+  } catch (error) {
+    console.error(`Auth audit gagal (${action}): ${error.message}`);
+  }
+}
+
+function loginUsernameKey(value) {
+  return String(value || '').trim().toLocaleLowerCase('id-ID');
+}
+
+async function loginAttemptCounts(usernameKey, ipHash, cutoff) {
+  const pair = await db.prepare(
+    'SELECT COUNT(*)::INTEGER AS count FROM login_attempts WHERE username = ? AND ip_hash = ? AND attempted_at > ?'
+  ).get(usernameKey, ipHash, cutoff);
+  const ip = await db.prepare(
+    'SELECT COUNT(*)::INTEGER AS count FROM login_attempts WHERE ip_hash = ? AND attempted_at > ?'
+  ).get(ipHash, cutoff);
+  return { pair: Number(pair.count), ip: Number(ip.count) };
+}
+
+async function recordLoginFailure(usernameKey, ipHash, attemptedAt) {
+  await db.prepare(
+    'INSERT INTO login_attempts (id, username, ip_hash, attempted_at) VALUES (?, ?, ?, ?)'
+  ).run(crypto.randomUUID(), usernameKey, ipHash, attemptedAt);
+}
+
+async function clearLoginFailures(usernameKey, ipHash) {
+  await db.prepare('DELETE FROM login_attempts WHERE username = ? AND ip_hash = ?').run(usernameKey, ipHash);
 }
 
 function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
@@ -117,7 +282,11 @@ async function initializeDatabase() {
 function parseCookies(header = '') {
   return header.split(';').map((segment) => segment.trim()).filter(Boolean).reduce((accumulator, segment) => {
     const [name, ...rest] = segment.split('=');
-    accumulator[name] = decodeURIComponent(rest.join('='));
+    try {
+      accumulator[name] = decodeURIComponent(rest.join('='));
+    } catch {
+      accumulator[name] = '';
+    }
     return accumulator;
   }, {});
 }
@@ -127,14 +296,31 @@ async function getUserFromRequest(req) {
   const token = cookies.orderguard_session;
   if (!token) return null;
   const hashedToken = hashSessionToken(token);
-  const session = await db.prepare('SELECT user_id AS userId FROM sessions WHERE token_hash = ? AND expires_at > ?').get(hashedToken, new Date().toISOString());
+  const session = await db.prepare(
+    'SELECT user_id AS userId, csrf_token AS csrfToken, expires_at AS expiresAt FROM sessions WHERE token_hash = ?'
+  ).get(hashedToken);
   if (!session) {
+    await recordAuthAudit('SESSION_INVALID', { req });
+    return null;
+  }
+  const expiresAt = Date.parse(session.expiresAt);
+  if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+    await recordAuthAudit('SESSION_EXPIRED', { user: { id: session.userId }, req });
     await db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(hashedToken);
     return null;
   }
   const user = await db.prepare('SELECT id, username, name, role, tenant_id AS tenantId FROM users WHERE id = ? AND active = TRUE').get(session.userId);
-  if (!user) await db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(hashedToken);
-  return user || null;
+  if (!user) {
+    await recordAuthAudit('SESSION_INVALID', { user: { id: session.userId }, req });
+    await db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(hashedToken);
+    return null;
+  }
+  let csrfToken = session.csrfToken;
+  if (!csrfToken) {
+    csrfToken = crypto.randomBytes(32).toString('base64url');
+    await db.prepare('UPDATE sessions SET csrf_token = ? WHERE token_hash = ?').run(csrfToken, hashedToken);
+  }
+  return { ...user, csrfToken };
 }
 
 async function revokeUserSessions(userId, exceptToken = '') {
@@ -896,9 +1082,11 @@ app.use((req, res, next) => {
   if (process.env.NODE_ENV === 'production') {
     res.set('Strict-Transport-Security', 'max-age=15552000; includeSubDomains');
   }
+  if (req.path.startsWith('/api/')) res.set('Cache-Control', 'no-store');
   next();
 });
 app.use(express.json({ limit: '10mb' }));
+app.use(validateRequestOrigin);
 
 app.get('/api/health', asyncRoute(async (req, res) => {
   await db.prepare('SELECT 1').get();
@@ -910,14 +1098,19 @@ app.get('/api/config', (req, res) => {
   res.json({ environment: process.env.NODE_ENV === 'production' ? 'production' : 'sandbox' });
 });
 
-app.get('/api/session', (req, res) => {
-  getUserFromRequest(req)
-    .then((user) => user ? publicUser(user) : null)
-    .then((user) => res.json({ user }))
-    .catch((error) => res.status(500).json({ error: error.message }));
-});
+app.get('/api/session', asyncRoute(async (req, res) => {
+  const user = await getUserFromRequest(req);
+  res.set('Cache-Control', 'no-store');
+  if (!user) {
+    res.clearCookie('orderguard_session', { httpOnly: true, sameSite: 'lax', secure: isProduction, path: '/' });
+    res.clearCookie('orderguard_csrf', { sameSite: 'lax', secure: isProduction, path: '/' });
+    return res.json({ user: null, csrfToken: null });
+  }
+  res.cookie('orderguard_csrf', user.csrfToken, csrfCookieOptions());
+  res.json({ user: await publicUser(user), csrfToken: user.csrfToken });
+}));
 
-app.post('/api/tenants', requireAuth, requireRole(['super-admin']), asyncRoute(async (req, res) => {
+app.post('/api/tenants', requireAuth, requireRole(['super-admin']), requireCsrf, asyncRoute(async (req, res) => {
   const id = String(req.body?.id || '').trim();
   const name = String(req.body?.name || '').trim();
   if (!/^[a-z0-9](?:[a-z0-9-]{0,48}[a-z0-9])$/.test(id)) {
@@ -939,7 +1132,7 @@ app.post('/api/tenants', requireAuth, requireRole(['super-admin']), asyncRoute(a
   res.status(201).json({ tenant: await getTenant(id) });
 }));
 
-app.patch('/api/tenants/:id', requireAuth, requireRole(['super-admin']), asyncRoute(async (req, res) => {
+app.patch('/api/tenants/:id', requireAuth, requireRole(['super-admin']), requireCsrf, asyncRoute(async (req, res) => {
   const tenant = await getTenant(req.params.id);
   if (!tenant) return res.status(404).json({ error: 'Tenant tidak ditemukan.' });
   const name = String(req.body?.name || '').trim();
@@ -966,7 +1159,7 @@ app.get('/api/users', requireAuth, requireRole(['super-admin']), asyncRoute(asyn
   res.json({ users, tenants, activity, tenantActivity });
 }));
 
-app.post('/api/users', requireAuth, requireRole(['super-admin']), asyncRoute(async (req, res) => {
+app.post('/api/users', requireAuth, requireRole(['super-admin']), requireCsrf, asyncRoute(async (req, res) => {
   const body = req.body || {};
   const username = String(body.username || '').trim();
   const name = String(body.name || '').trim();
@@ -976,7 +1169,7 @@ app.post('/api/users', requireAuth, requireRole(['super-admin']), asyncRoute(asy
 
   if (!/^[a-zA-Z0-9._-]{3,32}$/.test(username)) return res.status(400).json({ error: 'Username harus 3-32 karakter dan hanya berisi huruf, angka, titik, garis bawah, atau tanda hubung.' });
   if (!name || name.length > 100) return res.status(400).json({ error: 'Nama wajib diisi dan maksimal 100 karakter.' });
-  if (password.length < 8) return res.status(400).json({ error: 'Kata sandi minimal 8 karakter.' });
+  if (!password || password.length < PASSWORD_MIN_LENGTH || password.length > 200) return res.status(400).json({ error: `Kata sandi minimal ${PASSWORD_MIN_LENGTH} karakter dan maksimal 200 karakter.` });
   if (!EMPLOYEE_ROLES.includes(role)) return res.status(400).json({ error: 'Peran tidak valid.' });
   if (!(await getTenant(tenantId))) return res.status(400).json({ error: 'Tenant tidak valid.' });
 
@@ -996,7 +1189,7 @@ app.post('/api/users', requireAuth, requireRole(['super-admin']), asyncRoute(asy
   res.status(201).json({ user: await publicUser(created) });
 }));
 
-app.patch('/api/users/:id', requireAuth, requireRole(['super-admin']), asyncRoute(async (req, res) => {
+app.patch('/api/users/:id', requireAuth, requireRole(['super-admin']), requireCsrf, asyncRoute(async (req, res) => {
   const existing = await db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
   if (!existing) return res.status(404).json({ error: 'Karyawan tidak ditemukan.' });
 
@@ -1013,7 +1206,7 @@ app.patch('/api/users/:id', requireAuth, requireRole(['super-admin']), asyncRout
   if (!name || name.length > 100) return res.status(400).json({ error: 'Nama wajib diisi dan maksimal 100 karakter.' });
   if (!EMPLOYEE_ROLES.includes(role)) return res.status(400).json({ error: 'Peran tidak valid.' });
   if (!(await getTenant(tenantId))) return res.status(400).json({ error: 'Tenant tidak valid.' });
-  if (password && password.length < 8) return res.status(400).json({ error: 'Kata sandi baru minimal 8 karakter.' });
+  if (password && (password.length < PASSWORD_MIN_LENGTH || password.length > 200)) return res.status(400).json({ error: `Kata sandi baru minimal ${PASSWORD_MIN_LENGTH} karakter dan maksimal 200 karakter.` });
   if (isSelf && (role !== existing.role || tenantId !== existing.tenant_id || !active)) {
     return res.status(400).json({ error: 'Akun sendiri tidak dapat dipindahkan, dinonaktifkan, atau diubah perannya.' });
   }
@@ -1039,6 +1232,12 @@ app.patch('/api/users/:id', requireAuth, requireRole(['super-admin']), asyncRout
   if (password || role !== existing.role || tenantId !== existing.tenant_id || !active) {
     await revokeUserSessions(existing.id, existing.id === req.user.id ? parseCookies(req.headers.cookie || '').orderguard_session : '');
   }
+  const authChange = { id: existing.id, username, tenantId };
+  if (password) await recordAuthAudit('CREDENTIAL_CHANGED', { user: authChange, req });
+  else if (role !== existing.role || tenantId !== existing.tenant_id || !active) await recordAuthAudit('ACCOUNT_UPDATED', { user: authChange, req });
+  if (password || role !== existing.role || tenantId !== existing.tenant_id || !active) {
+    await recordAuthAudit('SESSIONS_REVOKED', { user: authChange, req });
+  }
   const action = password ? 'Data karyawan dan kata sandi diperbarui' : 'Data karyawan diperbarui';
   await db.prepare('INSERT INTO employee_audit (id, actor_id, actor_name, target_user_id, action, created_at) VALUES (?, ?, ?, ?, ?, ?)')
     .run(crypto.randomUUID(), req.user.id, req.user.name, existing.id, action, now);
@@ -1046,7 +1245,7 @@ app.patch('/api/users/:id', requireAuth, requireRole(['super-admin']), asyncRout
   res.json({ user: await publicUser(updated) });
 }));
 
-app.delete('/api/users/:id', requireAuth, requireRole(['super-admin']), asyncRoute(async (req, res) => {
+app.delete('/api/users/:id', requireAuth, requireRole(['super-admin']), requireCsrf, asyncRoute(async (req, res) => {
   const existing = await db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
   if (!existing) return res.status(404).json({ error: 'Karyawan tidak ditemukan.' });
   if (existing.id === req.user.id) return res.status(400).json({ error: 'Akun yang sedang digunakan tidak dapat dinonaktifkan.' });
@@ -1058,39 +1257,66 @@ app.delete('/api/users/:id', requireAuth, requireRole(['super-admin']), asyncRou
   const now = new Date().toISOString();
   await db.prepare('UPDATE users SET active = FALSE, updated_at = ? WHERE id = ?').run(now, existing.id);
   await revokeUserSessions(existing.id);
+  await recordAuthAudit('ACCOUNT_DEACTIVATED', { user: { id: existing.id, username: existing.username, tenantId: existing.tenant_id }, req });
+  await recordAuthAudit('SESSIONS_REVOKED', { user: { id: existing.id, username: existing.username, tenantId: existing.tenant_id }, req });
   await db.prepare('INSERT INTO employee_audit (id, actor_id, actor_name, target_user_id, action, created_at) VALUES (?, ?, ?, ?, ?, ?)')
     .run(crypto.randomUUID(), req.user.id, req.user.name, existing.id, 'Akun karyawan dinonaktifkan', now);
   res.json({ ok: true });
 }));
 
 app.post('/api/login', asyncRoute(async (req, res) => {
-  const { username, password } = req.body || {};
-  const user = await db.prepare('SELECT id, username, name, password_salt, password_hash, role, tenant_id AS tenantId FROM users WHERE LOWER(username) = LOWER(?) AND active = TRUE').get(String(username || '').trim());
-  if (!user || !verifyPassword(String(password || ''), user.password_salt, user.password_hash)) {
+  const username = String(req.body?.username || '').trim().slice(0, 200);
+  const usernameKey = loginUsernameKey(username);
+  const password = String(req.body?.password || '');
+  const ipHash = clientIpHash(req);
+  const now = new Date();
+  const cutoff = new Date(now.getTime() - LOGIN_WINDOW_MINUTES * 60 * 1000).toISOString();
+
+  await db.prepare('DELETE FROM login_attempts WHERE attempted_at <= ?').run(cutoff);
+  // Record the attempt before counting so concurrent attempts cannot all pass
+  // the threshold before any failure is persisted.
+  await recordLoginFailure(usernameKey, ipHash, now.toISOString());
+  const counts = await loginAttemptCounts(usernameKey, ipHash, cutoff);
+  if (counts.pair > LOGIN_MAX_ATTEMPTS || counts.ip > LOGIN_MAX_IP_ATTEMPTS) {
+    await recordAuthAudit('LOGIN_BLOCKED', { username, req });
+    res.set('Retry-After', '60');
+    return res.status(429).json({ error: 'Terlalu banyak percobaan login. Coba lagi nanti.', code: 'LOGIN_RATE_LIMITED' });
+  }
+
+  const user = await db.prepare(
+    'SELECT id, username, name, password_salt, password_hash, role, tenant_id AS tenantId FROM users WHERE LOWER(username) = LOWER(?) AND active = TRUE'
+  ).get(username);
+  if (!user || !verifyPassword(password, user.password_salt, user.password_hash)) {
+    await recordAuthAudit('LOGIN_FAILED', { user: user ? { id: user.id, username: user.username, tenantId: user.tenantId } : null, username, req });
     return res.status(401).json({ error: 'Kredensial tidak valid.' });
   }
 
+  await clearLoginFailures(usernameKey, ipHash);
   const token = signSessionToken();
+  const csrfToken = crypto.randomBytes(32).toString('base64url');
   const createdAt = new Date();
-  const expiresAt = new Date(createdAt.getTime() + 1000 * 60 * 60 * 8).toISOString();
-  await db.prepare('INSERT INTO sessions (token_hash, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)')
-    .run(hashSessionToken(token), user.id, expiresAt, createdAt.toISOString());
+  const expiresAt = new Date(createdAt.getTime() + SESSION_HOURS * 60 * 60 * 1000).toISOString();
+  await db.prepare('INSERT INTO sessions (token_hash, user_id, csrf_token, expires_at, created_at) VALUES (?, ?, ?, ?, ?)')
+    .run(hashSessionToken(token), user.id, csrfToken, expiresAt, createdAt.toISOString());
   await db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(createdAt.toISOString());
-  const secureCookie = process.env.NODE_ENV === 'production';
-  res.cookie('orderguard_session', token, {
-    httpOnly: true,
-    sameSite: 'lax',
-    secure: secureCookie,
-    maxAge: 1000 * 60 * 60 * 8,
-  });
-  res.json({ ok: true, user: await publicUser(user) });
+  await recordAuthAudit('LOGIN_SUCCESS', { user, req });
+
+  res.cookie('orderguard_session', token, sessionCookieOptions());
+  res.cookie('orderguard_csrf', csrfToken, csrfCookieOptions());
+  res.json({ ok: true, user: await publicUser(user), csrfToken });
 }));
 
 app.post('/api/logout', asyncRoute(async (req, res) => {
+  const user = await getUserFromRequest(req);
+  if (user && !csrfTokenMatches(req, user)) {
+    return res.status(403).json({ error: 'CSRF token tidak valid atau tidak tersedia.', code: 'CSRF_INVALID' });
+  }
   const cookies = parseCookies(req.headers.cookie || '');
   const token = cookies.orderguard_session;
+  if (user) await recordAuthAudit('LOGOUT', { user, req });
   if (token) await db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(hashSessionToken(token));
-  res.clearCookie('orderguard_session', { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production' });
+  res.clearCookie('orderguard_session', { httpOnly: true, sameSite: 'lax', secure: isProduction, path: '/' });
+  res.clearCookie('orderguard_csrf', { httpOnly: false, sameSite: 'lax', secure: isProduction, path: '/' });
   res.json({ ok: true });
 }));
 
@@ -1100,7 +1326,7 @@ app.get('/api/tiktok/status', requireAuth, requireRole(['super-admin', 'store-ad
   res.json({ configured, missing: configured ? [] : config.missing, connectedShops: shops });
 }));
 
-app.get('/api/tiktok/connect', requireAuth, requireRole(['super-admin', 'store-admin']), asyncRoute(async (req, res) => {
+app.get('/api/tiktok/connect', requireAuth, requireRole(['super-admin', 'store-admin']), validateOriginHeader, asyncRoute(async (req, res) => {
   const { configured, config } = tiktokConfigStatus();
   if (!configured) {
     return res.status(503).json({ error: `Integrasi TikTok Shop belum dikonfigurasi: ${config.missing.join(', ')}.` });
@@ -1207,7 +1433,7 @@ app.get('/api/tiktok/shops', requireAuth, requireRole(['super-admin', 'store-adm
   res.json({ shops });
 }));
 
-app.post('/api/tiktok/sync', requireAuth, requireRole(['super-admin', 'store-admin']), asyncRoute(async (req, res) => {
+app.post('/api/tiktok/sync', requireAuth, requireRole(['super-admin', 'store-admin']), requireCsrf, asyncRoute(async (req, res) => {
   const shopId = String(req.body?.shopId || '').trim();
   if (!shopId) return res.status(400).json({ error: 'Pilih toko TikTok Shop terlebih dahulu.' });
   const { configured, config } = tiktokConfigStatus();
@@ -1278,7 +1504,7 @@ app.post('/api/tiktok/sync', requireAuth, requireRole(['super-admin', 'store-adm
   }
 }));
 
-app.post('/api/order-events', requireAuth, requireRole(['super-admin', 'store-admin', 'handover-staff']), asyncRoute(async (req, res) => {
+app.post('/api/order-events', requireAuth, requireRole(['super-admin', 'store-admin', 'handover-staff']), requireCsrf, asyncRoute(async (req, res) => {
   const type = String(req.body?.type || '');
   const tracking = String(req.body?.tracking || '').trim();
   const reason = String(req.body?.reason || '').trim();
@@ -1315,7 +1541,7 @@ app.get('/api/state', requireAuth, requireRole(['super-admin', 'store-admin', 'h
   res.json(record.state);
 }));
 
-app.post('/api/state', requireAuth, requireRole(['super-admin', 'store-admin', 'handover-staff']), asyncRoute(async (req, res) => {
+app.post('/api/state', requireAuth, requireRole(['super-admin', 'store-admin', 'handover-staff']), requireCsrf, asyncRoute(async (req, res) => {
   const payload = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : null;
   if (!payload) return res.status(400).json({ error: 'Payload state tidak valid.' });
   if (!Array.isArray(payload.audit)) return res.status(400).json({ error: 'Data audit tidak valid.' });
@@ -1341,6 +1567,8 @@ app.post('/api/state', requireAuth, requireRole(['super-admin', 'store-admin', '
 app.get('/', (req, res) => {
   res.sendFile(path.join(appDir, 'index.html'));
 });
+
+app.use('/api', (req, res) => res.status(404).json({ error: 'Endpoint API tidak ditemukan.', code: 'API_NOT_FOUND' }));
 
 app.get('/evidence.js', (req, res) => res.sendFile(path.join(appDir, 'evidence.js')));
 app.get('/app.js', (req, res) => res.sendFile(path.join(appDir, 'app.js')));
@@ -1377,6 +1605,9 @@ app.use((error, req, res, next) => {
   }
   if (error?.type === 'entity.parse.failed' || (error instanceof SyntaxError && error.status === 400)) {
     return res.status(400).json({ error: 'Payload JSON tidak valid.' });
+  }
+  if (error?.type === 'entity.too.large') {
+    return res.status(413).json({ error: 'Payload terlalu besar.' });
   }
   console.error(`[${req.method} ${req.path}] ${error?.message || 'Unknown error'}`);
   return res.status(500).json({ error: 'Terjadi kesalahan server.' });
