@@ -9,6 +9,7 @@ const SCHEMA = `
   CREATE TABLE IF NOT EXISTS tenant_state (
     tenant_id TEXT PRIMARY KEY,
     payload TEXT NOT NULL,
+    version BIGINT NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL
   );
   CREATE TABLE IF NOT EXISTS tenants (
@@ -85,6 +86,10 @@ const SCHEMA = `
   );
 `;
 
+const MIGRATIONS = [
+  'ALTER TABLE tenant_state ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 0',
+];
+
 function placeholders(sql) {
   let index = 0;
   return sql
@@ -136,7 +141,7 @@ function createPool({ connectionString = process.env.DATABASE_URL, max = 10, sch
   if (schema && !/^[a-z_][a-z0-9_]{0,62}$/.test(schema)) throw new Error('DATABASE_SCHEMA hanya boleh berisi huruf kecil, angka, dan garis bawah.');
   const pool = new Pool({ connectionString, max, ...(schema ? { options: `-c search_path=${schema}` } : {}) });
   const database = createDatabase(pool);
-  return { ...database, pool, schema: SCHEMA };
+  return { ...database, pool, schema: SCHEMA, migrations: MIGRATIONS };
 }
 
-module.exports = { createPool, placeholders, SCHEMA };
+module.exports = { createPool, placeholders, SCHEMA, MIGRATIONS };

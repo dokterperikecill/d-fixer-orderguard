@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test backend.test.js tiktok-shop.test.js",
+    "test": "node --test backend.test.js tiktok-shop.test.js evidence.test.js",
     "db:migrate": "node scripts/migrate-sqlite-to-postgres.js",
     "db:backup": "node scripts/backup.js",
     "db:restore": "node scripts/restore.js",

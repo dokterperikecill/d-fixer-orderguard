@@ -3,9 +3,11 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { isDeepStrictEqual } = require('node:util');
 const { createPool } = require('./database');
+const Evidence = require('./evidence');
 const TikTokShop = require('./tiktok-shop');
 
 const app = express();
+app.disable('x-powered-by');
 const port = Number(process.env.PORT || 4173);
 const appDir = __dirname;
 const db = createPool();
@@ -107,6 +109,7 @@ async function seedInitialUsers() {
 
 async function initializeDatabase() {
   await db.exec(db.schema);
+  for (const migration of db.migrations) await db.exec(migration);
   await seedTenants();
   await seedInitialUsers();
 }
@@ -256,79 +259,139 @@ function baseState(tenantName = "D'Fixer Store") {
 }
 
 function normalizeState(payload, tenantName = "D'Fixer Store") {
-  const state = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : baseState(tenantName);
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new TypeError('Payload state harus berupa objek.');
+  }
+  const state = payload;
   for (const field of ['manifests', 'incidents', 'audit', 'importJobs', 'orderEvents']) {
     if (!Array.isArray(state[field])) state[field] = [];
   }
   return state;
 }
 
-async function readState(tenantId) {
-  const tenantName = (await getTenant(tenantId))?.name;
-  const row = await db.prepare('SELECT payload FROM tenant_state WHERE tenant_id = ?').get(tenantId);
-  if (!row) {
-    if (tenantId === 'dfixer-store') {
-      const legacyRow = await db.prepare("SELECT payload FROM app_state WHERE id = 'state'").get();
-      if (legacyRow) {
-        try {
-          const legacyState = normalizeState(JSON.parse(legacyRow.payload), tenantName);
-          await writeState(tenantId, legacyState);
-          return legacyState;
-        } catch (error) {
-          console.warn('State lama tidak dapat dibaca; membuat state tenant baru.', error);
-        }
-      }
-    }
-    const initialState = baseState(tenantName);
-    await writeState(tenantId, initialState);
-    return initialState;
-  }
-
-  try {
-    return normalizeState(JSON.parse(row.payload), tenantName);
-  } catch (error) {
-    const initialState = baseState(tenantName);
-    await writeState(tenantId, initialState);
-    return initialState;
+class StateCorruptionError extends Error {
+  constructor(tenantId, cause) {
+    super(`Data state tenant ${tenantId} tidak dapat dibaca. Hubungi administrator untuk pemulihan.`);
+    this.name = 'StateCorruptionError';
+    this.status = 503;
+    this.code = 'STATE_CORRUPTED';
+    this.tenantId = tenantId;
+    this.cause = cause;
   }
 }
 
-async function writeState(tenantId, payload) {
-  const state = normalizeState(payload, (await getTenant(tenantId))?.name);
+class StateVersionConflictError extends Error {
+  constructor(version) {
+    super('Data telah berubah sejak Anda memuatnya. Muat ulang lalu ulangi perubahan.');
+    this.name = 'StateVersionConflictError';
+    this.status = 409;
+    this.code = 'STATE_VERSION_CONFLICT';
+    this.version = version;
+  }
+}
+
+class StateValidationError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.name = 'StateValidationError';
+    this.status = status;
+    this.code = 'STATE_VALIDATION_FAILED';
+  }
+}
+
+function parseStoredState(payload, tenantName, tenantId) {
+  try {
+    return normalizeState(JSON.parse(payload), tenantName);
+  } catch (error) {
+    throw new StateCorruptionError(tenantId, error);
+  }
+}
+
+function parseIfMatchVersion(header) {
+  if (header === undefined || header === null || header === '') return null;
+  const value = String(header).trim();
+  if (value === '*') return null;
+  const match = /^(?:W\/)?"?state-(\d+)"?$/.exec(value) || /^(?:W\/)?"?(\d+)"?$/.exec(value);
+  return match ? Number(match[1]) : Number.NaN;
+}
+
+async function lockTenantState(tx, tenantId, tenantName) {
+  // Serialize initialization and mutation per tenant. The advisory lock is
+  // transaction-scoped, so it is released automatically on COMMIT/ROLLBACK.
+  await tx.prepare('SELECT pg_advisory_xact_lock(hashtext(?::text), hashtext(?::text))')
+    .get('orderguard:tenant-state', tenantId);
+
+  let row = await tx.prepare('SELECT payload, version, updated_at AS updatedAt FROM tenant_state WHERE tenant_id = ? FOR UPDATE').get(tenantId);
+  if (row) {
+    return { row, state: parseStoredState(row.payload, tenantName, tenantId), created: false };
+  }
+
+  let initialState = null;
+  if (tenantId === 'dfixer-store') {
+    const legacyRow = await tx.prepare("SELECT payload FROM app_state WHERE id = 'state'").get();
+    if (legacyRow) initialState = parseStoredState(legacyRow.payload, tenantName, tenantId);
+  }
+  if (!initialState) initialState = baseState(tenantName);
+
   const issuedAt = new Date().toISOString();
-  await db.prepare(
-    `INSERT INTO tenant_state (tenant_id, payload, updated_at) VALUES (?, ?, ?) ON CONFLICT(tenant_id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at`
-  ).run(tenantId, JSON.stringify(state), issuedAt);
+  await tx.prepare('INSERT INTO tenant_state (tenant_id, payload, version, updated_at) VALUES (?, ?, 0, ?)')
+    .run(tenantId, JSON.stringify(initialState), issuedAt);
+  row = { payload: JSON.stringify(initialState), version: 0, updatedAt: issuedAt };
+  return { row, state: initialState, created: true };
+}
+
+async function readStateRecord(tenantId) {
+  const tenantName = (await getTenant(tenantId))?.name;
+  const row = await db.prepare('SELECT payload, version, updated_at AS updatedAt FROM tenant_state WHERE tenant_id = ?').get(tenantId);
+  if (row) {
+    return {
+      state: parseStoredState(row.payload, tenantName, tenantId),
+      version: Number(row.version),
+      updatedAt: row.updatedAt,
+    };
+  }
+
+  return db.transaction(async (tx) => {
+    const locked = await lockTenantState(tx, tenantId, tenantName);
+    return {
+      state: locked.state,
+      version: Number(locked.row.version),
+      updatedAt: locked.row.updatedAt,
+    };
+  });
+}
+
+async function readState(tenantId) {
+  return (await readStateRecord(tenantId)).state;
+}
+
+async function transactTenantState(tenantId, handler, { expectedVersion = null } = {}) {
+  const tenantName = (await getTenant(tenantId))?.name;
+  return db.transaction(async (tx) => {
+    const locked = await lockTenantState(tx, tenantId, tenantName);
+    const currentVersion = Number(locked.row.version);
+    if (expectedVersion !== null && expectedVersion !== currentVersion) {
+      throw new StateVersionConflictError(currentVersion);
+    }
+
+    const outcome = await handler(locked.state, currentVersion);
+    const nextState = normalizeState(outcome && outcome.state ? outcome.state : locked.state, tenantName);
+    const issuedAt = new Date().toISOString();
+    const updated = await tx.prepare(
+      'UPDATE tenant_state SET payload = ?, version = version + 1, updated_at = ? WHERE tenant_id = ? RETURNING version'
+    ).get(JSON.stringify(nextState), issuedAt, tenantId);
+
+    return {
+      state: nextState,
+      result: outcome ? outcome.result : undefined,
+      version: Number(updated.version),
+      updatedAt: issuedAt,
+    };
+  });
 }
 
 async function updateTenantState(tenantId, updater) {
-  const tenantName = (await getTenant(tenantId))?.name;
-  return db.transaction(async (tx) => {
-    const row = await tx.prepare('SELECT payload FROM tenant_state WHERE tenant_id = ? FOR UPDATE').get(tenantId);
-    let current;
-    if (row) {
-      try {
-        current = normalizeState(JSON.parse(row.payload), tenantName);
-      } catch {
-        current = baseState(tenantName);
-      }
-    } else if (tenantId === 'dfixer-store') {
-      const legacyRow = await tx.prepare("SELECT payload FROM app_state WHERE id = 'state'").get();
-      try {
-        current = legacyRow ? normalizeState(JSON.parse(legacyRow.payload), tenantName) : baseState(tenantName);
-      } catch {
-        current = baseState(tenantName);
-      }
-    } else {
-      current = baseState(tenantName);
-    }
-    const result = await updater(current);
-    const issuedAt = new Date().toISOString();
-    await tx.prepare(
-      `INSERT INTO tenant_state (tenant_id, payload, updated_at) VALUES (?, ?, ?) ON CONFLICT(tenant_id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at`
-    ).run(tenantId, JSON.stringify(current), issuedAt);
-    return result;
-  });
+  return transactTenantState(tenantId, (state) => ({ result: updater(state) }));
 }
 
 class OrderEventError extends Error {
@@ -377,6 +440,7 @@ function applyOrderEvent(user, state, input) {
   const occurredAt = validTimestamp(input.occurredAt) ? new Date(input.occurredAt).toISOString() : recordedAt;
   const previousStatus = parcel.status;
   let newStatus;
+  let validatedEvidence = null;
 
   switch (input.type) {
     case 'CANCELLED_BEFORE_HANDOVER':
@@ -393,11 +457,15 @@ function applyOrderEvent(user, state, input) {
       if (parcel.status !== 'CANCELLATION_AFTER_HANDOVER') throw new OrderEventError(409, 'Retur hanya dapat diajukan untuk paket yang dibatalkan setelah pickup.');
       newStatus = 'RETURN_IN_TRANSIT';
       break;
-    case 'RETURN_RECEIVED':
+    case 'RETURN_RECEIVED': {
       if (parcel.status !== 'RETURN_IN_TRANSIT') throw new OrderEventError(409, 'Retur hanya dapat diterima untuk paket yang sedang dalam perjalanan retur.');
-      if (!input.evidence || !/^data:image\/(jpeg|png|webp);base64,/.test(input.evidence) || input.evidence.length > 2500000) throw new OrderEventError(400, 'Foto bukti retur diterima wajib diunggah.');
+      if (!input.evidence) throw new OrderEventError(400, 'Foto bukti retur diterima wajib diunggah.');
+      const evidenceResult = Evidence.validateEvidenceDataUri(input.evidence);
+      if (!evidenceResult.ok) throw new OrderEventError(400, evidenceResult.error);
+      validatedEvidence = evidenceResult.dataUri;
       newStatus = 'RETURN_RECEIVED';
       break;
+    }
     case 'CANCELLATION_REJECTED': {
       if (parcel.status !== 'CANCELLATION_AFTER_HANDOVER') throw new OrderEventError(409, 'Pembatalan hanya dapat ditolak saat paket berstatus dibatalkan setelah pickup.');
       const cancellation = state.orderEvents.find((event) => event.type === 'CANCELLATION_AFTER_HANDOVER' && normalizedTracking(event.tracking) === normalizedTracking(parcel.tracking));
@@ -424,7 +492,7 @@ function applyOrderEvent(user, state, input) {
     recordedAt,
     recordedBy: user.name,
     recordedById: user.id,
-    evidence: input.type === 'RETURN_RECEIVED' ? input.evidence : null,
+    evidence: input.type === 'RETURN_RECEIVED' ? validatedEvidence : null,
   };
   state.orderEvents.unshift(event);
   state.orderEvents = state.orderEvents.slice(0, 5000);
@@ -696,6 +764,7 @@ function validateHandoverUpdate(user, previous, next) {
   }
 
   const expectedIncidents = [];
+  const usedSessionIds = new Set(previous.manifests.flatMap((manifest) => (Array.isArray(manifest.sessions) ? manifest.sessions.map((session) => session.id) : [])));
   for (let index = 0; index < previous.manifests.length; index += 1) {
     const oldManifest = previous.manifests[index];
     const newManifest = next.manifests[index];
@@ -746,6 +815,14 @@ function validateHandoverUpdate(user, previous, next) {
     const handedOverInSessions = new Set();
     for (const session of newSessions) {
       if (session.actor !== user.name || !session.receiver || !validTimestamp(session.createdAt) || !Array.isArray(session.items) || !session.items.length) return 'Sesi serah terima tidak valid.';
+      if (typeof session.id !== 'string' || !/^TR-[A-Za-z0-9-]{1,80}$/.test(session.id) || usedSessionIds.has(session.id)) return 'ID sesi serah terima tidak valid atau duplikat.';
+      usedSessionIds.add(session.id);
+      if (typeof session.receiver !== 'string' || !session.receiver.trim() || session.receiver.length > 100) return 'Nama penerima sesi serah terima tidak valid.';
+      if (session.note !== undefined && (typeof session.note !== 'string' || session.note.length > 500)) return 'Catatan sesi serah terima maksimal 500 karakter.';
+      if (session.evidence !== undefined && session.evidence !== null) {
+        const evidenceResult = Evidence.validateEvidenceDataUri(session.evidence);
+        if (!evidenceResult.ok) return `Bukti foto sesi serah terima tidak valid: ${evidenceResult.error}`;
+      }
       const sessionItems = new Set();
       for (const tracking of session.items) {
         if (!newlyHandedOver.has(tracking) || handedOverInSessions.has(tracking) || sessionItems.has(tracking)) return 'Sesi hanya boleh berisi paket yang baru dikonfirmasi.';
@@ -797,6 +874,30 @@ function validateHandoverUpdate(user, previous, next) {
   return null;
 }
 
+app.use((req, res, next) => {
+  res.set('X-Content-Type-Options', 'nosniff');
+  res.set('X-Frame-Options', 'DENY');
+  res.set('Referrer-Policy', 'no-referrer');
+  res.set('Permissions-Policy', 'camera=(self), microphone=(), geolocation=()');
+  res.set('Content-Security-Policy', [
+    "default-src 'self'",
+    "base-uri 'self'",
+    "object-src 'none'",
+    "frame-ancestors 'none'",
+    "form-action 'self'",
+    "script-src 'self' https://cdn.jsdelivr.net",
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+    "font-src 'self' https://fonts.gstatic.com data:",
+    "img-src 'self' data: blob:",
+    "connect-src 'self'",
+    "worker-src 'self'",
+    "manifest-src 'self'",
+  ].join('; '));
+  if (process.env.NODE_ENV === 'production') {
+    res.set('Strict-Transport-Security', 'max-age=15552000; includeSubDomains');
+  }
+  next();
+});
 app.use(express.json({ limit: '10mb' }));
 
 app.get('/api/health', asyncRoute(async (req, res) => {
@@ -1144,10 +1245,11 @@ app.post('/api/tiktok/sync', requireAuth, requireRole(['super-admin', 'store-adm
       handedOver: hasHandoverHistory(manifest, parcel),
     })));
     const plans = TikTokShop.planOrderEvents(orders, returns, packagesForSync);
-    const eventsCreated = plans.length
+    const mutation = plans.length
       ? await updateTenantState(req.user.tenantId, (state) => applyTikTokEventPlans(req.user, state, plans))
-      : 0;
-    const state = await readState(req.user.tenantId);
+      : null;
+    const eventsCreated = mutation ? mutation.result : 0;
+    const state = mutation ? mutation.state : await readState(req.user.tenantId);
     const knownPackages = state.manifests
       .filter((manifest) => String(manifest.shop || '').trim().toLocaleLowerCase('id-ID') === shopName)
       .flatMap((manifest) => Array.isArray(manifest.packages) ? manifest.packages : []);
@@ -1167,6 +1269,7 @@ app.post('/api/tiktok/sync', requireAuth, requireRole(['super-admin', 'store-adm
       returnsFetched: returns.length,
       returnsWarning,
       eventsCreated,
+      stateVersion: mutation ? mutation.version : null,
       orders: eligibleOrders,
     });
   } catch (error) {
@@ -1187,7 +1290,7 @@ app.post('/api/order-events', requireAuth, requireRole(['super-admin', 'store-ad
   const occurredAt = String(req.body?.occurredAt || '').trim();
   if (occurredAt && !validTimestamp(occurredAt)) return res.status(400).json({ error: 'Waktu kejadian tidak valid.' });
   try {
-    const result = await updateTenantState(req.user.tenantId, (state) => applyOrderEvent(req.user, state, {
+    const mutation = await updateTenantState(req.user.tenantId, (state) => applyOrderEvent(req.user, state, {
       type,
       tracking,
       reason,
@@ -1195,7 +1298,9 @@ app.post('/api/order-events', requireAuth, requireRole(['super-admin', 'store-ad
       occurredAt,
       evidence: req.body?.evidence,
     }));
-    res.status(201).json(result);
+    res.set('ETag', `"state-${mutation.version}"`);
+    res.set('X-State-Version', String(mutation.version));
+    res.status(201).json(mutation.result);
   } catch (error) {
     if (error instanceof OrderEventError) return res.status(error.status).json({ error: error.message });
     throw error;
@@ -1203,31 +1308,41 @@ app.post('/api/order-events', requireAuth, requireRole(['super-admin', 'store-ad
 }));
 
 app.get('/api/state', requireAuth, requireRole(['super-admin', 'store-admin', 'handover-staff']), asyncRoute(async (req, res) => {
-  res.json(await readState(req.user.tenantId));
+  const record = await readStateRecord(req.user.tenantId);
+  res.set('Cache-Control', 'no-store');
+  res.set('ETag', `"state-${record.version}"`);
+  res.set('X-State-Version', String(record.version));
+  res.json(record.state);
 }));
 
 app.post('/api/state', requireAuth, requireRole(['super-admin', 'store-admin', 'handover-staff']), asyncRoute(async (req, res) => {
-  const payload = req.body && typeof req.body === 'object' ? req.body : null;
+  const payload = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : null;
   if (!payload) return res.status(400).json({ error: 'Payload state tidak valid.' });
-  const previous = await readState(req.user.tenantId);
   if (!Array.isArray(payload.audit)) return res.status(400).json({ error: 'Data audit tidak valid.' });
-  const auditError = validateAuditAppend(req.user, previous.audit, payload.audit);
-  if (auditError) return res.status(403).json({ error: auditError });
-  if (req.user.role === 'handover-staff') {
-    const validationError = validateHandoverUpdate(req.user, previous, payload);
-    if (validationError) return res.status(403).json({ error: validationError });
-  } else {
-    const validationError = validateStoreAdminUpdate(req.user, previous, payload);
-    if (validationError) return res.status(403).json({ error: validationError });
-  }
-  await writeState(req.user.tenantId, payload);
-  res.json({ ok: true, updatedAt: new Date().toISOString() });
+  const expectedVersion = parseIfMatchVersion(req.get('if-match'));
+  if (Number.isNaN(expectedVersion)) return res.status(400).json({ error: 'Header If-Match tidak valid.' });
+
+  const mutation = await transactTenantState(req.user.tenantId, (current) => {
+    const auditError = validateAuditAppend(req.user, current.audit, payload.audit);
+    if (auditError) throw new StateValidationError(403, auditError);
+    const validationError = req.user.role === 'handover-staff'
+      ? validateHandoverUpdate(req.user, current, payload)
+      : validateStoreAdminUpdate(req.user, current, payload);
+    if (validationError) throw new StateValidationError(403, validationError);
+    return { state: payload };
+  }, { expectedVersion });
+
+  res.set('Cache-Control', 'no-store');
+  res.set('ETag', `"state-${mutation.version}"`);
+  res.set('X-State-Version', String(mutation.version));
+  res.json({ ok: true, updatedAt: mutation.updatedAt, version: mutation.version });
 }));
 
 app.get('/', (req, res) => {
   res.sendFile(path.join(appDir, 'index.html'));
 });
 
+app.get('/evidence.js', (req, res) => res.sendFile(path.join(appDir, 'evidence.js')));
 app.get('/app.js', (req, res) => res.sendFile(path.join(appDir, 'app.js')));
 app.get('/styles.css', (req, res) => res.sendFile(path.join(appDir, 'styles.css')));
 app.get('/manifest.webmanifest', (req, res) => {
@@ -1242,6 +1357,29 @@ app.get('/service-worker.js', (req, res) => {
 app.get('/icons/:icon', (req, res) => {
   if (!['orderguard.svg', 'icon-192.png', 'icon-512.png'].includes(req.params.icon)) return res.sendStatus(404);
   res.sendFile(path.join(appDir, 'icons', req.params.icon));
+});
+
+app.use((error, req, res, next) => {
+  if (res.headersSent) return next(error);
+  if (error instanceof StateVersionConflictError) {
+    res.set('X-State-Version', String(error.version));
+    return res.status(409).json({ error: error.message, code: error.code, version: error.version });
+  }
+  if (error instanceof StateCorruptionError) {
+    console.error(`State tenant rusak (${error.tenantId}): ${error.cause?.message || 'payload tidak valid'}`);
+    return res.status(503).json({ error: error.message, code: error.code });
+  }
+  if (error instanceof StateValidationError) {
+    return res.status(error.status).json({ error: error.message, code: error.code });
+  }
+  if (error instanceof OrderEventError) {
+    return res.status(error.status).json({ error: error.message });
+  }
+  if (error?.type === 'entity.parse.failed' || (error instanceof SyntaxError && error.status === 400)) {
+    return res.status(400).json({ error: 'Payload JSON tidak valid.' });
+  }
+  console.error(`[${req.method} ${req.path}] ${error?.message || 'Unknown error'}`);
+  return res.status(500).json({ error: 'Terjadi kesalahan server.' });
 });
 
 initializeDatabase().then(() => {

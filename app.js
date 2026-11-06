@@ -148,6 +148,8 @@ async function hydrateStateFromServer() {
     if (!response.ok) return;
     const remote = await response.json();
     if (remote && Array.isArray(remote.manifests)) {
+      const version = response.headers.get('x-state-version');
+      if (version !== null && version !== '' && Number.isFinite(Number(version))) stateVersion = Number(version);
       localStorage.setItem(tenantStorageKey(), JSON.stringify(remote));
       Object.assign(state, remote);
     }
@@ -157,6 +159,7 @@ async function hydrateStateFromServer() {
 }
 
 const state = { manifests: [], incidents: [], audit: [], importJobs: [], orderEvents: [] };
+let stateVersion = null;
 let currentUser = null;
 let currentView = "dashboard";
 let selectedManifestId = null;
@@ -230,6 +233,7 @@ async function login(username, password) {
 async function logout() {
   await fetch('/api/logout', { method: 'POST', credentials: 'same-origin' });
   currentUser = null;
+  stateVersion = null;
   localStorage.removeItem(CURRENT_USER_KEY);
   currentView = 'dashboard';
   selectedManifestId = null;
@@ -259,18 +263,25 @@ async function persist() {
   const snapshot = JSON.stringify(state);
   localStorage.setItem(tenantStorageKey(), snapshot);
   try {
+    const headers = { 'Content-Type': 'application/json' };
+    if (Number.isInteger(stateVersion)) headers['If-Match'] = `"state-${stateVersion}"`;
     const response = await fetch('/api/state', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: snapshot,
     });
+    const result = await response.json().catch(() => ({}));
     if (!response.ok) {
-      const result = await response.json().catch(() => ({}));
       await hydrateStateFromServer();
       renderPage();
-      toast(result.error || 'Perubahan ditolak oleh server.', true);
+      if (response.status === 409) {
+        toast('Data telah diperbarui pengguna lain. Perubahan Anda belum tersimpan; silakan ulangi.', true);
+      } else {
+        toast(result.error || 'Perubahan ditolak oleh server.', true);
+      }
       return false;
     }
+    if (Number.isInteger(result.version)) stateVersion = result.version;
     return true;
   } catch (error) {
     console.warn('Gagal menyimpan state ke backend.', error);
@@ -306,6 +317,24 @@ function openModal(title, subtitle, body) {
 function closeModal() {
   modalBackdrop.hidden = true;
   modal.innerHTML = "";
+}
+
+function openEvidenceModal(title, subtitle, dataUri, alt) {
+  openModal(title, subtitle, '<div id="evidence-modal-content"></div><div class="modal-actions" style="margin-top:12px"><button type="button" class="button button-secondary" data-action="close-modal">Tutup</button></div>');
+  const container = document.querySelector("#evidence-modal-content");
+  if (!container) return;
+  const library = window.OrderGuardEvidence;
+  const result = library && typeof library.createEvidenceImage === "function"
+    ? library.createEvidenceImage(document, dataUri, alt)
+    : { ok: false, error: "Validator bukti foto tidak tersedia." };
+  if (result.ok) {
+    container.append(result.element);
+    return;
+  }
+  const message = document.createElement("p");
+  message.className = "row-error";
+  message.textContent = result.error || "Bukti foto tidak valid atau formatnya tidak didukung.";
+  container.append(message);
 }
 
 function getManifest(id) {
@@ -758,7 +787,7 @@ function createManifest({ shop, courier, date, location, parcels, source = "manu
   return manifest;
 }
 
-function commitImport() {
+async function commitImport() {
   if (!importDraft) return;
   readImportMapping();
   const rows = analyzeImport();
@@ -776,7 +805,8 @@ function commitImport() {
   const job = { id: makeId("IMP"), fileName: importDraft.fileName, total: rows.length, valid: validRows.length, failed: failedRows.length, manifestCount: created.length, createdAt: nowISO(), errors: failedRows.map(({ line, order, tracking, issue }) => ({ line, order, tracking, issue })) };
   state.importJobs.unshift(job);
   logAudit(`Impor ${job.fileName}: ${job.valid} valid, ${job.failed} ditolak`, job.id);
-  persist();
+  const saved = await persist();
+  if (!saved) return;
   lastImportJob = job;
   importDraft = null;
   toast(`${job.valid} paket dimasukkan ke ${created.length} manifest.`);
@@ -817,7 +847,7 @@ function openOrderEventModal(manifest, parcel, type) {
     ${needsReason ? '<div class="field"><label for="event-reason">Alasan <span class="required-mark">*</span></label><textarea id="event-reason" name="reason" required maxlength="500" placeholder="Contoh: pembeli membatalkan pesanan"></textarea></div>' : ""}
     <div class="modal-grid">
       <div class="field"><label for="event-occurred-at">Waktu kejadian</label><input id="event-occurred-at" name="occurredAt" type="datetime-local" value="${localDateTimeInput()}" /></div>
-      ${needsPhoto ? '<div class="field"><label for="event-photo">Foto bukti retur <span class="required-mark">*</span></label><input id="event-photo" name="photo" type="file" accept="image/*" required /><span class="field-help">Wajib. Foto dikompres sebelum disimpan.</span></div>' : ""}
+      ${needsPhoto ? '<div class="field"><label for="event-photo">Foto bukti retur <span class="required-mark">*</span></label><input id="event-photo" name="photo" type="file" accept="image/jpeg,image/png,image/webp" required /><span class="field-help">Wajib. Foto dikompres sebelum disimpan.</span></div>' : ""}
     </div>
     <div class="field"><label for="event-note">Catatan</label><textarea id="event-note" name="note" maxlength="1000" placeholder="Opsional"></textarea></div>
     <div class="modal-actions"><button type="button" class="button button-secondary" data-action="close-modal">Batal</button><button type="submit" class="button button-primary"><i data-lucide="save"></i> Simpan kejadian</button></div>
@@ -913,7 +943,7 @@ function renderReturns() {
 function showOrderEventEvidence(eventId) {
   const event = (state.orderEvents || []).find((item) => item.id === eventId);
   if (!event?.evidence) return;
-  openModal("Bukti retur diterima", `${event.tracking} · ${formatDateTime(event.recordedAt)}`, `<img src="${event.evidence}" alt="Bukti retur ${escapeHtml(event.tracking)}" style="display:block;width:100%;max-height:62vh;object-fit:contain;border-radius:5px;background:#f2f3f1" /><div class="modal-actions" style="margin-top:12px"><button type="button" class="button button-secondary" data-action="close-modal">Tutup</button></div>`);
+  openEvidenceModal("Bukti retur diterima", `${event.tracking} · ${formatDateTime(event.recordedAt)}`, event.evidence, `Bukti retur ${event.tracking}`);
 }
 
 function renderManifestDetail(manifest) {
@@ -937,7 +967,7 @@ function renderManifestDetail(manifest) {
       <div class="scanner-actions"><button class="button button-secondary button-small" id="camera-toggle" type="button"><i data-lucide="camera"></i> Buka kamera</button></div><video class="camera-frame" id="camera-frame" playsinline muted></video>
       <div class="scan-log" id="scan-log">${scanEntries.map((entry) => `<div class="scan-log-entry"><div><strong>${escapeHtml(entry.tracking)}</strong><small style="display:block;margin-top:4px">${formatDateTime(entry.createdAt)} · ${escapeHtml(entry.actor || ACTOR)}</small></div><span class="status-pill ${statusClass(entry.result)}">${escapeHtml(SCAN_LABELS[entry.result] || entry.result)}</span></div>`).join("") || '<span class="field-help">Belum ada aktivitas pemindaian.</span>'}</div>
     </section><section class="panel handover-panel"><h2>Konfirmasi serah terima</h2><p>Setiap sesi menyimpan daftar resi yang dipilih, penerima, waktu, dan bukti secara terpisah.</p>
-      <form id="handover-form"><div class="handover-fields"><div class="field"><label for="receiver-name">Nama penerima / kurir <span class="required-mark">*</span></label><input id="receiver-name" name="receiver" required placeholder="Nama petugas kurir" /></div><div class="field"><label for="handover-note">Catatan sesi</label><input id="handover-note" name="note" placeholder="Opsional" /></div><div class="field"><label for="handover-photo">Foto bukti</label><input id="handover-photo" name="photo" type="file" accept="image/*" /><span class="field-help">Opsional. Foto dikompres di perangkat lalu disimpan bersama data serah terima di server.</span></div></div>
+      <form id="handover-form"><div class="handover-fields"><div class="field"><label for="receiver-name">Nama penerima / kurir <span class="required-mark">*</span></label><input id="receiver-name" name="receiver" required placeholder="Nama petugas kurir" /></div><div class="field"><label for="handover-note">Catatan sesi</label><input id="handover-note" name="note" placeholder="Opsional" /></div><div class="field"><label for="handover-photo">Foto bukti</label><input id="handover-photo" name="photo" type="file" accept="image/jpeg,image/png,image/webp" /><span class="field-help">Opsional. Foto dikompres di perangkat lalu disimpan bersama data serah terima di server.</span></div></div>
         ${scannedPackages.length ? `<div class="field" style="margin-top:12px"><label>Paket yang diterima (${scannedPackages.length} dipindai)</label>${scannedPackages.map((parcel) => `<label class="handover-ready"><span><input type="checkbox" name="accepted" value="${escapeHtml(parcel.tracking)}" checked /> <span class="mono">${escapeHtml(parcel.tracking)}</span></span><span>Diterima</span></label>`).join("")}<span class="field-help">Hapus centang pada paket yang ditolak kurir. Paket tersebut tidak diberi status diterima.</span></div>` : `<div class="handover-ready"><span>Belum ada paket yang siap diserahkan</span><strong>0 paket</strong></div>`}
         <button class="button button-primary" type="submit" style="width:100%;margin-top:12px" ${canHandover ? "" : "disabled"}><i data-lucide="badge-check"></i> Konfirmasi penerimaan</button>
       </form></section></div>
@@ -949,7 +979,7 @@ function renderManifestDetail(manifest) {
   if (scanInput && canHandover) scanInput.focus();
 }
 
-function recordScan(manifest, rawTracking) {
+async function recordScan(manifest, rawTracking) {
   const tracking = String(rawTracking || "").trim();
   if (!tracking) return;
   if (["CLOSED", "CANCELLED", "CONFIRMED"].includes(computedManifestStatus(manifest))) return toast("Manifest sudah final dan tidak menerima pemindaian baru.", true);
@@ -975,7 +1005,8 @@ function recordScan(manifest, rawTracking) {
   manifest.scans.push({ tracking, result, createdAt: nowISO(), actor: currentUser?.name || ACTOR });
   if (result === "NOT_IN_MANIFEST") logAudit(`Pemindaian di luar manifest: ${tracking}`, manifest.id);
   else if (result === "MATCH") logAudit(`Paket dipindai: ${tracking}`, manifest.id);
-  persist();
+  const saved = await persist();
+  if (!saved) return;
   currentView = "manifest-detail";
   renderPage();
   const feedback = document.querySelector("#scan-feedback");
@@ -1037,7 +1068,8 @@ async function confirmHandover(form) {
   manifest.sessions.push(session);
   manifest.status = getManifestCounts(manifest).outstanding === 0 ? "CONFIRMED" : "PARTIALLY_HANDED_OVER";
   logAudit(`Serah terima ${session.id} dikonfirmasi: ${accepted.length} diterima${rejected.length ? `, ${rejected.length} ditolak` : ""}`, manifest.id);
-  persist();
+  const saved = await persist();
+  if (!saved) return;
   toast(`Serah terima tersimpan untuk ${accepted.length} paket.`);
   renderPage();
 }
@@ -1236,7 +1268,7 @@ function openNewManifestModal() {
   openModal("Buat manifest manual", "Tambahkan paket yang akan diserahkan ke kurir.", `<form class="modal-form" id="new-manifest-form"><div class="modal-grid"><div class="field"><label for="new-shop">Toko <span class="required-mark">*</span></label><input id="new-shop" name="shop" required value="D'Fixer Store" /></div><div class="field"><label for="new-courier">Kurir / ekspedisi <span class="required-mark">*</span></label><input id="new-courier" name="courier" required placeholder="Contoh: J&T Express" /></div><div class="field"><label for="new-date">Tanggal rencana <span class="required-mark">*</span></label><input id="new-date" name="date" type="date" required value="${todayISO()}" /></div><div class="field"><label for="new-location">Lokasi</label><input id="new-location" name="location" placeholder="Gudang / titik serah" /></div></div><div class="field"><label for="new-parcels">Nomor resi <span class="required-mark">*</span></label><textarea id="new-parcels" name="parcels" required placeholder="Satu nomor resi per baris"></textarea><span class="field-help">Nomor resi duplikat atau yang sudah ada pada manifest aktif akan ditolak.</span></div><div class="modal-actions"><button type="button" class="button button-secondary" data-action="close-modal">Batal</button><button type="submit" class="button button-primary"><i data-lucide="plus"></i> Buat manifest</button></div></form>`);
 }
 
-function submitNewManifest(form) {
+async function submitNewManifest(form) {
   const data = new FormData(form);
   const trackingNumbers = String(data.get("parcels") || "").split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
   if (!trackingNumbers.length) return toast("Masukkan minimal satu nomor resi.", true);
@@ -1249,7 +1281,8 @@ function submitNewManifest(form) {
   }
   const manifest = createManifest({ shop: String(data.get("shop")).trim(), courier: String(data.get("courier")).trim(), date: String(data.get("date")), location: String(data.get("location") || "").trim(), parcels: trackingNumbers.map((tracking) => ({ tracking, order: tracking })), source: "manual" });
   logAudit(`Manifest dibuat manual dengan ${trackingNumbers.length} paket`, manifest.id);
-  persist();
+  const saved = await persist();
+  if (!saved) return;
   closeModal();
   selectedManifestId = manifest.id;
   currentView = "manifest-detail";
@@ -1262,12 +1295,13 @@ function openNewIncidentModal() {
   openModal("Catat insiden", "Simpan konteks dan nomor resi agar selisih dapat ditelusuri.", `<form class="modal-form" id="new-incident-form"><div class="modal-grid"><div class="field"><label for="incident-category">Kategori <span class="required-mark">*</span></label><select id="incident-category" name="category" required><option>Paket kurang</option><option>Paket berlebih</option><option>Resi duplikat</option><option>Paket di luar manifest</option><option>Paket ditolak kurir</option><option>Kesalahan impor</option><option>Paket telah diserahkan sebelumnya</option><option>Kesalahan pemindaian</option><option>Masalah lain</option></select></div><div class="field"><label for="incident-manifest">Manifest terkait</label><select id="incident-manifest" name="manifestId"><option value="">Tidak terkait</option>${options}</select></div></div><div class="field"><label for="incident-tracking">Nomor resi</label><input id="incident-tracking" name="tracking" placeholder="Opsional" /></div><div class="field"><label for="incident-description">Deskripsi <span class="required-mark">*</span></label><textarea id="incident-description" name="description" required placeholder="Jelaskan kejadian dan tindakan yang diperlukan"></textarea></div><div class="modal-actions"><button type="button" class="button button-secondary" data-action="close-modal">Batal</button><button type="submit" class="button button-primary"><i data-lucide="triangle-alert"></i> Simpan insiden</button></div></form>`);
 }
 
-function submitIncident(form) {
+async function submitIncident(form) {
   const data = new FormData(form);
   const incident = { id: makeId("INC"), category: String(data.get("category")), manifestId: String(data.get("manifestId") || ""), tracking: String(data.get("tracking") || "").trim(), description: String(data.get("description") || "").trim(), reportedBy: currentUser?.name || ACTOR, createdAt: nowISO(), status: "OPEN", resolution: "" };
   state.incidents.unshift(incident);
   logAudit(`Insiden dicatat: ${incident.category}`, incident.id);
-  persist();
+  const saved = await persist();
+  if (!saved) return;
   closeModal();
   currentView = "incidents";
   renderPage();
@@ -1280,7 +1314,7 @@ function openResolveModal(id) {
   openModal("Selesaikan insiden", `${incident.id} · ${incident.category}`, `<form class="modal-form" id="resolve-incident-form" data-id="${escapeHtml(id)}"><div class="field"><label for="resolution">Tindakan perbaikan <span class="required-mark">*</span></label><textarea id="resolution" name="resolution" required placeholder="Catat hasil pemeriksaan dan alasan penutupan"></textarea></div><div class="modal-actions"><button type="button" class="button button-secondary" data-action="close-modal">Batal</button><button type="submit" class="button button-primary"><i data-lucide="check"></i> Tandai selesai</button></div></form>`);
 }
 
-function resolveIncident(form) {
+async function resolveIncident(form) {
   const incident = state.incidents.find((item) => item.id === form.dataset.id);
   const resolution = String(new FormData(form).get("resolution") || "").trim();
   if (!incident || !resolution) return;
@@ -1289,7 +1323,8 @@ function resolveIncident(form) {
   incident.resolvedAt = nowISO();
   incident.resolvedBy = currentUser?.name || ACTOR;
   logAudit(`Insiden diselesaikan: ${incident.category} — ${resolution}`, incident.id);
-  persist();
+  const saved = await persist();
+  if (!saved) return;
   closeModal();
   renderPage();
   toast("Insiden ditutup dan tindak lanjut dicatat.");
@@ -1312,7 +1347,7 @@ function downloadCsv(filename, headers, rows) {
   URL.revokeObjectURL(url);
 }
 
-function exportReport() {
+async function exportReport() {
   const rows = [];
   state.manifests.forEach((manifest) => manifest.packages.forEach((parcel) => {
     const event = latestOrderEvent(parcel.tracking);
@@ -1320,7 +1355,7 @@ function exportReport() {
   }));
   downloadCsv(`orderguard-rekonsiliasi-${todayISO()}.csv`, ["ID Manifest", "Toko", "Kurir", "Tanggal", "Nomor Pesanan", "Nomor Resi", "Status Paket", "Waktu Pindai", "Sesi Penerimaan", "Kejadian Terakhir", "Waktu Kejadian", "Alasan"], rows);
   logAudit("Laporan rekonsiliasi diekspor", "CSV");
-  persist();
+  await persist();
 }
 
 function exportAudit() {
@@ -1337,10 +1372,10 @@ function showEvidence(sessionId) {
   const manifest = getManifest(selectedManifestId);
   const session = manifest?.sessions.find((item) => item.id === sessionId);
   if (!session?.evidence) return;
-  openModal("Bukti foto penerimaan", `${session.id} · ${session.items.length} paket · ${formatDateTime(session.createdAt)}`, `<img src="${session.evidence}" alt="Bukti foto sesi ${escapeHtml(session.id)}" style="display:block;width:100%;max-height:62vh;object-fit:contain;border-radius:5px;background:#f2f3f1" /><div class="modal-actions" style="margin-top:12px"><button type="button" class="button button-secondary" data-action="close-modal">Tutup</button></div>`);
+  openEvidenceModal("Bukti foto penerimaan", `${session.id} · ${session.items.length} paket · ${formatDateTime(session.createdAt)}`, session.evidence, `Bukti foto sesi ${session.id}`);
 }
 
-function changeManifestStatus(id, action) {
+async function changeManifestStatus(id, action) {
   const manifest = getManifest(id);
   if (!manifest) return;
   if (action === "close-manifest") {
@@ -1355,7 +1390,8 @@ function changeManifestStatus(id, action) {
     manifest.packages.forEach((parcel) => { if (parcel.status !== "HANDED_OVER") parcel.status = "CANCELLED"; });
     logAudit("Manifest dibatalkan", manifest.id);
   }
-  persist();
+  const saved = await persist();
+  if (!saved) return;
   renderPage();
   toast(action === "close-manifest" ? "Manifest ditutup." : "Manifest dibatalkan.");
 }
