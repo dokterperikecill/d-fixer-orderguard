@@ -63,8 +63,11 @@ test('only orders with a tracking number are mapped for manifest import', () => 
     { order_id: 'existing-order', tracking_number: 'TRK-OLD' },
     { order_id: 'ready-order', tracking_number: 'TRK-DUPLICATE' },
     { tracking_number: 'TRK-NO-ID' },
+    { order_id: 'cancelled-order', tracking_number: 'TRK-CANCELLED', order_status: 'CANCELLED' },
+    { order_id: 'return-order', tracking_number: 'TRK-RETURN' },
   ], 'TikTok Shop Jakarta', '2026-11-04', {
     existingOrders: ['existing-order'],
+    excludedOrderIds: ['return-order'],
   });
   assert.deepEqual(result, {
     orders: [{
@@ -77,8 +80,66 @@ test('only orders with a tracking number are mapped for manifest import', () => 
     withoutTracking: 1,
     alreadyImported: 1,
     duplicateOrders: 1,
+    cancelledOrders: 1,
+    returnOrders: 1,
   });
   assert.equal(JSON.stringify(result).includes('private@example.test'), false);
+});
+
+test('TikTok return search follows pagination and returns all pages', async () => {
+  const calls = [];
+  const returns = await TikTokShop.searchReturns({
+    accessToken: 'access-token',
+    shopCipher: 'shop-cipher',
+    config: { key: 'app-key', secret: 'app-secret' },
+    now: 1800000000000,
+    fetchImpl: async (url, options) => {
+      const requestUrl = new URL(url);
+      calls.push({ requestUrl, body: JSON.parse(options.body) });
+      const firstPage = !requestUrl.searchParams.has('page_token');
+      return Response.json({
+        code: 0,
+        data: {
+          return_orders: firstPage ? [{ return_id: 'return-1', order_id: 'order-1' }] : [{ return_id: 'return-2', order_id: 'order-2' }],
+          ...(firstPage ? { next_page_token: 'next-return-page' } : {}),
+        },
+      });
+    },
+  });
+
+  assert.deepEqual(returns.map((item) => item.return_id), ['return-1', 'return-2']);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].requestUrl.pathname, '/return_refund/202309/returns/search');
+  assert.equal(calls[0].requestUrl.searchParams.get('page_size'), '50');
+  assert.equal(calls[1].requestUrl.searchParams.get('page_token'), 'next-return-page');
+  assert.equal(calls[0].body.update_time_ge, Math.floor((1800000000000 - 30 * 24 * 60 * 60 * 1000) / 1000));
+});
+
+test('TikTok cancellation and return statuses are mapped to OrderGuard events', () => {
+  const packages = [
+    { order: 'order-cancelled', tracking: 'TRK-CANCELLED', status: 'HANDED_OVER', handedOver: true },
+    { order: 'order-return', tracking: 'TRK-RETURN', status: 'HANDED_OVER', handedOver: true },
+    { order: 'order-before', tracking: 'TRK-BEFORE', status: 'EXPECTED', handedOver: false },
+    { order: 'order-rejected', tracking: 'TRK-REJECTED', status: 'CANCELLATION_AFTER_HANDOVER', handedOver: true },
+  ];
+  const plans = TikTokShop.planOrderEvents([
+    { order_id: 'order-cancelled', order_status: 'CANCELLED', cancel_reason_text: 'Buyer changed mind' },
+    { order_id: 'order-before', order_status: 'CANCELLED' },
+  ], [
+    { return_id: 'return-1', order_id: 'order-return', return_status: 'BUYER_SHIPPED_ITEM', return_reason_text: 'Wrong size' },
+    { return_id: 'return-2', order_id: 'order-rejected', return_status: 'RETURN_OR_REFUND_REQUEST_CANCEL' },
+  ], packages);
+
+  assert.deepEqual(plans.map((plan) => `${plan.order}:${plan.type}`), [
+    'order-cancelled:CANCELLATION_AFTER_HANDOVER',
+    'order-before:CANCELLED_BEFORE_HANDOVER',
+    'order-return:CANCELLATION_AFTER_HANDOVER',
+    'order-return:RETURN_IN_TRANSIT',
+    'order-rejected:CANCELLATION_REJECTED',
+  ]);
+  assert.equal(plans[0].reason, 'Buyer changed mind');
+  assert.equal(plans[0].sourceRef, 'tiktok:order:order-cancelled:cancelled');
+  assert.equal(TikTokShop.isCancelledOrder({ order_status: 'cancelled' }), true);
 });
 
 test('TikTok API errors are surfaced instead of returning empty order data', async () => {

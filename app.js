@@ -613,8 +613,11 @@ async function syncTikTokOrders(button) {
     });
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || 'Sinkronisasi TikTok Shop gagal.');
+    if (result.eventsCreated) await hydrateStateFromServer();
+    const syncSummary = `${result.cancelledOrders || 0} pesanan batal, ${result.returnOrders || 0} retur; ${result.eventsCreated || 0} event dibuat${result.returnsWarning ? `; retur belum tersinkron: ${result.returnsWarning}` : ""}.`;
     if (!result.orders.length) {
-      toast(`Tidak ada pesanan baru untuk manifest. ${result.withoutTracking} tanpa resi dan ${result.alreadyImported} sudah diimpor dilewati.`);
+      renderImports();
+      toast(`Tidak ada pesanan baru untuk manifest. ${result.withoutTracking} tanpa resi, ${result.alreadyImported} sudah diimpor; ${syncSummary}`);
       return;
     }
     importDraft = {
@@ -624,7 +627,7 @@ async function syncTikTokOrders(button) {
       mapping: { order: '0', tracking: '1', courier: '2', shop: '3', date: '4', quantity: '' },
     };
     renderImports();
-    toast(`${result.orders.length} pesanan dengan resi siap ditinjau; ${result.withoutTracking} tanpa resi, ${result.alreadyImported} sudah diimpor, dan ${result.duplicateOrders} duplikat dilewati.`);
+    toast(`${result.orders.length} pesanan dengan resi siap ditinjau; ${result.withoutTracking} tanpa resi, ${result.alreadyImported} sudah diimpor, ${result.duplicateOrders} duplikat dilewati; ${syncSummary}`);
   } catch (error) {
     toast(error.message, true);
   } finally {

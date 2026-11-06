@@ -346,6 +346,14 @@ const ORDER_EVENT_TYPES = new Set([
   'CANCELLATION_REJECTED',
 ]);
 
+const ORDER_EVENT_AUDIT_ACTIONS = {
+  CANCELLED_BEFORE_HANDOVER: (tracking) => `Pembatalan pembeli dicatat: ${tracking}`,
+  CANCELLATION_AFTER_HANDOVER: (tracking) => `Pembatalan pembeli setelah pickup: ${tracking}`,
+  RETURN_IN_TRANSIT: (tracking) => `Retur dalam perjalanan: ${tracking}`,
+  RETURN_RECEIVED: (tracking) => `Retur diterima: ${tracking}`,
+  CANCELLATION_REJECTED: (tracking) => `Pembatalan ditolak marketplace: ${tracking}`,
+};
+
 function findPackageByTracking(state, tracking) {
   const wanted = normalizedTracking(tracking);
   for (const manifest of state.manifests) {
@@ -425,16 +433,66 @@ function applyOrderEvent(user, state, input) {
     parcel.returnReceivedAt = recordedAt;
     parcel.returnReceivedBy = user.name;
   }
-  const auditActions = {
-    CANCELLED_BEFORE_HANDOVER: `Pembatalan pembeli dicatat: ${parcel.tracking}`,
-    CANCELLATION_AFTER_HANDOVER: `Pembatalan pembeli setelah pickup: ${parcel.tracking}`,
-    RETURN_IN_TRANSIT: `Retur dalam perjalanan: ${parcel.tracking}`,
-    RETURN_RECEIVED: `Retur diterima: ${parcel.tracking}`,
-    CANCELLATION_REJECTED: `Pembatalan ditolak marketplace: ${parcel.tracking}`,
-  };
-  state.audit.unshift({ id: `AU-${crypto.randomUUID()}`, actor: user.name, action: auditActions[input.type], object: manifest.id, createdAt: recordedAt });
+  const auditActions = ORDER_EVENT_AUDIT_ACTIONS;
+  state.audit.unshift({ id: `AU-${crypto.randomUUID()}`, actor: user.name, action: auditActions[input.type](parcel.tracking), object: manifest.id, createdAt: recordedAt });
   state.audit = state.audit.slice(0, 5000);
   return { ok: true, event, manifestId: manifest.id, order: parcel.order, tracking: parcel.tracking, status: parcel.status };
+}
+
+function applyTikTokEventPlans(user, state, plans) {
+  const existingRefs = new Set(state.orderEvents.map((event) => event.sourceRef).filter(Boolean));
+  let eventsCreated = 0;
+  for (const plan of plans) {
+    if (existingRefs.has(plan.sourceRef)) continue;
+    const found = findPackageByTracking(state, plan.tracking);
+    if (!found) continue;
+    const { manifest, parcel } = found;
+    const previousStatus = parcel.status;
+    let newStatus = plan.type;
+
+    if (plan.type === 'CANCELLED_BEFORE_HANDOVER') {
+      if (!['EXPECTED', 'SCANNED'].includes(parcel.status)) continue;
+    } else if (plan.type === 'CANCELLATION_AFTER_HANDOVER') {
+      if (!hasHandoverHistory(manifest, parcel) || ['CANCELLATION_AFTER_HANDOVER', 'RETURN_IN_TRANSIT', 'RETURN_RECEIVED'].includes(parcel.status)) continue;
+    } else if (plan.type === 'RETURN_IN_TRANSIT') {
+      if (parcel.status !== 'CANCELLATION_AFTER_HANDOVER') continue;
+    } else if (plan.type === 'CANCELLATION_REJECTED') {
+      if (!['CANCELLATION_AFTER_HANDOVER', 'RETURN_IN_TRANSIT'].includes(parcel.status)) continue;
+      const cancellation = state.orderEvents.find((event) => event.type === 'CANCELLATION_AFTER_HANDOVER' && normalizedTracking(event.tracking) === normalizedTracking(parcel.tracking));
+      newStatus = cancellation && ['HANDED_OVER', 'SCANNED', 'EXPECTED'].includes(cancellation.previousStatus) ? cancellation.previousStatus : 'HANDED_OVER';
+    } else {
+      continue;
+    }
+    if (parcel.status === newStatus) continue;
+
+    const recordedAt = new Date().toISOString();
+    const event = {
+      id: `EVT-${crypto.randomUUID()}`,
+      manifestId: manifest.id,
+      order: parcel.order,
+      tracking: parcel.tracking,
+      type: plan.type,
+      reason: plan.reason || 'Sinkronisasi TikTok Shop',
+      note: plan.note || '',
+      source: 'tiktok',
+      sourceRef: plan.sourceRef,
+      previousStatus,
+      newStatus,
+      occurredAt: plan.occurredAt || recordedAt,
+      recordedAt,
+      recordedBy: 'TikTok Shop',
+      recordedById: 'system:tiktok',
+      evidence: null,
+    };
+    state.orderEvents.unshift(event);
+    state.orderEvents = state.orderEvents.slice(0, 5000);
+    parcel.status = newStatus;
+    state.audit.unshift({ id: `AU-${crypto.randomUUID()}`, actor: 'TikTok Shop', action: ORDER_EVENT_AUDIT_ACTIONS[plan.type](parcel.tracking), object: manifest.id, createdAt: recordedAt });
+    state.audit = state.audit.slice(0, 5000);
+    existingRefs.add(plan.sourceRef);
+    eventsCreated += 1;
+  }
+  return eventsCreated;
 }
 
 async function publicUser(user) {
@@ -1063,14 +1121,40 @@ app.post('/api/tiktok/sync', requireAuth, requireRole(['super-admin', 'store-adm
       shopCipher: connection.shopCipher,
       config,
     });
+    let returns = [];
+    let returnsWarning = '';
+    try {
+      returns = await TikTokShop.searchReturns({
+        accessToken,
+        shopCipher: connection.shopCipher,
+        config,
+      });
+    } catch (error) {
+      returnsWarning = error.message;
+      console.warn('Sinkronisasi retur TikTok Shop dilewati:', error.message);
+    }
     const date = new Date().toISOString().slice(0, 10);
     const shopName = connection.shopName.trim().toLocaleLowerCase('id-ID');
-    const knownPackages = (await readState(req.user.tenantId)).manifests
+    const stateBefore = await readState(req.user.tenantId);
+    const shopManifests = stateBefore.manifests.filter((manifest) => String(manifest.shop || '').trim().toLocaleLowerCase('id-ID') === shopName);
+    const packagesForSync = shopManifests.flatMap((manifest) => (manifest.packages || []).map((parcel) => ({
+      order: parcel.order,
+      tracking: parcel.tracking,
+      status: parcel.status,
+      handedOver: hasHandoverHistory(manifest, parcel),
+    })));
+    const plans = TikTokShop.planOrderEvents(orders, returns, packagesForSync);
+    const eventsCreated = plans.length
+      ? await updateTenantState(req.user.tenantId, (state) => applyTikTokEventPlans(req.user, state, plans))
+      : 0;
+    const state = await readState(req.user.tenantId);
+    const knownPackages = state.manifests
       .filter((manifest) => String(manifest.shop || '').trim().toLocaleLowerCase('id-ID') === shopName)
       .flatMap((manifest) => Array.isArray(manifest.packages) ? manifest.packages : []);
-    const { orders: eligibleOrders, withoutTracking, alreadyImported, duplicateOrders } = TikTokShop.prepareImportOrders(orders, connection.shopName, date, {
+    const { orders: eligibleOrders, withoutTracking, alreadyImported, duplicateOrders, cancelledOrders, returnOrders } = TikTokShop.prepareImportOrders(orders, connection.shopName, date, {
       existingOrders: knownPackages.map((parcel) => parcel.order).filter(Boolean),
       existingTrackings: knownPackages.map((parcel) => parcel.tracking).filter(Boolean),
+      excludedOrderIds: returns.map((item) => item.order_id).filter(Boolean),
     });
     res.json({
       shop: { shopId: connection.shopId, name: connection.shopName },
@@ -1078,6 +1162,11 @@ app.post('/api/tiktok/sync', requireAuth, requireRole(['super-admin', 'store-adm
       withoutTracking,
       alreadyImported,
       duplicateOrders,
+      cancelledOrders,
+      returnOrders,
+      returnsFetched: returns.length,
+      returnsWarning,
+      eventsCreated,
       orders: eligibleOrders,
     });
   } catch (error) {

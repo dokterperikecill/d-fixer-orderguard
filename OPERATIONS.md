@@ -71,7 +71,19 @@ Tes membuat dan menghapus schema berawalan `orderguard_test_`; jangan arahkan `T
 
 ## Integrasi TikTok Shop
 
-Integrasi tersedia untuk aplikasi ISV yang sudah disetujui di TikTok Shop Partner Center. Sinkronisasi bersifat read-only: OrderGuard hanya mengambil pesanan yang telah memiliki nomor resi, dan pengguna harus meninjau hasil sebelum membuat manifest. Sinkronisasi mencari pesanan yang diperbarui dalam 30 hari terakhir; pesanan tanpa resi dilewati.
+Integrasi tersedia untuk aplikasi ISV yang sudah disetujui di TikTok Shop Partner Center. Sinkronisasi bersifat read-only: OrderGuard mengambil pesanan dan retur dari toko yang sudah diotorisasi, lalu pengguna harus meninjau hasil sebelum membuat manifest.
+
+Sinkronisasi mencari pesanan yang diperbarui dalam 30 hari terakhir. Pesanan tanpa resi dan pesanan berstatus `CANCELLED` dilewati saat pembuatan manifest. Untuk pesanan yang sudah pernah diimpor, perubahan status akan dicatat sebagai event pembatalan/retur otomatis:
+
+- `CANCELLED` → `CANCELLED_BEFORE_HANDOVER` atau `CANCELLATION_AFTER_HANDOVER`
+- status retur dalam perjalanan → `RETURN_IN_TRANSIT`
+- retur ditolak/dibatalkan → event `CANCELLATION_REJECTED`
+
+Penerimaan fisik retur tetap harus dikonfirmasi manual dengan foto oleh Store Admin atau Handover Staff. Sinkronisasi tidak pernah menandai `RETURN_RECEIVED` tanpa bukti foto.
+
+Endpoint retur yang dipakai saat ini adalah `POST /return_refund/202309/returns/search`. Path dapat dioverride melalui `TIKTOK_RETURNS_PATH` jika toko hanya mengaktifkan versi API retur yang lebih baru. Verifikasi path dan scope di Partner Center sebelum produksi. Kegagalan endpoint retur tidak menggagalkan sinkronisasi pesanan; antarmuka akan menampilkan peringatan.
+
+Scope yang dibutuhkan: baca daftar pesanan dan baca retur/refund (Return & Refund Basic / `seller.return_refund.basic`).
 
 1. Daftarkan OAuth redirect URL aplikasi di Partner Center dengan URL HTTPS persis berikut: `https://<domain-orderguard>/api/tiktok/callback`. Pastikan aplikasi disetujui untuk authorization toko dan akses baca daftar pesanan.
 2. Atur environment variable berikut di secret manager/deployment platform:
