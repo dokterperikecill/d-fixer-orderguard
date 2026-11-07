@@ -185,12 +185,56 @@ npm run db:backup
 
 Jalankan `pg_dump` dan `pg_restore` dari PostgreSQL client tools yang tersedia. Secara default file custom-format disimpan di `data/backups/` dan retensi menyimpan 30 backup terakhir. Atur `ORDERGUARD_BACKUP_DIR` atau `ORDERGUARD_BACKUP_KEEP` bila lokasi atau retensinya berbeda. Backup berisi data operasional dan wajib diperlakukan sebagai data sensitif. Pastikan user database memiliki izin backup dan restore.
 
+Setiap backup menghasilkan:
+
+- `orderguard-YYYYMMDDTHHMMSSZ.dump` — custom-format PostgreSQL.
+- `orderguard-YYYYMMDDTHHMMSSZ.dump.sha256` — checksum integritas.
+
+Script memvalidasi arsip dengan `pg_restore --list` dan menulis checksum SHA-256. Simpan file `.dump` dan `.sha256` bersama-sama. Backup tidak dienkripsi oleh script; gunakan enkripsi disk/secret manager bila diperlukan.
+
 ## Restore
 
-Pulihkan dari backup custom-format yang sudah diverifikasi:
+Restore adalah tindakan destruktif pada database target. Script membutuhkan konfirmasi eksplisit berupa nama database target:
 
 ```sh
+DATABASE_URL="postgresql://user:password@host:5432/orderguard" \
+ORDERGUARD_CONFIRM_RESTORE="orderguard" \
 npm run db:restore -- data/backups/orderguard-YYYYMMDDTHHMMSSZ.dump
 ```
 
-Script membuat backup keselamatan terlebih dahulu, lalu memulihkan objek dari arsip ke database `DATABASE_URL` menggunakan `pg_restore --clean`. Setelah restore berhasil, jalankan test/health check sebelum membuka layanan kembali. Jadwalkan backup rutin dan simpan salinan di media terpisah; script ini tidak menjadwalkan backup otomatis.
+Script akan:
+
+1. Memeriksa checksum `.sha256` bila tersedia.
+2. Memvalidasi arsip dengan `pg_restore --list`.
+3. Membuat backup keselamatan `orderguard-pre-restore-*.dump`.
+4. Menjalankan restore atomik (`--single-transaction --clean --if-exists`) ke database target.
+5. Memverifikasi tabel `tenants` setelah restore.
+
+**Jangan arahkan `DATABASE_URL` restore ke database produksi tanpa persetujuan dan backup terbaru.** Uji restore pada database terpisah terlebih dahulu, lalu jalankan health check/test setelah restore. Script ini tidak menjadwalkan backup otomatis; jadwalkan melalui cron/Render cron job dan simpan salinan di media terpisah.
+
+## Inisialisasi Tenant Baru
+
+Tenant baru selalu dimulai dengan state operasional kosong. Data demo tidak lagi dibuat otomatis untuk tenant baru. Data lama pada tenant yang sudah ada tidak dihapus.
+
+Untuk pengembangan/test internal, data demo hanya dapat diaktifkan eksplisit melalui environment test:
+
+```sh
+NODE_ENV=test ORDERGUARD_TEST_SEED_DEMO=1 npm start
+```
+
+Jangan gunakan opsi tersebut pada production.
+
+## Integritas Data
+
+- Setiap manifest ID dicatat di `tenant_manifest_ids` dan divalidasi unik per tenant. Pembuatan manifest berjalan di dalam transaksi tenant state yang sama, sehingga dua request paralel tidak dapat menghasilkan ID duplikat.
+- Manifest berstatus `CLOSED`, `CANCELLED`, atau `CONFIRMED` tidak dapat diubah melalui scan atau handover. Penutupan/pembatalan resmi tetap melalui workflow Store Admin yang tercatat.
+- Setiap scan wajib memiliki catatan audit yang sesuai; setiap sesi handover wajib memiliki audit `Serah terima <id> dikonfirmasi: ...`.
+- Bukti handover bersifat append-only; evidence pada sesi lama tidak dapat diubah.
+- Payload state yang tidak valid tidak diganti dengan state demo. Payload asli dipertahankan di `state_quarantine` untuk investigasi/recovery manual, dan API mengembalikan `503 STATE_CORRUPTED`.
+- Foreign key ditambahkan secara additive dengan `NOT VALID`: constraint berlaku untuk data baru tanpa menggagalkan startup karena data lama. Setelah audit data lama, constraint dapat divalidasi manual:
+
+  ```sql
+  ALTER TABLE users VALIDATE CONSTRAINT users_tenant_fk;
+  ```
+
+- Index tambahan tersedia untuk session, audit, user tenant, manifest registry, dan quarantine.

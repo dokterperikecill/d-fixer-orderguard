@@ -56,6 +56,19 @@ const SCAN_LABELS = {
   RETURN_IN_TRANSIT: "Dalam retur",
   RETURN_RECEIVED: "Retur diterima",
 };
+function scanAuditAction(result, tracking) {
+  return {
+    MATCH: `Paket dipindai: ${tracking}`,
+    NOT_IN_MANIFEST: `Pemindaian di luar manifest: ${tracking}`,
+    DUPLICATE_SCAN: `Pemindaian duplikat: ${tracking}`,
+    ALREADY_HANDED_OVER: `Paket sudah diserahkan: ${tracking}`,
+    INVALID_PACKAGE: `Paket tidak valid: ${tracking}`,
+    CANCELLED: `Paket dibatalkan: ${tracking}`,
+    CANCELLED_BY_BUYER: `Paket dibatalkan pembeli: ${tracking}`,
+    RETURN_IN_TRANSIT: `Retur dalam perjalanan: ${tracking}`,
+    RETURN_RECEIVED: `Retur diterima: ${tracking}`,
+  }[result] || `Pemindaian: ${tracking}`;
+}
 const ORDER_EVENT_LABELS = {
   CANCELLED_BEFORE_HANDOVER: "Pembatalan pembeli",
   CANCELLATION_AFTER_HANDOVER: "Pembatalan setelah pickup",
@@ -127,7 +140,7 @@ function loadState(storageKey = STORAGE_KEY, shopName = "D'Fixer Store") {
   } catch (error) {
     console.warn("Data lokal tidak dapat dibaca.", error);
   }
-  return sampleState(shopName);
+  return { manifests: [], incidents: [], audit: [], importJobs: [], orderEvents: [] };
 }
 
 const tenantStorageKey = () => `${STORAGE_KEY}:${currentUser?.tenantId || 'anonymous'}`;
@@ -1022,8 +1035,7 @@ async function recordScan(manifest, rawTracking) {
     result = handedElsewhere ? "ALREADY_HANDED_OVER" : "NOT_IN_MANIFEST";
   }
   manifest.scans.push({ tracking, result, createdAt: nowISO(), actor: currentUser?.name || ACTOR });
-  if (result === "NOT_IN_MANIFEST") logAudit(`Pemindaian di luar manifest: ${tracking}`, manifest.id);
-  else if (result === "MATCH") logAudit(`Paket dipindai: ${tracking}`, manifest.id);
+  logAudit(scanAuditAction(result, tracking), manifest.id);
   const saved = await persist();
   if (!saved) return;
   currentView = "manifest-detail";

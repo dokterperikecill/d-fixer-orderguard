@@ -67,7 +67,8 @@ const ROLE_PERMISSIONS = {
 async function seedTenants() {
   const insert = db.prepare('INSERT INTO tenants (id, name, created_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING');
   const now = new Date().toISOString();
-  for (const tenant of INITIAL_TENANTS) await insert.run(tenant.id, tenant.name, now, now);
+  const tenants = process.env.NODE_ENV === 'production' ? INITIAL_TENANTS.filter((tenant) => tenant.id === 'dfixer-store') : INITIAL_TENANTS;
+  for (const tenant of tenants) await insert.run(tenant.id, tenant.name, now, now);
 }
 
 async function getTenant(tenantId) {
@@ -277,6 +278,8 @@ async function initializeDatabase() {
   for (const migration of db.migrations) await db.exec(migration);
   await seedTenants();
   await seedInitialUsers();
+  await backfillManifestRegistry();
+  await seedTestDemoState();
 }
 
 function parseCookies(header = '') {
@@ -444,6 +447,10 @@ function baseState(tenantName = "D'Fixer Store") {
   };
 }
 
+function emptyState() {
+  return { manifests: [], incidents: [], audit: [], importJobs: [], orderEvents: [] };
+}
+
 function normalizeState(payload, tenantName = "D'Fixer Store") {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
     throw new TypeError('Payload state harus berupa objek.');
@@ -452,6 +459,20 @@ function normalizeState(payload, tenantName = "D'Fixer Store") {
   for (const field of ['manifests', 'incidents', 'audit', 'importJobs', 'orderEvents']) {
     if (!Array.isArray(state[field])) state[field] = [];
   }
+  state.manifests = state.manifests.map((manifest, index) => {
+    if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
+      throw new TypeError(`Manifest pada indeks ${index} tidak valid.`);
+    }
+    for (const field of ['packages', 'scans', 'sessions']) {
+      if (!Array.isArray(manifest[field])) manifest[field] = [];
+    }
+    manifest.packages.forEach((parcel, packageIndex) => {
+      if (!parcel || typeof parcel !== 'object' || Array.isArray(parcel)) {
+        throw new TypeError(`Paket pada manifest ${manifest.id || index} indeks ${packageIndex} tidak valid.`);
+      }
+    });
+    return manifest;
+  });
   return state;
 }
 
@@ -489,7 +510,60 @@ function parseStoredState(payload, tenantName, tenantId) {
   try {
     return normalizeState(JSON.parse(payload), tenantName);
   } catch (error) {
-    throw new StateCorruptionError(tenantId, error);
+    const wrapped = new StateCorruptionError(tenantId, error);
+    wrapped.rawPayload = payload;
+    throw wrapped;
+  }
+}
+
+async function quarantineState(tenantId, payload, error) {
+  try {
+    const reason = String(error?.cause?.message || error?.message || 'State tidak valid').slice(0, 500);
+    await db.prepare(
+      'INSERT INTO state_quarantine (id, tenant_id, payload, payload_hash, reason, created_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (tenant_id, payload_hash) DO NOTHING'
+    ).run(crypto.randomUUID(), tenantId, payload, hashOpaqueValue(payload), reason, new Date().toISOString());
+  } catch (quarantineError) {
+    console.error(`State quarantine gagal (${tenantId}): ${quarantineError.message}`);
+  }
+}
+
+async function registerManifestIds(executor, tenantId, state) {
+  if (!Array.isArray(state?.manifests)) return;
+  const issuedAt = new Date().toISOString();
+  for (const manifest of state.manifests) {
+    if (!manifest || typeof manifest.id !== 'string' || !manifest.id) continue;
+    await executor.prepare(
+      'INSERT INTO tenant_manifest_ids (tenant_id, manifest_id, created_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING'
+    ).run(tenantId, manifest.id, issuedAt);
+  }
+}
+
+async function backfillManifestRegistry() {
+  const rows = await db.prepare('SELECT tenant_id AS tenantId, payload FROM tenant_state').all();
+  for (const row of rows) {
+    try {
+      const tenantName = (await getTenant(row.tenantId))?.name;
+      const state = normalizeState(JSON.parse(row.payload), tenantName);
+      await registerManifestIds(db, row.tenantId, state);
+    } catch (error) {
+      await quarantineState(row.tenantId, row.payload, error);
+    }
+  }
+}
+
+async function seedTestDemoState() {
+  if (process.env.NODE_ENV !== 'test' || process.env.ORDERGUARD_TEST_SEED_DEMO !== '1') return;
+  for (const tenant of INITIAL_TENANTS) {
+    const existing = await db.prepare('SELECT 1 AS found FROM tenant_state WHERE tenant_id = ?').get(tenant.id);
+    if (existing) continue;
+    if (tenant.id === 'dfixer-store') {
+      const legacy = await db.prepare("SELECT 1 AS found FROM app_state WHERE id = 'state'").get();
+      if (legacy) continue;
+    }
+    const state = baseState(tenant.name);
+    await db.prepare('INSERT INTO tenant_state (tenant_id, payload, version, updated_at) VALUES (?, ?, 0, ?) ON CONFLICT DO NOTHING')
+      .run(tenant.id, JSON.stringify(state), new Date().toISOString());
+    await registerManifestIds(db, tenant.id, state);
   }
 }
 
@@ -517,11 +591,12 @@ async function lockTenantState(tx, tenantId, tenantName) {
     const legacyRow = await tx.prepare("SELECT payload FROM app_state WHERE id = 'state'").get();
     if (legacyRow) initialState = parseStoredState(legacyRow.payload, tenantName, tenantId);
   }
-  if (!initialState) initialState = baseState(tenantName);
+  if (!initialState) initialState = emptyState();
 
   const issuedAt = new Date().toISOString();
   await tx.prepare('INSERT INTO tenant_state (tenant_id, payload, version, updated_at) VALUES (?, ?, 0, ?)')
     .run(tenantId, JSON.stringify(initialState), issuedAt);
+  await registerManifestIds(tx, tenantId, initialState);
   row = { payload: JSON.stringify(initialState), version: 0, updatedAt: issuedAt };
   return { row, state: initialState, created: true };
 }
@@ -530,21 +605,31 @@ async function readStateRecord(tenantId) {
   const tenantName = (await getTenant(tenantId))?.name;
   const row = await db.prepare('SELECT payload, version, updated_at AS updatedAt FROM tenant_state WHERE tenant_id = ?').get(tenantId);
   if (row) {
-    return {
-      state: parseStoredState(row.payload, tenantName, tenantId),
-      version: Number(row.version),
-      updatedAt: row.updatedAt,
-    };
+    try {
+      return {
+        state: parseStoredState(row.payload, tenantName, tenantId),
+        version: Number(row.version),
+        updatedAt: row.updatedAt,
+      };
+    } catch (error) {
+      if (error instanceof StateCorruptionError) await quarantineState(tenantId, error.rawPayload, error);
+      throw error;
+    }
   }
 
-  return db.transaction(async (tx) => {
-    const locked = await lockTenantState(tx, tenantId, tenantName);
-    return {
-      state: locked.state,
-      version: Number(locked.row.version),
-      updatedAt: locked.row.updatedAt,
-    };
-  });
+  try {
+    return await db.transaction(async (tx) => {
+      const locked = await lockTenantState(tx, tenantId, tenantName);
+      return {
+        state: locked.state,
+        version: Number(locked.row.version),
+        updatedAt: locked.row.updatedAt,
+      };
+    });
+  } catch (error) {
+    if (error instanceof StateCorruptionError) await quarantineState(tenantId, error.rawPayload, error);
+    throw error;
+  }
 }
 
 async function readState(tenantId) {
@@ -553,27 +638,57 @@ async function readState(tenantId) {
 
 async function transactTenantState(tenantId, handler, { expectedVersion = null } = {}) {
   const tenantName = (await getTenant(tenantId))?.name;
-  return db.transaction(async (tx) => {
-    const locked = await lockTenantState(tx, tenantId, tenantName);
-    const currentVersion = Number(locked.row.version);
-    if (expectedVersion !== null && expectedVersion !== currentVersion) {
-      throw new StateVersionConflictError(currentVersion);
-    }
+  try {
+    return await db.transaction(async (tx) => {
+      const locked = await lockTenantState(tx, tenantId, tenantName);
+      const currentVersion = Number(locked.row.version);
+      if (expectedVersion !== null && expectedVersion !== currentVersion) {
+        throw new StateVersionConflictError(currentVersion);
+      }
 
-    const outcome = await handler(locked.state, currentVersion);
-    const nextState = normalizeState(outcome && outcome.state ? outcome.state : locked.state, tenantName);
-    const issuedAt = new Date().toISOString();
-    const updated = await tx.prepare(
-      'UPDATE tenant_state SET payload = ?, version = version + 1, updated_at = ? WHERE tenant_id = ? RETURNING version'
-    ).get(JSON.stringify(nextState), issuedAt, tenantId);
+      const outcome = await handler(locked.state, currentVersion);
+      let nextState;
+      try {
+        nextState = normalizeState(outcome && outcome.state ? outcome.state : locked.state, tenantName);
+      } catch (error) {
+        throw new StateValidationError(400, error.message);
+      }
 
-    return {
-      state: nextState,
-      result: outcome ? outcome.result : undefined,
-      version: Number(updated.version),
-      updatedAt: issuedAt,
-    };
-  });
+      const previousIds = new Set(locked.state.manifests.map((manifest) => manifest.id));
+      const seenIds = new Set();
+      for (const manifest of nextState.manifests) {
+        if (typeof manifest.id !== 'string' || !manifest.id) {
+          throw new StateValidationError(400, 'ID manifest tidak valid.');
+        }
+        if (seenIds.has(manifest.id)) {
+          throw new StateValidationError(409, `ID manifest ${manifest.id} duplikat.`);
+        }
+        seenIds.add(manifest.id);
+        if (!previousIds.has(manifest.id)) {
+          const registered = await tx.prepare('SELECT 1 AS found FROM tenant_manifest_ids WHERE tenant_id = ? AND manifest_id = ?').get(tenantId, manifest.id);
+          if (registered) {
+            throw new StateValidationError(409, `ID manifest ${manifest.id} sudah digunakan.`);
+          }
+        }
+      }
+
+      const issuedAt = new Date().toISOString();
+      const updated = await tx.prepare(
+        'UPDATE tenant_state SET payload = ?, version = version + 1, updated_at = ? WHERE tenant_id = ? RETURNING version'
+      ).get(JSON.stringify(nextState), issuedAt, tenantId);
+      await registerManifestIds(tx, tenantId, nextState);
+
+      return {
+        state: nextState,
+        result: outcome ? outcome.result : undefined,
+        version: Number(updated.version),
+        updatedAt: issuedAt,
+      };
+    });
+  } catch (error) {
+    if (error instanceof StateCorruptionError) await quarantineState(tenantId, error.rawPayload, error);
+    throw error;
+  }
 }
 
 async function updateTenantState(tenantId, updater) {
@@ -789,6 +904,21 @@ function normalizedTracking(value) {
   return String(value || '').trim().toLocaleLowerCase('id-ID');
 }
 
+function scanAuditAction(result, tracking) {
+  const actions = {
+    MATCH: `Paket dipindai: ${tracking}`,
+    NOT_IN_MANIFEST: `Pemindaian di luar manifest: ${tracking}`,
+    DUPLICATE_SCAN: `Pemindaian duplikat: ${tracking}`,
+    ALREADY_HANDED_OVER: `Paket sudah diserahkan: ${tracking}`,
+    INVALID_PACKAGE: `Paket tidak valid: ${tracking}`,
+    CANCELLED: `Paket dibatalkan: ${tracking}`,
+    CANCELLED_BY_BUYER: `Paket dibatalkan pembeli: ${tracking}`,
+    RETURN_IN_TRANSIT: `Retur dalam perjalanan: ${tracking}`,
+    RETURN_RECEIVED: `Retur diterima: ${tracking}`,
+  };
+  return actions[result] || `Pemindaian: ${tracking}`;
+}
+
 function validateNewManifestTracking(previousManifests, addedManifests) {
   const known = new Map();
   for (const manifest of previousManifests) {
@@ -804,6 +934,18 @@ function validateNewManifestTracking(previousManifests, addedManifests) {
       if (known.has(tracking)) return `Resi ${parcel.tracking} sudah tercatat pada manifest ${known.get(tracking)}.`;
       known.set(tracking, manifest.id);
     }
+  }
+  return null;
+}
+
+function validateManifestIds(previousManifests, addedManifests) {
+  const known = new Set(previousManifests.map((manifest) => manifest.id));
+  for (const manifest of addedManifests) {
+    if (typeof manifest.id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(manifest.id)) {
+      return 'ID manifest baru tidak valid. Gunakan 1-80 karakter huruf, angka, titik, garis bawah, atau tanda hubung.';
+    }
+    if (known.has(manifest.id)) return `ID manifest ${manifest.id} sudah digunakan.`;
+    known.add(manifest.id);
   }
   return null;
 }
@@ -829,6 +971,7 @@ function validateStoreAdminWorkflowUpdate(user, previous, next, addedAudit) {
   const { previous: oldManifest, next: newManifest } = changed[0];
   if (oldManifest.id !== newManifest.id) return workflowError;
   if (newManifest.status === 'CLOSED' && oldManifest.status !== 'CLOSED') {
+    if (['CLOSED', 'CANCELLED'].includes(oldManifest.status)) return 'Manifest final tidak dapat ditutup ulang.';
     const counts = oldManifest.packages.filter((parcel) => ['EXPECTED', 'SCANNED', 'REJECTED', 'EXCEPTION', 'CANCELLATION_AFTER_HANDOVER', 'RETURN_IN_TRANSIT'].includes(parcel.status)).length;
     if (counts || previous.incidents.some((incident) => incident.manifestId === oldManifest.id && incident.status === 'OPEN') || !isDeepStrictEqual(oldManifest.packages, newManifest.packages) || addedAudit[0].object !== oldManifest.id || addedAudit[0].action !== 'Manifest ditutup') return 'Penutupan manifest tidak memenuhi syarat rekonsiliasi.';
     const oldFields = Object.fromEntries(Object.entries(oldManifest).filter(([key]) => key !== 'status'));
@@ -836,6 +979,7 @@ function validateStoreAdminWorkflowUpdate(user, previous, next, addedAudit) {
     return isDeepStrictEqual(oldFields, newFields) ? null : workflowError;
   }
   if (newManifest.status === 'CANCELLED' && oldManifest.status !== 'CANCELLED') {
+    if (['CLOSED', 'CANCELLED', 'CONFIRMED'].includes(oldManifest.status)) return 'Manifest final tidak dapat dibatalkan.';
     if (oldManifest.packages.some((parcel) => parcel.status === 'HANDED_OVER' || parcel.handedOverAt || ['CANCELLATION_AFTER_HANDOVER', 'RETURN_IN_TRANSIT', 'RETURN_RECEIVED'].includes(parcel.status)) || addedAudit[0].object !== oldManifest.id || addedAudit[0].action !== 'Manifest dibatalkan') return 'Manifest yang memiliki penerimaan tidak dapat dibatalkan.';
     const oldFields = Object.fromEntries(Object.entries(oldManifest).filter(([key]) => !['status', 'packages'].includes(key)));
     const newFields = Object.fromEntries(Object.entries(newManifest).filter(([key]) => !['status', 'packages'].includes(key)));
@@ -875,6 +1019,8 @@ function validateStoreAdminUpdate(user, previous, next) {
   if (addedManifests.length) {
     if (!addedIncidents || addedIncidents.length) return 'Pembuatan manifest tidak boleh mengubah insiden lama.';
     if (next.manifests.length - addedManifests.length !== previous.manifests.length || !isDeepStrictEqual(next.manifests.slice(addedManifests.length), previous.manifests)) return 'Manifest lama tidak boleh diubah saat membuat manifest baru.';
+    const idError = validateManifestIds(previous.manifests, addedManifests);
+    if (idError) return idError;
     const trackingError = validateNewManifestTracking(previous.manifests, addedManifests);
     if (trackingError) return trackingError;
     const packageCount = addedManifests.reduce((total, manifest) => total + (Array.isArray(manifest.packages) ? manifest.packages.length : 0), 0);
@@ -941,6 +1087,13 @@ function validateHandoverUpdate(user, previous, next) {
   const knownAuditActions = [
     /^Paket dipindai: .+$/,
     /^Pemindaian di luar manifest: .+$/,
+    /^Pemindaian duplikat: .+$/,
+    /^Paket sudah diserahkan: .+$/,
+    /^Paket tidak valid: .+$/,
+    /^Paket dibatalkan: .+$/,
+    /^Paket dibatalkan pembeli: .+$/,
+    /^Retur dalam perjalanan: .+$/,
+    /^Retur diterima: .+$/,
     /^Serah terima TR-[A-Z0-9-]+ dikonfirmasi: .+$/,
   ];
   for (const entry of addedAudit) {
@@ -955,6 +1108,9 @@ function validateHandoverUpdate(user, previous, next) {
     const oldManifest = previous.manifests[index];
     const newManifest = next.manifests[index];
     if (!newManifest || oldManifest.id !== newManifest.id) return 'Handover Staff tidak dapat mengganti manifest.';
+    if (['CLOSED', 'CANCELLED', 'CONFIRMED'].includes(oldManifest.status) && !isDeepStrictEqual(oldManifest, newManifest)) {
+      return 'Manifest final tidak dapat diubah melalui pemindaian atau serah terima.';
+    }
     const protectedManifest = (manifest) => Object.fromEntries(Object.entries(manifest).filter(([key]) => !['status', 'packages', 'scans', 'sessions'].includes(key)));
     if (!isDeepStrictEqual(protectedManifest(oldManifest), protectedManifest(newManifest))) return 'Informasi administratif manifest tidak boleh diubah.';
     if (!Array.isArray(oldManifest.packages) || !Array.isArray(newManifest.packages) || oldManifest.packages.length !== newManifest.packages.length) return 'Daftar paket manifest tidak boleh diubah.';
@@ -1015,12 +1171,19 @@ function validateHandoverUpdate(user, previous, next) {
         sessionItems.add(tracking);
         handedOverInSessions.add(tracking);
       }
+      if (!addedAudit.some((entry) => entry.object === oldManifest.id && entry.action.startsWith(`Serah terima ${session.id} dikonfirmasi:`))) {
+        return 'Setiap sesi serah terima harus memiliki catatan audit yang sesuai.';
+      }
     }
     if (handedOverInSessions.size !== newlyHandedOver.size) return 'Setiap paket yang diterima harus tercatat dalam sesi serah terima.';
 
     for (const scan of newScans) {
       if (scan.actor !== user.name || !validTimestamp(scan.createdAt) || !['MATCH', 'DUPLICATE_SCAN', 'NOT_IN_MANIFEST', 'ALREADY_HANDED_OVER', 'INVALID_PACKAGE', 'CANCELLED', 'CANCELLED_BY_BUYER', 'RETURN_IN_TRANSIT', 'RETURN_RECEIVED'].includes(scan.result)) {
         return 'Catatan pemindaian baru tidak valid.';
+      }
+      const expectedAudit = scanAuditAction(scan.result, scan.tracking);
+      if (!addedAudit.some((entry) => entry.object === oldManifest.id && entry.action === expectedAudit)) {
+        return 'Setiap pemindaian harus memiliki catatan audit yang sesuai.';
       }
       const packageBefore = oldManifest.packages.find((parcel) => parcel.tracking === scan.tracking);
       const packageAfter = newManifest.packages.find((parcel) => parcel.tracking === scan.tracking);

@@ -52,6 +52,7 @@ function startTestServer(port, schema, extraEnv = {}) {
       DATABASE_SCHEMA: schema,
       NODE_ENV: 'test',
       ORDERGUARD_TEST_USERS: JSON.stringify(TEST_USERS),
+      ORDERGUARD_TEST_SEED_DEMO: '1',
       TIKTOK_APP_KEY: '',
       TIKTOK_APP_SECRET: '',
       TIKTOK_REDIRECT_URI: '',
@@ -762,7 +763,12 @@ test('tenant creation and rename are restricted and reflected in employee accoun
     const state = await fetch(`http://127.0.0.1:${port}/api/state`, {
       headers: { Cookie: `orderguard_session=${staff.cookie}` },
     }).then((response) => response.json());
-    assert.equal(state.manifests[0].shop, 'North Store Operations');
+    assert.deepEqual(state.manifests, []);
+    assert.deepEqual(state.incidents, []);
+    assert.deepEqual(state.importJobs, []);
+    assert.deepEqual(state.orderEvents, []);
+    const registry = await testDatabase.query(`SELECT COUNT(*)::INTEGER AS count FROM "${server.schema}".tenant_manifest_ids WHERE tenant_id = $1`, [tenant.id]);
+    assert.equal(registry.rows[0].count, 0);
 
     const directory = await fetch(`http://127.0.0.1:${port}/api/users`, {
       headers: { Cookie: `orderguard_session=${admin.cookie}` },
@@ -1534,6 +1540,348 @@ test('concurrent failed logins cannot bypass the rate limit', async () => {
       body: JSON.stringify({ username: 'rani', password: 'rani123' }),
     });
     assert.equal(afterBatch.status, 429);
+  } finally {
+    await stopTestServer(server);
+  }
+});
+
+async function loginCookie(port, username, password) {
+  const response = await fetch(`http://127.0.0.1:${port}/api/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  });
+  assert.equal(response.status, 200);
+  return /orderguard_session=([^;]+)/.exec(response.headers.get('set-cookie') || '')?.[1];
+}
+
+async function readStateForTest(port, cookie) {
+  const response = await fetch(`http://127.0.0.1:${port}/api/state`, { headers: { Cookie: `orderguard_session=${cookie}` } });
+  return { response, state: await response.json(), version: Number(response.headers.get('x-state-version')) };
+}
+
+function wave2ManifestState(base, manifestId, tracking, suffix) {
+  const next = structuredClone(base);
+  const createdAt = new Date().toISOString();
+  next.manifests.unshift({
+    id: manifestId,
+    shop: "D'Fixer Store",
+    courier: 'JNE',
+    date: createdAt.slice(0, 10),
+    location: 'Gudang',
+    status: 'OPEN',
+    createdAt,
+    createdBy: 'Platform Admin',
+    source: 'manual',
+    packages: [{ order: `ORD-${suffix}`, tracking, status: 'EXPECTED', scannedAt: null }],
+    scans: [],
+    sessions: [],
+  });
+  next.audit.unshift({ id: `AU-${suffix}`, actor: 'Platform Admin', action: 'Manifest dibuat manual dengan 1 paket', object: manifestId, createdAt });
+  return next;
+}
+
+function wave2ScanState(base, manifestId, tracking, includeAudit = true, result = 'MATCH') {
+  const next = structuredClone(base);
+  const manifest = next.manifests.find((item) => item.id === manifestId);
+  const parcel = manifest.packages.find((item) => item.tracking === tracking);
+  const createdAt = new Date().toISOString();
+  if (result === 'MATCH') {
+    parcel.status = 'SCANNED';
+    parcel.scannedAt = createdAt;
+  }
+  manifest.scans.push({ tracking, result, createdAt, actor: 'Budi Handover' });
+  if (includeAudit) {
+    const action = {
+      MATCH: `Paket dipindai: ${tracking}`,
+      DUPLICATE_SCAN: `Pemindaian duplikat: ${tracking}`,
+      NOT_IN_MANIFEST: `Pemindaian di luar manifest: ${tracking}`,
+      ALREADY_HANDED_OVER: `Paket sudah diserahkan: ${tracking}`,
+      INVALID_PACKAGE: `Paket tidak valid: ${tracking}`,
+    }[result] || `Pemindaian: ${tracking}`;
+    next.audit.unshift({ id: `AU-SCAN-${result}-${tracking}`, actor: 'Budi Handover', action, object: manifest.id, createdAt });
+  }
+  return next;
+}
+
+function wave2HandoverState(base, manifestId, includeAudit = true, evidence = null) {
+  const next = structuredClone(base);
+  const manifest = next.manifests.find((item) => item.id === manifestId);
+  const scanned = manifest.packages.filter((parcel) => parcel.status === 'SCANNED');
+  const createdAt = new Date().toISOString();
+  const session = {
+    id: `TR-W2-${Date.now().toString(36).toUpperCase()}`,
+    receiver: 'Kurir Wave2',
+    actor: 'Budi Handover',
+    createdAt,
+    note: '',
+    items: scanned.map((parcel) => parcel.tracking),
+    evidence,
+  };
+  for (const parcel of scanned) {
+    parcel.status = 'HANDED_OVER';
+    parcel.handedOverAt = createdAt;
+    parcel.handedOverSessionId = session.id;
+  }
+  manifest.sessions.push(session);
+  manifest.status = manifest.packages.some((parcel) => ['EXPECTED', 'SCANNED', 'REJECTED', 'EXCEPTION', 'CANCELLATION_AFTER_HANDOVER', 'RETURN_IN_TRANSIT'].includes(parcel.status))
+    ? 'PARTIALLY_HANDED_OVER'
+    : 'CONFIRMED';
+  if (includeAudit) {
+    next.audit.unshift({ id: `AU-HANDOVER-${session.id}`, actor: 'Budi Handover', action: `Serah terima ${session.id} dikonfirmasi: ${scanned.length} diterima`, object: manifest.id, createdAt });
+  }
+  return { next, sessionId: session.id, manifestId: manifest.id };
+}
+
+test('manifest IDs are unique in validation, database registry, and concurrent creation', async () => {
+  const port = 4335;
+  const server = await createTestServer(port);
+
+  try {
+    await waitForServer(port);
+    const cookie = await loginCookie(port, 'admin', 'admin123');
+    let base = await readStateForTest(port, cookie);
+    const uniqueId = 'OG-WAVE2-UNIQUE-001';
+    const created = wave2ManifestState(base.state, uniqueId, 'JNE-WAVE2-001', 'W2-UNIQUE');
+    const createResponse = await fetch(`http://127.0.0.1:${port}/api/state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${cookie}`, 'If-Match': `"state-${base.version}"` },
+      body: JSON.stringify(created),
+    });
+    assert.equal(createResponse.status, 200);
+    base = await readStateForTest(port, cookie);
+    assert.equal(base.state.manifests.filter((manifest) => manifest.id === uniqueId).length, 1);
+
+    const duplicate = wave2ManifestState(base.state, uniqueId, 'JNE-WAVE2-DUPLICATE', 'W2-DUPLICATE');
+    const duplicateResponse = await fetch(`http://127.0.0.1:${port}/api/state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${cookie}`, 'If-Match': `"state-${base.version}"` },
+      body: JSON.stringify(duplicate),
+    });
+    assert.equal(duplicateResponse.status, 403);
+
+    const concurrentId = 'OG-WAVE2-CONCURRENT-001';
+    const firstState = wave2ManifestState(base.state, concurrentId, 'JNE-WAVE2-CONCURRENT-A', 'W2-CONCURRENT-A');
+    const secondState = wave2ManifestState(base.state, concurrentId, 'JNE-WAVE2-CONCURRENT-B', 'W2-CONCURRENT-B');
+    const [firstResponse, secondResponse] = await Promise.all([
+      fetch(`http://127.0.0.1:${port}/api/state`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${cookie}`, 'If-Match': `"state-${base.version}"` },
+        body: JSON.stringify(firstState),
+      }),
+      fetch(`http://127.0.0.1:${port}/api/state`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${cookie}`, 'If-Match': `"state-${base.version}"` },
+        body: JSON.stringify(secondState),
+      }),
+    ]);
+    assert.deepEqual([firstResponse.status, secondResponse.status].sort((a, b) => a - b), [200, 409]);
+    const afterConcurrent = await readStateForTest(port, cookie);
+    assert.equal(afterConcurrent.state.manifests.filter((manifest) => manifest.id === concurrentId).length, 1);
+    const registry = await testDatabase.query(
+      `SELECT manifest_id FROM "${server.schema}".tenant_manifest_ids WHERE tenant_id = $1 AND manifest_id = ANY($2::text[])`,
+      ['dfixer-store', [uniqueId, concurrentId]],
+    );
+    assert.equal(registry.rows.length, 2);
+  } finally {
+    await stopTestServer(server);
+  }
+});
+
+test('corrupted JSON is quarantined without replacing the original state', async () => {
+  const port = 4336;
+  const server = await createTestServer(port);
+
+  try {
+    await waitForServer(port);
+    const cookie = await loginCookie(port, 'admin', 'admin123');
+    const corruptPayload = '{ini-bukan-json';
+    await testDatabase.query(`UPDATE "${server.schema}".tenant_state SET payload = $1 WHERE tenant_id = $2`, [corruptPayload, 'dfixer-store']);
+    const response = await fetch(`http://127.0.0.1:${port}/api/state`, { headers: { Cookie: `orderguard_session=${cookie}` } });
+    assert.equal(response.status, 503);
+    assert.equal((await response.json()).code, 'STATE_CORRUPTED');
+    const row = await testDatabase.query(`SELECT payload FROM "${server.schema}".tenant_state WHERE tenant_id = $1`, ['dfixer-store']);
+    assert.equal(row.rows[0].payload, corruptPayload);
+    const quarantine = await testDatabase.query(`SELECT payload, tenant_id FROM "${server.schema}".state_quarantine WHERE tenant_id = $1`, ['dfixer-store']);
+    assert.equal(quarantine.rowCount, 1);
+    assert.equal(quarantine.rows[0].payload, corruptPayload);
+  } finally {
+    await stopTestServer(server);
+  }
+});
+
+test('final manifests reject scan and handover changes', async () => {
+  const port = 4337;
+  const server = await createTestServer(port);
+
+  try {
+    await waitForServer(port);
+    const cookie = await loginCookie(port, 'handover', 'handover123');
+    const base = await readStateForTest(port, cookie);
+    const target = base.state.manifests.find((manifest) => manifest.packages.some((parcel) => parcel.status === 'EXPECTED') && manifest.packages.some((parcel) => parcel.status === 'SCANNED'));
+    const corrupted = structuredClone(base.state);
+    corrupted.manifests.find((manifest) => manifest.id === target.id).status = 'CLOSED';
+    await testDatabase.query(`UPDATE "${server.schema}".tenant_state SET payload = $1 WHERE tenant_id = $2`, [JSON.stringify(corrupted), 'dfixer-store']);
+    const loaded = await readStateForTest(port, cookie);
+    const expected = loaded.state.manifests.find((manifest) => manifest.id === target.id).packages.find((parcel) => parcel.status === 'EXPECTED');
+    const scan = wave2ScanState(loaded.state, target.id, expected.tracking, true);
+    const scanResponse = await fetch(`http://127.0.0.1:${port}/api/state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${cookie}`, 'If-Match': `"state-${loaded.version}"` },
+      body: JSON.stringify(scan),
+    });
+    assert.equal(scanResponse.status, 403);
+
+    const handover = wave2HandoverState(loaded.state, target.id, true);
+    const handoverResponse = await fetch(`http://127.0.0.1:${port}/api/state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${cookie}`, 'If-Match': `"state-${loaded.version}"` },
+      body: JSON.stringify(handover.next),
+    });
+    assert.equal(handoverResponse.status, 403);
+  } finally {
+    await stopTestServer(server);
+  }
+});
+
+test('every scan and handover requires audit and existing evidence cannot be changed', async () => {
+  const port = 4338;
+  const server = await createTestServer(port);
+
+  try {
+    await waitForServer(port);
+    const cookie = await loginCookie(port, 'handover', 'handover123');
+    let base = await readStateForTest(port, cookie);
+    const target = base.state.manifests.find((manifest) => manifest.packages.some((parcel) => parcel.status === 'EXPECTED') && manifest.packages.some((parcel) => parcel.status === 'SCANNED'));
+    const expected = target.packages.find((parcel) => parcel.status === 'EXPECTED');
+    const scanWithoutAudit = wave2ScanState(base.state, target.id, expected.tracking, false);
+    const rejectedScan = await fetch(`http://127.0.0.1:${port}/api/state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${cookie}`, 'If-Match': `"state-${base.version}"` },
+      body: JSON.stringify(scanWithoutAudit),
+    });
+    assert.equal(rejectedScan.status, 403);
+
+    const scanWithAudit = wave2ScanState(base.state, target.id, expected.tracking, true);
+    const acceptedScan = await fetch(`http://127.0.0.1:${port}/api/state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${cookie}`, 'If-Match': `"state-${base.version}"` },
+      body: JSON.stringify(scanWithAudit),
+    });
+    assert.equal(acceptedScan.status, 200);
+
+    base = await readStateForTest(port, cookie);
+    const currentManifest = base.state.manifests.find((manifest) => manifest.id === target.id);
+    const scanned = currentManifest.packages.find((parcel) => parcel.status === 'SCANNED');
+    const duplicateWithoutAudit = wave2ScanState(base.state, target.id, scanned.tracking, false, 'DUPLICATE_SCAN');
+    const rejectedDuplicate = await fetch(`http://127.0.0.1:${port}/api/state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${cookie}`, 'If-Match': `"state-${base.version}"` },
+      body: JSON.stringify(duplicateWithoutAudit),
+    });
+    assert.equal(rejectedDuplicate.status, 403);
+    const duplicateWithAudit = wave2ScanState(base.state, target.id, scanned.tracking, true, 'DUPLICATE_SCAN');
+    const acceptedDuplicate = await fetch(`http://127.0.0.1:${port}/api/state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${cookie}`, 'If-Match': `"state-${base.version}"` },
+      body: JSON.stringify(duplicateWithAudit),
+    });
+    assert.equal(acceptedDuplicate.status, 200);
+
+    base = await readStateForTest(port, cookie);
+    const handoverWithoutAudit = wave2HandoverState(base.state, target.id, false);
+    const rejectedHandover = await fetch(`http://127.0.0.1:${port}/api/state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${cookie}`, 'If-Match': `"state-${base.version}"` },
+      body: JSON.stringify(handoverWithoutAudit.next),
+    });
+    assert.equal(rejectedHandover.status, 403);
+
+    const handoverWithAudit = wave2HandoverState(base.state, target.id, true, 'data:image/png;base64,iVBORw0KGgo=');
+    const acceptedHandover = await fetch(`http://127.0.0.1:${port}/api/state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${cookie}`, 'If-Match': `"state-${base.version}"` },
+      body: JSON.stringify(handoverWithAudit.next),
+    });
+    assert.equal(acceptedHandover.status, 200);
+
+    const afterHandover = await readStateForTest(port, cookie);
+    const tampered = structuredClone(afterHandover.state);
+    const session = tampered.manifests.find((manifest) => manifest.id === target.id).sessions.find((item) => item.id === handoverWithAudit.sessionId);
+    session.evidence = 'data:image/png;base64,AAAA" onerror="alert(1)';
+    const tamperedResponse = await fetch(`http://127.0.0.1:${port}/api/state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${cookie}`, 'If-Match': `"state-${afterHandover.version}"` },
+      body: JSON.stringify(tampered),
+    });
+    assert.equal(tamperedResponse.status, 403);
+  } finally {
+    await stopTestServer(server);
+  }
+});
+
+test('database has tenant foreign keys, operational indexes, and rejects orphan users', async () => {
+  const port = 4339;
+  const server = await createTestServer(port);
+
+  try {
+    await waitForServer(port);
+    const constraints = await testDatabase.query(
+      `SELECT conname FROM pg_constraint WHERE connamespace = $1::regnamespace AND contype = 'f' ORDER BY conname`,
+      [server.schema],
+    );
+    const names = new Set(constraints.rows.map((row) => row.conname));
+    for (const name of ['users_tenant_fk', 'sessions_user_fk', 'tenant_state_tenant_fk', 'tenant_manifest_ids_tenant_fk', 'state_quarantine_tenant_fk']) {
+      assert.equal(names.has(name), true, `missing foreign key ${name}`);
+    }
+    const indexes = await testDatabase.query(
+      `SELECT indexname FROM pg_indexes WHERE schemaname = $1`,
+      [server.schema],
+    );
+    const indexNames = new Set(indexes.rows.map((row) => row.indexname));
+    for (const name of ['users_tenant_id_idx', 'tenant_audit_created_idx', 'employee_audit_created_idx', 'tenant_manifest_ids_pkey']) {
+      assert.equal(indexNames.has(name), true, `missing index ${name}`);
+    }
+    await assert.rejects(
+      testDatabase.query(
+        `INSERT INTO "${server.schema}".users (id, username, name, password_salt, password_hash, role, tenant_id, active, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, $8, $9)`,
+        ['orphan-user', 'orphan-user', 'Orphan', 'salt', 'hash', 'handover-staff', 'missing-tenant', new Date().toISOString(), new Date().toISOString()],
+      ),
+      (error) => error.code === '23503',
+    );
+  } finally {
+    await stopTestServer(server);
+  }
+});
+
+test('official manifest close workflow remains allowed after final-state guards', async () => {
+  const port = 4340;
+  const server = await createTestServer(port);
+
+  try {
+    await waitForServer(port);
+    const cookie = await loginCookie(port, 'admin', 'admin123');
+    const base = await readStateForTest(port, cookie);
+    const target = base.state.manifests.find((manifest) => !base.state.incidents.some((incident) => incident.manifestId === manifest.id && incident.status === 'OPEN'));
+    assert.ok(target);
+    const prepared = structuredClone(base.state);
+    const preparedManifest = prepared.manifests.find((manifest) => manifest.id === target.id);
+    preparedManifest.packages.forEach((parcel) => { parcel.status = 'HANDED_OVER'; });
+    preparedManifest.status = 'PARTIALLY_HANDED_OVER';
+    await testDatabase.query(`UPDATE "${server.schema}".tenant_state SET payload = $1 WHERE tenant_id = $2`, [JSON.stringify(prepared), 'dfixer-store']);
+    const current = await readStateForTest(port, cookie);
+    const closed = structuredClone(current.state);
+    closed.manifests.find((manifest) => manifest.id === target.id).status = 'CLOSED';
+    const createdAt = new Date().toISOString();
+    closed.audit.unshift({ id: 'AU-W2-CLOSE', actor: 'Platform Admin', action: 'Manifest ditutup', object: target.id, createdAt });
+    const response = await fetch(`http://127.0.0.1:${port}/api/state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${cookie}`, 'If-Match': `"state-${current.version}"` },
+      body: JSON.stringify(closed),
+    });
+    assert.equal(response.status, 200, JSON.stringify(await response.clone().json().catch(() => ({}))));
+    const after = await readStateForTest(port, cookie);
+    assert.equal(after.state.manifests.find((manifest) => manifest.id === target.id).status, 'CLOSED');
   } finally {
     await stopTestServer(server);
   }
