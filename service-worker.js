@@ -1,4 +1,4 @@
-const CACHE_NAME = "dfixer-orderguard-shell-v8";
+const CACHE_NAME = "dfixer-orderguard-shell-v9";
 const SHELL_URLS = [
   "/",
   "/styles.css",
