@@ -1,7 +1,9 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
+const { Client } = require('pg');
 const { encryptFile, sha256File } = require('./backup-crypto');
+const { copyOffsite } = require('./backup-offsite');
 
 const databaseUrl = process.env.DATABASE_URL;
 const backupDirectory = path.resolve(process.env.ORDERGUARD_BACKUP_DIR || path.join(__dirname, '..', 'data', 'backups'));
@@ -10,12 +12,12 @@ const keepCount = Number.isInteger(configuredKeepCount) && configuredKeepCount >
 const timestamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
 const encryptionKey = process.env.ORDERGUARD_BACKUP_ENCRYPTION_KEY || '';
 const allowPlaintext = process.env.ORDERGUARD_BACKUP_ALLOW_PLAINTEXT === '1';
-const offsiteDirectory = process.env.ORDERGUARD_BACKUP_OFFSITE_DIR ? path.resolve(process.env.ORDERGUARD_BACKUP_OFFSITE_DIR) : '';
+let offsiteDestination = '';
 
 const plainPath = path.join(backupDirectory, `orderguard-${timestamp}.dump`);
 const encryptedPath = `${plainPath}.enc`;
 const tempPath = `${plainPath}.tmp`;
-const metadataPath = `${encryptedPath}.meta.json`;
+const encryptedMetadataPath = `${encryptedPath}.meta.json`;
 const checksumPath = `${encryptedPath}.sha256`;
 
 function postgresEnvironment() {
@@ -38,6 +40,26 @@ function run(command, args) {
   return result.stdout;
 }
 
+async function collectCounts() {
+  const schema = process.env.DATABASE_SCHEMA;
+  const client = new Client({ connectionString: databaseUrl, ...(schema ? { options: `-c search_path=${schema}` } : {}) });
+  await client.connect();
+  try {
+    const tables = ['tenants', 'users', 'tenant_state', 'tenant_manifest_ids', 'state_quarantine', 'quarantine_recovery_audit', 'integrity_orphans', 'sessions', 'auth_audit'];
+    const existing = await client.query(`SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = ANY($1::text[])`, [tables]);
+    const counts = {};
+    for (const row of existing.rows) {
+      const table = row.table_name;
+      if (!/^[a-z_][a-z0-9_]*$/.test(table)) continue;
+      const result = await client.query(`SELECT COUNT(*)::BIGINT AS count FROM "${table}"`);
+      counts[table] = Number(result.rows[0].count);
+    }
+    return counts;
+  } finally {
+    await client.end();
+  }
+}
+
 function writeChecksum(filePath) {
   const checksumPathForFile = `${filePath}.sha256`;
   fs.writeFileSync(checksumPathForFile, `${sha256File(filePath)}  ${path.basename(filePath)}\n`, { mode: 0o600 });
@@ -45,14 +67,6 @@ function writeChecksum(filePath) {
   return checksumPathForFile;
 }
 
-function copyOffsite(files) {
-  if (!offsiteDirectory) return;
-  fs.mkdirSync(offsiteDirectory, { recursive: true, mode: 0o700 });
-  fs.chmodSync(offsiteDirectory, 0o700);
-  for (const file of files) {
-    if (fs.existsSync(file)) fs.copyFileSync(file, path.join(offsiteDirectory, path.basename(file)));
-  }
-}
 
 async function main() {
   if (!encryptionKey && !allowPlaintext) {
@@ -68,30 +82,36 @@ async function main() {
     fs.chmodSync(tempPath, 0o600);
     run('pg_restore', ['--list', tempPath]);
 
+    const counts = await collectCounts();
     if (encryptionKey) {
-      const metadata = await encryptFile(tempPath, encryptedPath, encryptionKey);
-      fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 2), { mode: 0o600 });
-      fs.chmodSync(metadataPath, 0o600);
+      const metadata = { ...(await encryptFile(tempPath, encryptedPath, encryptionKey)), encrypted: true, counts };
+      fs.writeFileSync(encryptedMetadataPath, JSON.stringify(metadata, null, 2), { mode: 0o600 });
+      fs.chmodSync(encryptedMetadataPath, 0o600);
       const encryptedChecksum = writeChecksum(encryptedPath);
-      createdFiles = [encryptedPath, metadataPath, encryptedChecksum];
+      createdFiles = [encryptedPath, encryptedMetadataPath, encryptedChecksum];
       finalPath = encryptedPath;
       fs.unlinkSync(tempPath);
     } else {
       fs.renameSync(tempPath, plainPath);
+      const metadataPathForPlain = `${plainPath}.meta.json`;
+      fs.writeFileSync(metadataPathForPlain, JSON.stringify({ version: 1, encrypted: false, counts, createdAt: new Date().toISOString() }, null, 2), { mode: 0o600 });
+      fs.chmodSync(metadataPathForPlain, 0o600);
       const plainChecksum = writeChecksum(plainPath);
-      createdFiles = [plainPath, plainChecksum];
+      createdFiles = [plainPath, metadataPathForPlain, plainChecksum];
       finalPath = plainPath;
       console.warn('Peringatan: backup disimpan tanpa enkripsi karena ORDERGUARD_BACKUP_ALLOW_PLAINTEXT=1.');
     }
 
     try {
-      copyOffsite(createdFiles);
+      const offsite = copyOffsite(createdFiles);
+      offsiteDestination = offsite.destination;
+      if (offsite.mode === 'none') console.warn('Peringatan: backup tidak disalin off-site; konfigurasi S3/rclone diperlukan untuk disaster recovery.');
     } catch (offsiteError) {
       console.error(`Backup lokal valid, tetapi salinan off-site gagal: ${offsiteError.message}`);
       process.exitCode = 1;
     }
   } catch (error) {
-    for (const file of [tempPath, encryptedPath, metadataPath, checksumPath, plainPath, `${plainPath}.sha256`]) {
+    for (const file of [tempPath, encryptedPath, encryptedMetadataPath, checksumPath, plainPath, `${plainPath}.meta.json`, `${plainPath}.sha256`]) {
       if (fs.existsSync(file)) fs.unlinkSync(file);
     }
     throw error;
@@ -108,7 +128,7 @@ async function main() {
     for (const sidecar of sidecars) if (fs.existsSync(sidecar)) fs.unlinkSync(sidecar);
   }
 
-  console.log(`Backup PostgreSQL valid: ${finalPath} (sha256 ${sha256File(finalPath)})${offsiteDirectory ? `; off-site: ${offsiteDirectory}` : ''}`);
+  console.log(`Backup PostgreSQL valid: ${finalPath} (sha256 ${sha256File(finalPath)})${offsiteDestination ? `; off-site: ${offsiteDestination}` : ''}`);
 }
 
 main().catch((error) => {

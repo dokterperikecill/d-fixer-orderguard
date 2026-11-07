@@ -208,7 +208,7 @@ Script akan:
 2. Memvalidasi arsip dengan `pg_restore --list`.
 3. Membuat backup keselamatan `orderguard-pre-restore-*.dump`.
 4. Menjalankan restore atomik (`--single-transaction --clean --if-exists`) ke database target.
-5. Memverifikasi tabel `tenants` setelah restore.
+5. Memverifikasi keberadaan tabel inti dan membandingkan jumlah baris tabel penting dengan metadata backup.
 
 **Jangan arahkan `DATABASE_URL` restore ke database produksi tanpa persetujuan dan backup terbaru.** Uji restore pada database terpisah terlebih dahulu, lalu jalankan health check/test setelah restore. Script ini tidak menjadwalkan backup otomatis; jadwalkan melalui cron/Render cron job dan simpan salinan di media terpisah.
 
@@ -306,7 +306,7 @@ ORDERGUARD_BACKUP_ENCRYPTION_KEY="<32-byte-hex-64-char-atau-base64>"
 - Checksum ciphertext dan plaintext disimpan di `.sha256`/`.meta.json`.
 - Kunci tidak pernah dicetak ke log dan tidak boleh disimpan di repository.
 - Restore mendukung `ORDERGUARD_BACKUP_PREVIOUS_ENCRYPTION_KEYS` (dipisahkan koma) untuk rotasi kunci.
-- `ORDERGUARD_BACKUP_OFFSITE_DIR` menyalin backup terverifikasi ke direktori mount/off-site; kegagalan off-site tidak menghapus backup lokal.
+- Off-site nyata: set `ORDERGUARD_BACKUP_OFFSITE_S3_URI=s3://bucket/prefix` (AWS CLI) atau `ORDERGUARD_BACKUP_OFFSITE_RCLONE_REMOTE=nama-remote:path` (rclone). `ORDERGUARD_BACKUP_OFFSITE_DIR` hanya mirror filesystem lokal dan diberi peringatan; jangan dianggap disaster recovery terpisah.
 - Backup lokal/off-site lama tidak dihapus sebelum backup baru lolos verifikasi.
 - Retensi: `ORDERGUARD_BACKUP_KEEP` (default 30).
 - Untuk mode development tanpa enkripsi, set `ORDERGUARD_BACKUP_ALLOW_PLAINTEXT=1`; jangan gunakan di production.

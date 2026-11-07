@@ -153,71 +153,56 @@ async function main() {
 
     const scanLatencies = [];
     const scanStatuses = [];
-    let scanRetries = 0;
     const scanStarted = now();
     await runQueue(packages.slice(0, 10), async (parcel) => {
       const begin = now();
-      let result = 0;
-      for (let attempt = 0; attempt < 30; attempt += 1) {
-        const current = await getState();
-        const manifest = current.body.manifests.find((item) => item.id === loadManifestId);
-        const target = manifest.packages.find((item) => item.tracking === parcel.tracking);
-        if (target.status !== 'EXPECTED') { result = 200; break; }
-        const next = structuredClone(current.body);
-        const nextManifest = next.manifests.find((item) => item.id === loadManifestId);
-        const nextTarget = nextManifest.packages.find((item) => item.tracking === parcel.tracking);
-        const createdAt = new Date().toISOString();
-        nextTarget.status = 'SCANNED';
-        nextTarget.scannedAt = createdAt;
-        nextManifest.scans.push({ tracking: parcel.tracking, result: 'MATCH', createdAt, actor: 'Platform Admin' });
-        next.audit.unshift({ id: `AU-SCAN-${parcel.tracking}`, actor: 'Platform Admin', action: `Paket dipindai: ${parcel.tracking}`, object: loadManifestId, createdAt });
-        const response = await postState(next, current.version);
-        result = response.status;
-        if (response.status === 200) break;
-        if (response.status === 409) { scanRetries += 1; continue; }
-        break;
-      }
-      scanStatuses.push(result);
+      const response = await fetch(`http://127.0.0.1:${PORT}/api/manifests/${encodeURIComponent(loadManifestId)}/scans`, {
+        method: 'POST',
+        headers: writeHeaders,
+        body: JSON.stringify({ tracking: parcel.tracking }),
+      });
+      scanStatuses.push(response.status);
       scanLatencies.push(now() - begin);
     }, 10);
     const scanDuration = (now() - scanStarted) / 1000;
-    metrics.push({ phase: 'POST /api/state concurrent package scanning', virtualUsers: 10, transactions: scanStatuses.length, throughput: Number((scanStatuses.length / scanDuration).toFixed(2)), errors: scanStatuses.filter((status) => status !== 200).length, retries: scanRetries, latencyMs: percentiles(scanLatencies) });
+    metrics.push({ phase: 'POST /api/manifests/:id/scans concurrent scanning', virtualUsers: 10, transactions: scanStatuses.length, throughput: Number((scanStatuses.length / scanDuration).toFixed(2)), errors: scanStatuses.filter((status) => status !== 201).length, retries: 0, latencyMs: percentiles(scanLatencies) });
 
     const handoverLatencies = [];
     const handoverStatuses = [];
-    let handoverRetries = 0;
+    const handoverManifests = [];
+    for (let index = 0; index < 5; index += 1) {
+      const setupBase = await getState();
+      const createdAt = new Date().toISOString();
+      const id = `OG-LOAD-HANDOVER-${index}`;
+      const tracking = `TRK-LOAD-HANDOVER-${index}`;
+      handoverManifests.push({ id, tracking });
+      const setup = structuredClone(setupBase.body);
+      setup.manifests.unshift({ id, shop: "D'Fixer Store", courier: 'JNE', date: createdAt.slice(0, 10), location: 'Load', status: 'OPEN', createdAt, createdBy: 'Platform Admin', source: 'manual', packages: [{ order: `ORD-LOAD-HANDOVER-${index}`, tracking, status: 'EXPECTED', scannedAt: null }], scans: [], sessions: [] });
+      setup.audit.unshift({ id: `AU-${id}`, actor: 'Platform Admin', action: 'Manifest dibuat manual dengan 1 paket', object: id, createdAt });
+      const setupResponse = await postState(setup, setupBase.version);
+      if (setupResponse.status !== 200) throw new Error(`handover setup failed: ${setupResponse.status}`);
+    }
+    for (const item of handoverManifests) {
+      const scan = await fetch(`http://127.0.0.1:${PORT}/api/manifests/${encodeURIComponent(item.id)}/scans`, {
+        method: 'POST',
+        headers: writeHeaders,
+        body: JSON.stringify({ tracking: item.tracking }),
+      });
+      if (scan.status !== 201) throw new Error(`handover setup scan failed: ${scan.status}`);
+    }
     const handoverStarted = now();
-    await runQueue(packages.slice(0, 5), async (parcel) => {
+    await runQueue(handoverManifests, async (item) => {
       const begin = now();
-      let result = 0;
-      for (let attempt = 0; attempt < 30; attempt += 1) {
-        const current = await getState();
-        const manifest = current.body.manifests.find((item) => item.id === loadManifestId);
-        const target = manifest.packages.find((item) => item.tracking === parcel.tracking);
-        if (target.status === 'HANDED_OVER') { result = 200; break; }
-        if (target.status !== 'SCANNED') { result = 409; break; }
-        const next = structuredClone(current.body);
-        const nextManifest = next.manifests.find((item) => item.id === loadManifestId);
-        const nextTarget = nextManifest.packages.find((item) => item.tracking === parcel.tracking);
-        const createdAt = new Date().toISOString();
-        const sessionId = `TR-LOAD-${parcel.tracking}`;
-        nextTarget.status = 'HANDED_OVER';
-        nextTarget.handedOverAt = createdAt;
-        nextTarget.handedOverSessionId = sessionId;
-        nextManifest.sessions.push({ id: sessionId, receiver: 'Kurir Load', actor: 'Platform Admin', createdAt, note: '', items: [parcel.tracking], evidence: null });
-        nextManifest.status = 'PARTIALLY_HANDED_OVER';
-        next.audit.unshift({ id: `AU-HANDOVER-${parcel.tracking}`, actor: 'Platform Admin', action: `Serah terima ${sessionId} dikonfirmasi: 1 diterima`, object: loadManifestId, createdAt });
-        const response = await postState(next, current.version);
-        result = response.status;
-        if (response.status === 200) break;
-        if (response.status === 409) { handoverRetries += 1; continue; }
-        break;
-      }
-      handoverStatuses.push(result);
+      const response = await fetch(`http://127.0.0.1:${PORT}/api/manifests/${encodeURIComponent(item.id)}/handovers`, {
+        method: 'POST',
+        headers: writeHeaders,
+        body: JSON.stringify({ receiver: 'Kurir Load', items: [item.tracking], note: 'load', evidence: null }),
+      });
+      handoverStatuses.push(response.status);
       handoverLatencies.push(now() - begin);
     }, 5);
     const handoverDuration = (now() - handoverStarted) / 1000;
-    metrics.push({ phase: 'POST /api/state concurrent handover', virtualUsers: 5, transactions: handoverStatuses.length, throughput: Number((handoverStatuses.length / handoverDuration).toFixed(2)), errors: handoverStatuses.filter((status) => status !== 200).length, retries: handoverRetries, latencyMs: percentiles(handoverLatencies) });
+    metrics.push({ phase: 'POST /api/manifests/:id/handovers concurrent handover', virtualUsers: 5, transactions: handoverStatuses.length, throughput: Number((handoverStatuses.length / handoverDuration).toFixed(2)), errors: handoverStatuses.filter((status) => status !== 201).length, retries: 0, latencyMs: percentiles(handoverLatencies) });
 
     const memory = await new Promise((resolve) => {
       const fs = require('node:fs');

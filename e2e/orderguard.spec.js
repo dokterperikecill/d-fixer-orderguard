@@ -2,6 +2,7 @@ const { test, expect } = require('@playwright/test');
 const { Client } = require('pg');
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const XLSX = require('xlsx');
 
 const E2E_SCHEMA = process.env.E2E_SCHEMA || 'orderguard_e2e';
@@ -156,6 +157,40 @@ test.describe.serial('OrderGuard browser E2E', () => {
     await expect(page.locator('#page-content')).toContainText('Rekonsiliasi per manifest');
   });
 
+  test('quarantine admin UI previews, confirms, recovers, and shows history', async ({ page }) => {
+    await login(page, 'admin', 'admin123');
+    const current = await stateFromApi(page);
+    const recovered = structuredClone(current);
+    const createdAt = new Date().toISOString();
+    const incident = { id: 'INC-E2E-QUARANTINE', category: 'Masalah lain', manifestId: '', tracking: '', description: 'E2E quarantine recovery', reportedBy: 'Platform Admin', createdAt, status: 'OPEN', resolution: '' };
+    recovered.incidents.unshift(incident);
+    recovered.audit.unshift({ id: 'AU-E2E-QUARANTINE', actor: 'Platform Admin', action: 'Insiden dicatat: Masalah lain', object: incident.id, createdAt });
+    const payload = JSON.stringify(recovered);
+    const hash = crypto.createHash('sha256').update(payload).digest('hex');
+    const db = new Client({ connectionString: DATABASE_URL });
+    await db.connect();
+    try {
+      await db.query(`INSERT INTO "${E2E_SCHEMA}".state_quarantine (id, tenant_id, payload, payload_hash, reason, created_at) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING`, ['Q-E2E-UI', 'dfixer-store', payload, hash, 'E2E UI quarantine', createdAt]);
+    } finally {
+      await db.end();
+    }
+
+    await goView(page, 'quarantine');
+    await expect(page.locator('#page-content')).toContainText('Q-E2E-UI');
+    await page.locator('[data-action="view-quarantine"][data-id="Q-E2E-UI"]').click();
+    await expect(page.locator('#modal')).toContainText('Detail quarantine');
+    await expect(page.locator('#modal')).toContainText('Pulihkan');
+    page.once('dialog', (dialog) => dialog.accept());
+    await page.locator('[data-action="recover-quarantine"]').click();
+    await expect(page.locator('.toast')).toContainText(/berhasil dipulihkan/i);
+    const after = await stateFromApi(page);
+    expect(after.incidents.some((item) => item.id === 'INC-E2E-QUARANTINE')).toBeTruthy();
+
+    await page.locator('[data-action="view-quarantine"][data-id="Q-E2E-UI"]').click();
+    await expect(page.locator('#modal')).toContainText('QUARANTINE_RECOVERY');
+    await page.locator('[data-action="close-modal"]').last().click();
+  });
+
   test('connection failure during session bootstrap renders login safely', async ({ browser }) => {
     const context = await browser.newContext();
     const page = await context.newPage();
@@ -174,7 +209,7 @@ test.describe.serial('OrderGuard browser E2E', () => {
       return { scriptURL: registration.active?.scriptURL || '', caches: await caches.keys() };
     });
     expect(result.scriptURL).toContain('/service-worker.js');
-    expect(result.caches).toContain('dfixer-orderguard-shell-v9');
+    expect(result.caches).toContain('dfixer-orderguard-shell-v10');
     await context.close();
   });
 });

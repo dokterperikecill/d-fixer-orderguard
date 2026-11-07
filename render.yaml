@@ -57,6 +57,10 @@ services:
         sync: false
       - key: ORDERGUARD_BACKUP_DIR
         sync: false
+      - key: ORDERGUARD_BACKUP_OFFSITE_S3_URI
+        sync: false
+      - key: ORDERGUARD_BACKUP_OFFSITE_RCLONE_REMOTE
+        sync: false
       - key: ORDERGUARD_BACKUP_OFFSITE_DIR
         sync: false
       - key: ORDERGUARD_BACKUP_KEEP

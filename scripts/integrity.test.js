@@ -27,11 +27,19 @@ test('integrity audit/reconcile quarantines orphans and validates foreign keys',
     const before = await auditIntegrity(db);
     assert.equal(before.orphans.some((item) => item.table === 'users'), true);
 
+    await db.prepare(
+      'INSERT INTO sessions (token_hash, user_id, csrf_token, expires_at, created_at) VALUES (?, ?, ?, ?, ?)'
+    ).run('dependent-session', 'orphan-user', 'csrf', new Date(Date.now() + 60000).toISOString(), now);
+
     const dryRun = await reconcileIntegrity(db, { apply: false });
     assert.equal(dryRun.applied, false);
     const stillThere = await db.prepare('SELECT COUNT(*)::INTEGER AS count FROM users WHERE id = ?').get('orphan-user');
     assert.equal(stillThere.count, 1);
 
+    await assert.rejects(() => reconcileIntegrity(db, { apply: true }), /diblokir/);
+    assert.equal((await db.prepare('SELECT COUNT(*)::INTEGER AS count FROM users WHERE id = ?').get('orphan-user')).count, 1);
+    assert.equal((await db.prepare('SELECT COUNT(*)::INTEGER AS count FROM sessions WHERE user_id = ?').get('orphan-user')).count, 1);
+    await db.prepare('DELETE FROM sessions WHERE token_hash = ?').run('dependent-session');
     const applied = await reconcileIntegrity(db, { apply: true });
     assert.equal(applied.applied, true);
     const after = await db.prepare('SELECT COUNT(*)::INTEGER AS count FROM users WHERE id = ?').get('orphan-user');

@@ -60,8 +60,8 @@ const INITIAL_TENANTS = [
 ];
 const EMPLOYEE_ROLES = ['super-admin', 'store-admin', 'handover-staff'];
 const ROLE_PERMISSIONS = {
-  'super-admin': ['dashboard', 'manifests', 'imports', 'incidents', 'reports', 'audit'],
-  'store-admin': ['dashboard', 'manifests', 'imports', 'incidents', 'reports', 'audit'],
+  'super-admin': ['dashboard', 'manifests', 'imports', 'incidents', 'reports', 'audit', 'quarantine'],
+  'store-admin': ['dashboard', 'manifests', 'imports', 'incidents', 'reports', 'audit', 'quarantine'],
   'handover-staff': ['dashboard', 'manifests'],
 };
 async function seedTenants() {
@@ -865,6 +865,106 @@ function applyOrderEvent(user, state, input) {
   return { ok: true, event, manifestId: manifest.id, order: parcel.order, tracking: parcel.tracking, status: parcel.status };
 }
 
+function performScan(user, state, manifestId, rawTracking) {
+  const manifest = state.manifests.find((item) => item.id === manifestId);
+  if (!manifest) throw new StateValidationError(404, 'Manifest tidak ditemukan pada tenant ini.');
+  if (['CLOSED', 'CANCELLED', 'CONFIRMED'].includes(manifest.status)) throw new StateValidationError(409, 'Manifest final tidak menerima pemindaian baru.');
+  const tracking = String(rawTracking || '').trim();
+  if (!tracking || tracking.length > 200) throw new StateValidationError(400, 'Nomor resi tidak valid.');
+  const parcel = manifest.packages.find((item) => normalizedTracking(item.tracking) === normalizedTracking(tracking));
+  const computedAt = new Date().toISOString();
+  let result = 'INVALID_PACKAGE';
+  if (parcel) {
+    if (parcel.status === 'HANDED_OVER') result = 'ALREADY_HANDED_OVER';
+    else if (parcel.status === 'SCANNED') result = 'DUPLICATE_SCAN';
+    else if (parcel.status === 'CANCELLED') result = 'CANCELLED';
+    else if (['CANCELLED_BEFORE_HANDOVER', 'CANCELLATION_AFTER_HANDOVER'].includes(parcel.status)) result = 'CANCELLED_BY_BUYER';
+    else if (parcel.status === 'RETURN_IN_TRANSIT') result = 'RETURN_IN_TRANSIT';
+    else if (parcel.status === 'RETURN_RECEIVED') result = 'RETURN_RECEIVED';
+    else if (parcel.status === 'REJECTED') result = 'INVALID_PACKAGE';
+    else if (parcel.status === 'EXPECTED') {
+      parcel.status = 'SCANNED';
+      parcel.scannedAt = computedAt;
+      result = 'MATCH';
+    }
+  } else {
+    const handedElsewhere = state.manifests.some((other) => other.id !== manifest.id && other.packages.some((item) => normalizedTracking(item.tracking) === normalizedTracking(tracking) && item.status === 'HANDED_OVER'));
+    result = handedElsewhere ? 'ALREADY_HANDED_OVER' : 'NOT_IN_MANIFEST';
+  }
+  manifest.scans.push({ tracking, result, createdAt: computedAt, actor: user.name });
+  state.audit.unshift({ id: `AU-${crypto.randomUUID()}`, actor: user.name, action: scanAuditAction(result, tracking), object: manifest.id, createdAt: computedAt });
+  state.audit = state.audit.slice(0, 5000);
+  return { result, manifestId: manifest.id, tracking, status: parcel?.status || null };
+}
+
+function performHandover(user, state, manifestId, input) {
+  const manifest = state.manifests.find((item) => item.id === manifestId);
+  if (!manifest) throw new StateValidationError(404, 'Manifest tidak ditemukan pada tenant ini.');
+  if (['CLOSED', 'CANCELLED', 'CONFIRMED'].includes(manifest.status)) throw new StateValidationError(409, 'Manifest final tidak dapat menerima handover baru.');
+  const receiver = String(input.receiver || '').trim();
+  if (!receiver || receiver.length > 100) throw new StateValidationError(400, 'Nama penerima wajib diisi dan maksimal 100 karakter.');
+  const note = String(input.note || '').trim();
+  if (note.length > 500) throw new StateValidationError(400, 'Catatan sesi maksimal 500 karakter.');
+  if (!Array.isArray(input.items) || !input.items.length) throw new StateValidationError(400, 'Daftar paket yang diterima wajib diisi.');
+  const items = input.items.map((item) => String(item));
+  if (new Set(items).size !== items.length) throw new StateValidationError(400, 'Daftar paket yang diterima mengandung duplikat.');
+  let evidence = null;
+  if (input.evidence !== undefined && input.evidence !== null) {
+    const evidenceResult = Evidence.validateEvidenceDataUri(input.evidence);
+    if (!evidenceResult.ok) throw new StateValidationError(400, evidenceResult.error);
+    evidence = evidenceResult.dataUri;
+  }
+  const scanned = manifest.packages.filter((parcel) => parcel.status === 'SCANNED');
+  const scannedTrackings = new Set(scanned.map((parcel) => parcel.tracking));
+  if (items.some((tracking) => !scannedTrackings.has(tracking))) throw new StateValidationError(409, 'Hanya paket berstatus dipindai pada manifest ini yang dapat diserahkan.');
+  const createdAt = new Date().toISOString();
+  const session = {
+    id: `TR-${crypto.randomUUID()}`,
+    receiver,
+    actor: user.name,
+    createdAt,
+    note,
+    items,
+    evidence,
+  };
+  const accepted = new Set(items);
+  const rejected = scanned.filter((parcel) => !accepted.has(parcel.tracking));
+  for (const parcel of manifest.packages) {
+    if (accepted.has(parcel.tracking)) {
+      parcel.status = 'HANDED_OVER';
+      parcel.handedOverAt = createdAt;
+      parcel.handedOverSessionId = session.id;
+    }
+  }
+  for (const parcel of rejected) {
+    parcel.status = 'REJECTED';
+    state.incidents.unshift({
+      id: `INC-${crypto.randomUUID()}`,
+      category: 'Paket ditolak kurir',
+      manifestId: manifest.id,
+      tracking: parcel.tracking,
+      description: `Paket ditolak oleh ${receiver} saat sesi ${session.id}.`,
+      reportedBy: user.name,
+      createdAt,
+      status: 'OPEN',
+      resolution: '',
+    });
+  }
+  manifest.sessions.push(session);
+  manifest.status = manifest.packages.some((parcel) => ['EXPECTED', 'SCANNED', 'REJECTED', 'EXCEPTION', 'CANCELLATION_AFTER_HANDOVER', 'RETURN_IN_TRANSIT'].includes(parcel.status))
+    ? 'PARTIALLY_HANDED_OVER'
+    : 'CONFIRMED';
+  state.audit.unshift({
+    id: `AU-${crypto.randomUUID()}`,
+    actor: user.name,
+    action: `Serah terima ${session.id} dikonfirmasi: ${items.length} diterima${rejected.length ? `, ${rejected.length} ditolak` : ''}`,
+    object: manifest.id,
+    createdAt,
+  });
+  state.audit = state.audit.slice(0, 5000);
+  return { sessionId: session.id, manifestId: manifest.id, accepted: items, rejected: rejected.map((parcel) => parcel.tracking), status: manifest.status };
+}
+
 function applyTikTokEventPlans(user, state, plans) {
   const existingRefs = new Set(state.orderEvents.map((event) => event.sourceRef).filter(Boolean));
   let eventsCreated = 0;
@@ -1349,6 +1449,10 @@ app.get('/api/admin/quarantine/:id', requireAuth, requireRole(['super-admin', 's
   const row = await quarantineRowForUser(req, req.params.id);
   if (!row) return res.status(404).json({ error: 'Quarantine tidak ditemukan.' });
   const parsed = parseQuarantinePayload(row);
+  const history = await db.prepare(
+    `SELECT action, actor_name AS actorName, before_hash AS beforeHash, after_hash AS afterHash, created_at AS createdAt
+     FROM quarantine_recovery_audit WHERE quarantine_id = ? ORDER BY created_at DESC LIMIT 100`
+  ).all(row.id);
   res.json({
     quarantine: {
       id: row.id,
@@ -1360,6 +1464,7 @@ app.get('/api/admin/quarantine/:id', requireAuth, requireRole(['super-admin', 's
       error: parsed.ok ? '' : parsed.error,
       preview: parsed.ok ? statePreview(parsed.state) : null,
     },
+    history,
   });
 }));
 
@@ -1832,6 +1937,27 @@ app.post('/api/order-events', requireAuth, requireRole(['super-admin', 'store-ad
     if (error instanceof OrderEventError) return res.status(error.status).json({ error: error.message });
     throw error;
   }
+}));
+
+app.post('/api/manifests/:manifestId/scans', requireAuth, requireRole(['super-admin', 'store-admin', 'handover-staff']), requireCsrf, asyncRoute(async (req, res) => {
+  const tracking = String(req.body?.tracking || '').trim();
+  const mutation = await transactTenantState(req.user.tenantId, (state) => {
+    const result = performScan(req.user, state, req.params.manifestId, tracking);
+    return { state, result };
+  });
+  res.set('ETag', `"state-${mutation.version}"`);
+  res.set('X-State-Version', String(mutation.version));
+  res.status(201).json(mutation.result);
+}));
+
+app.post('/api/manifests/:manifestId/handovers', requireAuth, requireRole(['super-admin', 'store-admin', 'handover-staff']), requireCsrf, asyncRoute(async (req, res) => {
+  const mutation = await transactTenantState(req.user.tenantId, (state) => {
+    const result = performHandover(req.user, state, req.params.manifestId, req.body || {});
+    return { state, result };
+  });
+  res.set('ETag', `"state-${mutation.version}"`);
+  res.set('X-State-Version', String(mutation.version));
+  res.status(201).json(mutation.result);
 }));
 
 app.get('/api/state', requireAuth, requireRole(['super-admin', 'store-admin', 'handover-staff']), asyncRoute(async (req, res) => {

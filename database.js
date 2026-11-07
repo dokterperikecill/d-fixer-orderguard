@@ -32,7 +32,8 @@ const SCHEMA = `
     payload_hash TEXT NOT NULL,
     reason TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    UNIQUE (tenant_id, payload_hash)
+    UNIQUE (tenant_id, payload_hash),
+    UNIQUE (id, tenant_id)
   );
   CREATE INDEX IF NOT EXISTS state_quarantine_tenant_created_idx ON state_quarantine (tenant_id, created_at DESC);
   CREATE TABLE IF NOT EXISTS quarantine_recovery_audit (
@@ -83,6 +84,7 @@ const SCHEMA = `
     updated_at TEXT NOT NULL
   );
   CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower_uq ON users (LOWER(username));
+  CREATE UNIQUE INDEX IF NOT EXISTS users_id_tenant_uq ON users (id, tenant_id);
   CREATE INDEX IF NOT EXISTS users_tenant_id_idx ON users (tenant_id);
   CREATE TABLE IF NOT EXISTS sessions (
     token_hash TEXT PRIMARY KEY,
@@ -135,6 +137,7 @@ const SCHEMA = `
     updated_at TEXT NOT NULL,
     UNIQUE (tenant_id, open_id)
   );
+  CREATE UNIQUE INDEX IF NOT EXISTS tiktok_connections_id_tenant_uq ON tiktok_connections (id, tenant_id);
   CREATE TABLE IF NOT EXISTS tiktok_shops (
     id TEXT PRIMARY KEY,
     tenant_id TEXT NOT NULL,
@@ -226,6 +229,25 @@ const MIGRATIONS = [
       FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE SET NULL NOT VALID;
   EXCEPTION WHEN duplicate_object THEN NULL; END $$`,
   `CREATE OR REPLACE FUNCTION prevent_quarantine_audit_mutation() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'quarantine_recovery_audit is append-only'; END; $$`,
+  `DO $$ BEGIN
+    ALTER TABLE tiktok_oauth_states ADD CONSTRAINT tiktok_oauth_states_user_tenant_fk
+      FOREIGN KEY (user_id, tenant_id) REFERENCES users(id, tenant_id) ON DELETE CASCADE NOT VALID;
+  EXCEPTION WHEN duplicate_object THEN NULL; END $$`,
+  `DO $$ BEGIN
+    ALTER TABLE tiktok_shops ADD CONSTRAINT tiktok_shops_connection_tenant_fk
+      FOREIGN KEY (connection_id, tenant_id) REFERENCES tiktok_connections(id, tenant_id) ON DELETE CASCADE NOT VALID;
+  EXCEPTION WHEN duplicate_object THEN NULL; END $$`,
+  `ALTER TABLE auth_audit DROP CONSTRAINT IF EXISTS auth_audit_user_tenant_fk`,
+  `DO $$ BEGIN
+    ALTER TABLE quarantine_recovery_audit ADD CONSTRAINT quarantine_recovery_audit_quarantine_tenant_fk
+      FOREIGN KEY (quarantine_id, tenant_id) REFERENCES state_quarantine(id, tenant_id) ON DELETE RESTRICT NOT VALID;
+  EXCEPTION WHEN duplicate_object THEN NULL; END $$`,
+  `CREATE OR REPLACE FUNCTION revoke_sessions_on_user_tenant_change() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.tenant_id IS DISTINCT FROM OLD.tenant_id THEN EXECUTE format('DELETE FROM %I.sessions WHERE user_id = $1', TG_TABLE_SCHEMA) USING NEW.id; EXECUTE format('DELETE FROM %I.tiktok_oauth_states WHERE user_id = $1', TG_TABLE_SCHEMA) USING NEW.id; END IF; RETURN NEW; END; $$`,
+  `DO $$ BEGIN
+    CREATE TRIGGER users_tenant_change_revokes_sessions
+      BEFORE UPDATE OF tenant_id ON users
+      FOR EACH ROW EXECUTE FUNCTION revoke_sessions_on_user_tenant_change();
+  EXCEPTION WHEN duplicate_object THEN NULL; END $$`,
   `DO $$ BEGIN
     CREATE TRIGGER quarantine_recovery_audit_immutable
       BEFORE UPDATE OR DELETE ON quarantine_recovery_audit

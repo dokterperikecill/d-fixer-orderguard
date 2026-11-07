@@ -9,11 +9,12 @@ const VIEW_LABELS = {
   returns: "Pembatalan & Retur",
   reports: "Laporan",
   audit: "Audit log",
+  quarantine: "Quarantine",
   employees: "Karyawan",
 };
 const ROLE_PERMISSIONS = {
-  'super-admin': ['dashboard', 'manifests', 'imports', 'incidents', 'returns', 'reports', 'audit', 'employees'],
-  'store-admin': ['dashboard', 'manifests', 'imports', 'incidents', 'returns', 'reports', 'audit'],
+  'super-admin': ['dashboard', 'manifests', 'imports', 'incidents', 'returns', 'reports', 'audit', 'quarantine', 'employees'],
+  'store-admin': ['dashboard', 'manifests', 'imports', 'incidents', 'returns', 'reports', 'audit', 'quarantine'],
   'handover-staff': ['dashboard', 'manifests', 'returns'],
 };
 const ROLE_LABELS = {
@@ -473,6 +474,7 @@ function renderPage() {
     reports: renderReports,
     audit: renderAudit,
     employees: renderEmployees,
+    quarantine: renderQuarantine,
     "manifest-detail": () => renderManifestDetail(getManifest(selectedManifestId)),
   };
   (renderers[currentView] || renderDashboard)();
@@ -1015,35 +1017,28 @@ async function recordScan(manifest, rawTracking) {
   const tracking = String(rawTracking || "").trim();
   if (!tracking) return;
   if (["CLOSED", "CANCELLED", "CONFIRMED"].includes(computedManifestStatus(manifest))) return toast("Manifest sudah final dan tidak menerima pemindaian baru.", true);
-  const parcel = manifest.packages.find((item) => normalize(item.tracking) === normalize(tracking));
-  let result = "INVALID_PACKAGE";
-  if (parcel) {
-    if (parcel.status === "HANDED_OVER") result = "ALREADY_HANDED_OVER";
-    else if (parcel.status === "SCANNED") result = "DUPLICATE_SCAN";
-    else if (parcel.status === "CANCELLED") result = "CANCELLED";
-    else if (["CANCELLED_BEFORE_HANDOVER", "CANCELLATION_AFTER_HANDOVER"].includes(parcel.status)) result = "CANCELLED_BY_BUYER";
-    else if (parcel.status === "RETURN_IN_TRANSIT") result = "RETURN_IN_TRANSIT";
-    else if (parcel.status === "RETURN_RECEIVED") result = "RETURN_RECEIVED";
-    else if (parcel.status === "REJECTED") result = "INVALID_PACKAGE";
-    else if (parcel.status === "EXPECTED") {
-      parcel.status = "SCANNED";
-      parcel.scannedAt = nowISO();
-      result = "MATCH";
+  const response = await apiFetch(`/api/manifests/${encodeURIComponent(manifest.id)}/scans`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ tracking }),
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    if (response.status === 409 || response.status === 404) {
+      await hydrateStateFromServer();
+      renderPage();
     }
-  } else {
-    const handedElsewhere = state.manifests.some((other) => other.id !== manifest.id && other.packages.some((item) => normalize(item.tracking) === normalize(tracking) && item.status === "HANDED_OVER"));
-    result = handedElsewhere ? "ALREADY_HANDED_OVER" : "NOT_IN_MANIFEST";
+    toast(result.error || "Pemindaian ditolak oleh server.", true);
+    return;
   }
-  manifest.scans.push({ tracking, result, createdAt: nowISO(), actor: currentUser?.name || ACTOR });
-  logAudit(scanAuditAction(result, tracking), manifest.id);
-  const saved = await persist();
-  if (!saved) return;
+  await hydrateStateFromServer();
   currentView = "manifest-detail";
   renderPage();
   const feedback = document.querySelector("#scan-feedback");
-  const stateClass = result === "MATCH" ? "match" : ["DUPLICATE_SCAN"].includes(result) ? "warning" : "error";
+  if (!feedback) return;
+  const stateClass = result.result === "MATCH" ? "match" : ["DUPLICATE_SCAN"].includes(result.result) ? "warning" : "error";
   feedback.className = `scan-feedback ${stateClass}`;
-  feedback.innerHTML = `<i data-lucide="${result === "MATCH" ? "circle-check" : result === "DUPLICATE_SCAN" ? "triangle-alert" : "circle-alert"}"></i><span><strong>${escapeHtml(SCAN_LABELS[result])}:</strong> ${escapeHtml(tracking)}${result === "NOT_IN_MANIFEST" ? ". Resi ini tidak menambah jumlah paket yang sah." : ""}</span>`;
+  feedback.innerHTML = `<i data-lucide="${result.result === "MATCH" ? "circle-check" : result.result === "DUPLICATE_SCAN" ? "triangle-alert" : "circle-alert"}"></i><span><strong>${escapeHtml(SCAN_LABELS[result.result])}:</strong> ${escapeHtml(tracking)}${result.result === "NOT_IN_MANIFEST" ? ". Resi ini tidak menambah jumlah paket yang sah." : ""}</span>`;
   renderIcons(feedback);
   document.querySelector("#scan-input")?.focus();
 }
@@ -1077,7 +1072,6 @@ async function confirmHandover(form) {
   const scanned = manifest.packages.filter((parcel) => parcel.status === "SCANNED");
   if (!receiver || !accepted.length) return toast("Nama penerima dan minimal satu paket yang diterima wajib diisi.", true);
   if (accepted.some((tracking) => !scanned.some((parcel) => parcel.tracking === tracking))) return toast("Daftar paket berubah. Muat ulang manifest sebelum mengonfirmasi.", true);
-  const rejected = scanned.filter((parcel) => !accepted.includes(parcel.tracking));
   if (!window.confirm(`Konfirmasi ${accepted.length} paket diterima oleh ${receiver}? Catatan sesi ini tidak dapat ditimpa.`)) return;
   let evidence = null;
   const photo = formData.get("photo");
@@ -1085,22 +1079,26 @@ async function confirmHandover(form) {
     try { evidence = await loadImageData(photo); }
     catch (error) { return toast(error.message, true); }
   }
-  const session = { id: makeId("TR"), receiver, actor: currentUser?.name || ACTOR, createdAt: nowISO(), note: String(formData.get("note") || "").trim(), items: [...accepted], evidence };
-  accepted.forEach((tracking) => {
-    const parcel = manifest.packages.find((item) => item.tracking === tracking);
-    parcel.status = "HANDED_OVER";
-    parcel.handedOverAt = session.createdAt;
-    parcel.handedOverSessionId = session.id;
+  const response = await apiFetch(`/api/manifests/${encodeURIComponent(manifest.id)}/handovers`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      receiver,
+      items: [...accepted],
+      note: String(formData.get("note") || "").trim(),
+      evidence,
+    }),
   });
-  rejected.forEach((parcel) => {
-    parcel.status = "REJECTED";
-    state.incidents.unshift({ id: makeId("INC"), category: "Paket ditolak kurir", manifestId: manifest.id, tracking: parcel.tracking, description: `Paket ditolak oleh ${receiver} saat sesi ${session.id}.`, reportedBy: currentUser?.name || ACTOR, createdAt: nowISO(), status: "OPEN", resolution: "" });
-  });
-  manifest.sessions.push(session);
-  manifest.status = getManifestCounts(manifest).outstanding === 0 ? "CONFIRMED" : "PARTIALLY_HANDED_OVER";
-  logAudit(`Serah terima ${session.id} dikonfirmasi: ${accepted.length} diterima${rejected.length ? `, ${rejected.length} ditolak` : ""}`, manifest.id);
-  const saved = await persist();
-  if (!saved) return;
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    if (response.status === 409 || response.status === 404) {
+      await hydrateStateFromServer();
+      renderPage();
+    }
+    toast(result.error || "Serah terima ditolak oleh server.", true);
+    return;
+  }
+  await hydrateStateFromServer();
   toast(`Serah terima tersimpan untuk ${accepted.length} paket.`);
   renderPage();
 }
@@ -1177,6 +1175,45 @@ function renderReports() {
     <div class="report-summary"><div class="report-card"><span>Paket direncanakan</span><strong>${totals.planned}</strong></div><div class="report-card"><span>Diterima kurir</span><strong>${totals.handed}</strong></div><div class="report-card"><span>Batal setelah pickup</span><strong>${totals.cancelledAfter}</strong></div><div class="report-card"><span>Dalam retur</span><strong>${totals.inReturn}</strong></div><div class="report-card"><span>Retur diterima</span><strong>${totals.returned}</strong></div><div class="report-card"><span>Efektif terkirim</span><strong>${totals.effective}</strong></div></div>
     <section class="panel"><div class="panel-heading"><div><h2>Rekonsiliasi per manifest</h2><p>Setiap kategori dihitung dari status paket dan riwayat handover.</p></div></div>${rows ? `<div class="table-wrap"><table><thead><tr><th>MANIFEST</th><th>TOKO</th><th>KURIR</th><th>JADWAL</th><th>RENCANA</th><th>DIPINDAI</th><th>DITERIMA</th><th>BATAL/RETUR</th><th>SELISIH</th><th>STATUS</th></tr></thead><tbody>${rows}</tbody></table></div>` : emptyState("chart-no-axes-column-increasing", "Belum ada data", "Data rekonsiliasi akan tampil setelah manifest dibuat.")}</section>
     <div class="footer-note">Ekspor memuat nomor pesanan, resi, toko, kurir, jadwal, status paket, kejadian pembatalan/retur terakhir, dan manifest. Data pelanggan yang tidak diperlukan tidak disertakan.</div>`;
+}
+
+async function renderQuarantine() {
+  content.innerHTML = `${pageHeading("PEMULIHAN DATA", "Quarantine recovery", "Tinjau payload state yang gagal dibaca sebelum melakukan recovery eksplisit.")}<section class="panel"><div class="panel-heading"><div><h2>Daftar quarantine</h2><p>Hanya tenant yang diizinkan yang ditampilkan.</p></div><span class="cell-secondary">Memuat...</span></div></section>`;
+  try {
+    const response = await apiFetch("/api/admin/quarantine");
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "Quarantine tidak dapat dimuat.");
+    const rows = data.quarantine.map((row) => `<tr><td><span class="cell-primary mono">${escapeHtml(row.id)}</span><span class="cell-secondary">${formatDateTime(row.createdAt)}</span></td><td>${escapeHtml(row.tenantId)}</td><td>${escapeHtml(row.reason)}</td><td class="mono">${escapeHtml(row.payloadHash.slice(0, 12))}...</td><td><button class="table-action" data-action="view-quarantine" data-id="${escapeHtml(row.id)}"><i data-lucide="eye"></i> Tinjau</button></td></tr>`).join("");
+    content.innerHTML = `${pageHeading("PEMULIHAN DATA", "Quarantine recovery", "Tinjau payload state yang gagal dibaca sebelum melakukan recovery eksplisit.")}<section class="panel"><div class="panel-heading"><div><h2>Daftar quarantine</h2><p>Recovery tidak pernah otomatis.</p></div><span class="status-pill">${data.quarantine.length} catatan</span></div>${data.quarantine.length ? `<div class="table-wrap"><table><thead><tr><th>ID / WAKTU</th><th>TENANT</th><th>ALASAN</th><th>HASH</th><th>AKSI</th></tr></thead><tbody>${rows}</tbody></table></div>` : emptyState("shield-alert", "Tidak ada quarantine", "State yang valid tidak memerlukan recovery.")}</section>`;
+    renderIcons(content);
+  } catch (error) {
+    content.innerHTML = `${pageHeading("PEMULIHAN DATA", "Quarantine recovery", "Tinjau payload state yang gagal dibaca sebelum melakukan recovery eksplisit.")}<section class="panel">${emptyState("shield-alert", "Quarantine tidak tersedia", error.message)}</section>`;
+  }
+}
+
+async function showQuarantine(id) {
+  const response = await apiFetch(`/api/admin/quarantine/${encodeURIComponent(id)}`);
+  const data = await response.json();
+  if (!response.ok) return toast(data.error || "Quarantine tidak ditemukan.", true);
+  const quarantine = data.quarantine;
+  const preview = quarantine.preview ? `<div class="event-detail-grid"><div><span>Manifest</span><strong>${quarantine.preview.manifestCount}</strong></div><div><span>Paket</span><strong>${quarantine.preview.packageCount}</strong></div><div><span>Insiden</span><strong>${quarantine.preview.incidentCount}</strong></div><div><span>Audit</span><strong>${quarantine.preview.auditCount}</strong></div></div><p class="field-help">Manifest IDs: ${quarantine.preview.manifestIds.map(escapeHtml).join(", ") || "-"}</p>` : `<p class="row-error">${escapeHtml(quarantine.error || "Payload tidak valid.")}</p>`;
+  const history = data.history && data.history.length ? data.history.map((entry) => `<div class="history-session"><div><strong>${escapeHtml(entry.action)}</strong><small>${formatDateTime(entry.createdAt)} · ${escapeHtml(entry.actorName)}</small></div></div>`).join("") : '<p class="page-subtitle">Belum ada riwayat recovery.</p>';
+  openModal("Detail quarantine", `${quarantine.id} · ${quarantine.tenantId}`, `<div class="help-copy"><p><strong>Alasan:</strong> ${escapeHtml(quarantine.reason)}</p><p class="mono">Hash: ${escapeHtml(quarantine.payloadHash)}</p>${preview}<p><strong>Riwayat recovery</strong></p>${history}</div><div class="modal-actions"><button type="button" class="button button-secondary" data-action="close-modal">Tutup</button>${quarantine.valid ? `<button type="button" class="button button-primary" data-action="recover-quarantine" data-id="${escapeHtml(quarantine.id)}" data-hash="${escapeHtml(quarantine.payloadHash)}"><i data-lucide="rotate-ccw"></i> Pulihkan</button>` : ""}</div>`);
+}
+
+async function recoverQuarantine(id, payloadHash) {
+  if (!window.confirm(`Pulihkan quarantine ${id}? State aktif akan disalin ke quarantine terlebih dahulu.`)) return;
+  const response = await apiFetch(`/api/admin/quarantine/${encodeURIComponent(id)}/recover`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ confirm: true, expectedPayloadHash: payloadHash }),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) return toast(data.error || "Recovery gagal.", true);
+  closeModal();
+  await hydrateStateFromServer();
+  toast("Quarantine berhasil dipulihkan.");
+  renderQuarantine();
 }
 
 function renderAudit() {
@@ -1469,6 +1506,8 @@ document.addEventListener("click", async (event) => {
     else if (name === "export-audit") { if (!hasAccess('audit')) return toast('Anda tidak memiliki izin untuk melihat audit log.', true); exportAudit(); }
     else if (name === "export-failed") exportFailedRows(id);
     else if (name === "view-evidence") showEvidence(id);
+    else if (name === "view-quarantine") showQuarantine(id);
+    else if (name === "recover-quarantine") recoverQuarantine(id, action.dataset.hash);
     else if (name === "new-employee") { if (!hasAccess('employees')) return toast('Hanya Platform Admin yang dapat mengelola karyawan.', true); openEmployeeModal(); }
     else if (name === "edit-employee") { if (!hasAccess('employees')) return toast('Hanya Platform Admin yang dapat mengelola karyawan.', true); openEmployeeModal(id); }
     else if (name === "deactivate-employee") { if (!hasAccess('employees')) return toast('Hanya Platform Admin yang dapat mengelola karyawan.', true); deactivateEmployee(id).catch((error) => toast(error.message, true)); }

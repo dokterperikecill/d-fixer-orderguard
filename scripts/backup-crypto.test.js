@@ -41,3 +41,24 @@ test('backup encryption rejects a wrong key and invalid key format', async () =>
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('key rotation restores an old backup with the previous key and rejects the new key', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orderguard-rotation-'));
+  const plain = path.join(directory, 'source.dump');
+  const encrypted = path.join(directory, 'source.dump.enc');
+  const restored = path.join(directory, 'restored.dump');
+  const rejected = path.join(directory, 'rejected.dump');
+  const previousKey = 'c'.repeat(64);
+  const currentKey = 'd'.repeat(64);
+  fs.writeFileSync(plain, 'backup before key rotation');
+  try {
+    const metadata = await encryptFile(plain, encrypted, previousKey);
+    assert.equal(metadata.keyId, keyId(decodeKey(previousKey)));
+    assert.notEqual(metadata.keyId, keyId(decodeKey(currentKey)));
+    await decryptFile(encrypted, restored, previousKey, metadata);
+    assert.deepEqual(fs.readFileSync(restored), fs.readFileSync(plain));
+    await assert.rejects(() => decryptFile(encrypted, rejected, currentKey, metadata), /authentication|unable|bad decrypt|tag|ciphertext/i);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});

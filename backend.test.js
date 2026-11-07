@@ -1850,6 +1850,33 @@ test('database has tenant foreign keys, operational indexes, and rejects orphan 
       ),
       (error) => error.code === '23503',
     );
+    const now = new Date().toISOString();
+    await testDatabase.query(`INSERT INTO "${server.schema}".tenants (id, name, created_at, updated_at) VALUES ($1, $2, $3, $4)`, ['tenant-extra', 'Tenant Extra', now, now]);
+    await assert.rejects(
+      testDatabase.query(
+        `INSERT INTO "${server.schema}".tiktok_oauth_states (state_hash, tenant_id, user_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5)`,
+        ['cross-tenant-state', 'tenant-extra', 'admin', now, now],
+      ),
+      (error) => error.code === '23503',
+    );
+    await testDatabase.query(
+      `INSERT INTO "${server.schema}".tiktok_connections (id, tenant_id, open_id, access_token, refresh_token, access_token_expires_at, refresh_token_expires_at, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      ['cross-conn', 'dfixer-store', 'cross-open', 'access', 'refresh', 1, 1, now, now],
+    );
+    await assert.rejects(
+      testDatabase.query(
+        `INSERT INTO "${server.schema}".tiktok_shops (id, tenant_id, connection_id, shop_id, shop_cipher, name, region, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        ['cross-shop', 'tenant-extra', 'cross-conn', 'cross-shop-id', 'cipher', 'Cross Shop', '', now],
+      ),
+      (error) => error.code === '23503',
+    );
+    await testDatabase.query(
+      `INSERT INTO "${server.schema}".sessions (token_hash, user_id, csrf_token, expires_at, created_at) VALUES ($1, $2, $3, $4, $5)`,
+      ['session-for-tenant-change', 'admin', 'csrf', new Date(Date.now() + 60000).toISOString(), now],
+    );
+    await testDatabase.query(`UPDATE "${server.schema}".users SET tenant_id = $1 WHERE id = $2`, ['tenant-extra', 'admin']);
+    const sessionsAfterTenantChange = await testDatabase.query(`SELECT COUNT(*)::INTEGER AS count FROM "${server.schema}".sessions WHERE user_id = $1`, ['admin']);
+    assert.equal(sessionsAfterTenantChange.rows[0].count, 0);
   } finally {
     await stopTestServer(server);
   }
@@ -1968,6 +1995,78 @@ test('quarantine recovery is tenant-scoped, explicit, audited, and rollback-safe
     assert.equal(invalidRecover.status, 422);
     const unchanged = await readStateForTest(port, admin);
     assert.equal(unchanged.state.incidents.some((incident) => incident.id === 'INC-AUTH-QUARANTINE-RECOVERY'), true);
+  } finally {
+    await stopTestServer(server);
+  }
+});
+
+test('operational scan and handover endpoints are transactional, audited, and tenant-scoped', async () => {
+  const port = 4342;
+  const server = await createTestServer(port);
+
+  try {
+    await waitForServer(port);
+    const handover = await loginCookie(port, 'handover', 'handover123');
+    const base = await readStateForTest(port, handover);
+    const manifest = base.state.manifests.find((item) => item.packages.filter((parcel) => parcel.status === 'EXPECTED').length >= 2 && item.packages.some((parcel) => parcel.status === 'SCANNED'));
+    const expected = manifest.packages.filter((parcel) => parcel.status === 'EXPECTED').slice(0, 2);
+    const scanResponses = await Promise.all(expected.map((parcel) => fetch(`http://127.0.0.1:${port}/api/manifests/${encodeURIComponent(manifest.id)}/scans`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${handover}` },
+      body: JSON.stringify({ tracking: parcel.tracking }),
+    })));
+    assert.deepEqual(scanResponses.map((response) => response.status), [201, 201]);
+    let current = await readStateForTest(port, handover);
+    let currentManifest = current.state.manifests.find((item) => item.id === manifest.id);
+    for (const parcel of expected) {
+      assert.equal(currentManifest.packages.find((item) => item.tracking === parcel.tracking).status, 'SCANNED');
+      assert.equal(currentManifest.scans.some((scan) => scan.tracking === parcel.tracking && scan.result === 'MATCH'), true);
+      assert.equal(current.state.audit.some((entry) => entry.action === `Paket dipindai: ${parcel.tracking}`), true);
+    }
+
+    const duplicate = await fetch(`http://127.0.0.1:${port}/api/manifests/${encodeURIComponent(manifest.id)}/scans`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${handover}` },
+      body: JSON.stringify({ tracking: expected[0].tracking }),
+    });
+    assert.equal(duplicate.status, 201);
+    assert.equal((await duplicate.json()).result, 'DUPLICATE_SCAN');
+    current = await readStateForTest(port, handover);
+    currentManifest = current.state.manifests.find((item) => item.id === manifest.id);
+    assert.equal(currentManifest.packages.filter((item) => item.tracking === expected[0].tracking).length, 1);
+    assert.equal(currentManifest.scans.some((scan) => scan.tracking === expected[0].tracking && scan.result === 'DUPLICATE_SCAN'), true);
+
+    const accepted = currentManifest.packages.filter((item) => item.status === 'SCANNED').slice(0, 2).map((item) => item.tracking);
+    const handoverResponse = await fetch(`http://127.0.0.1:${port}/api/manifests/${encodeURIComponent(manifest.id)}/handovers`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${handover}` },
+      body: JSON.stringify({ receiver: 'Kurir Endpoint', items: accepted, note: 'Endpoint test', evidence: 'data:image/png;base64,iVBORw0KGgo=' }),
+    });
+    assert.equal(handoverResponse.status, 201, JSON.stringify(await handoverResponse.clone().json().catch(() => ({}))));
+    const handoverBody = await handoverResponse.json();
+    assert.ok(handoverBody.sessionId);
+    current = await readStateForTest(port, handover);
+    currentManifest = current.state.manifests.find((item) => item.id === manifest.id);
+    assert.equal(currentManifest.sessions.some((session) => session.id === handoverBody.sessionId), true);
+    assert.equal(currentManifest.packages.filter((item) => accepted.includes(item.tracking)).every((item) => item.status === 'HANDED_OVER'), true);
+    assert.equal(current.state.audit.some((entry) => entry.action.startsWith(`Serah terima ${handoverBody.sessionId} dikonfirmasi:`)), true);
+
+    const admin = await loginCookie(port, 'admin', 'admin123');
+    const adminBase = await readStateForTest(port, admin);
+    const isolatedManifestState = wave2ManifestState(adminBase.state, 'OG-ENDPOINT-DFIXER', 'TRK-ENDPOINT-DFIXER', 'ENDPOINT');
+    const createIsolated = await fetch(`http://127.0.0.1:${port}/api/state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${admin}`, 'If-Match': `"state-${adminBase.version}"` },
+      body: JSON.stringify(isolatedManifestState),
+    });
+    assert.equal(createIsolated.status, 200);
+    const maya = await loginCookie(port, 'maya', 'maya123');
+    const crossTenant = await fetch(`http://127.0.0.1:${port}/api/manifests/OG-ENDPOINT-DFIXER/scans`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${maya}` },
+      body: JSON.stringify({ tracking: 'TRK-ENDPOINT-DFIXER' }),
+    });
+    assert.equal(crossTenant.status, 404);
   } finally {
     await stopTestServer(server);
   }

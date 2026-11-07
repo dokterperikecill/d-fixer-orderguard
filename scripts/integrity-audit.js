@@ -7,7 +7,7 @@ const db = createPool();
   try {
     const report = await auditIntegrity(db);
     console.log(JSON.stringify({ generatedAt: new Date().toISOString(), ...report }, null, 2));
-    if (report.orphans.length || report.duplicateManifests.length) process.exitCode = 2;
+    if (report.orphans.length || report.crossTenantReferences.length || report.duplicateManifests.length) process.exitCode = 2;
   } finally {
     await db.pool.end();
   }
