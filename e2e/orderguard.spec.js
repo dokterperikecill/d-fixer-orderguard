@@ -103,7 +103,7 @@ test.describe.serial('OrderGuard browser E2E', () => {
     await page.locator('#import-file').setInputFiles(writeCsv());
     await expect(page.locator('#import-preview')).toContainText('Siap dimanifestkan');
     await page.locator('[data-action="commit-import"]').click();
-    await expect(page.locator('.toast')).toContainText(/paket dimasukkan|Impor/i);
+    await expect(page.locator('.toast').filter({ hasText: /paket dimasukkan|Impor/i })).toBeVisible();
     let state = await stateFromApi(page);
     expect(state.manifests.some((manifest) => manifest.packages.some((parcel) => parcel.tracking === 'TRK-E2E-CSV-001'))).toBeTruthy();
 
@@ -111,7 +111,7 @@ test.describe.serial('OrderGuard browser E2E', () => {
     await page.locator('#import-file').setInputFiles(writeXlsx(testInfo));
     await expect(page.locator('#import-preview')).toContainText('Siap dimanifestkan', { timeout: 30_000 });
     await page.locator('[data-action="commit-import"]').click();
-    await expect(page.locator('.toast')).toContainText(/paket dimasukkan|Impor/i);
+    await expect(page.locator('.toast').filter({ hasText: /paket dimasukkan|Impor/i })).toBeVisible();
     state = await stateFromApi(page);
     expect(state.manifests.some((manifest) => manifest.packages.some((parcel) => parcel.tracking === 'TRK-E2E-XLSX-001'))).toBeTruthy();
   });
@@ -139,7 +139,7 @@ test.describe.serial('OrderGuard browser E2E', () => {
     await page.locator('#handover-photo').setInputFiles(writePhoto());
     page.once('dialog', (dialog) => dialog.accept());
     await page.locator('#handover-form button[type="submit"]').click();
-    await expect(page.locator('.toast')).toContainText(/Serah terima tersimpan/i);
+    await expect(page.locator('.toast').filter({ hasText: /Serah terima tersimpan/i })).toBeVisible();
 
     await page.locator('[data-action="view-evidence"]').first().click();
     await expect(page.locator('#evidence-modal-content img')).toBeVisible();
@@ -147,7 +147,7 @@ test.describe.serial('OrderGuard browser E2E', () => {
 
     page.once('dialog', (dialog) => dialog.accept());
     await page.locator('[data-action="close-manifest"]').click();
-    await expect(page.locator('.toast')).toContainText(/Manifest ditutup/i);
+    await expect(page.locator('.toast').filter({ hasText: /Manifest ditutup/i })).toBeVisible();
   });
 
   test('reports are available after operational activity', async ({ page }) => {
@@ -182,7 +182,7 @@ test.describe.serial('OrderGuard browser E2E', () => {
     await expect(page.locator('#modal')).toContainText('Pulihkan');
     page.once('dialog', (dialog) => dialog.accept());
     await page.locator('[data-action="recover-quarantine"]').click();
-    await expect(page.locator('.toast')).toContainText(/berhasil dipulihkan/i);
+    await expect(page.locator('.toast').filter({ hasText: /berhasil dipulihkan/i })).toBeVisible();
     const after = await stateFromApi(page);
     expect(after.incidents.some((item) => item.id === 'INC-E2E-QUARANTINE')).toBeTruthy();
 
