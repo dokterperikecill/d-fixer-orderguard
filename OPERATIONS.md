@@ -238,3 +238,86 @@ Jangan gunakan opsi tersebut pada production.
   ```
 
 - Index tambahan tersedia untuk session, audit, user tenant, manifest registry, dan quarantine.
+
+## Audit Integritas & Rekonsiliasi
+
+Audit bersifat read-only dan tidak menghapus data:
+
+```sh
+DATABASE_URL="postgresql://user:password@host:5432/orderguard" npm run db:integrity:audit
+```
+
+Audit memeriksa foreign key `NOT VALID`, orphan record, dan manifest ID duplikat. Rekonsiliasi default dry-run:
+
+```sh
+DATABASE_URL="..." npm run db:integrity:reconcile
+```
+
+Untuk menerapkan pemindahan orphan ke `integrity_orphans` dan validasi FK:
+
+```sh
+DATABASE_URL="..." npm run db:integrity:reconcile -- --apply --confirm orderguard
+```
+
+- Tanpa `--apply --confirm <nama-database>`, tidak ada perubahan.
+- Orphan disalin ke `integrity_orphans` sebelum dihapus.
+- Manifest ID duplikat tidak dihapus otomatis; harus ditinjau manual.
+- `VALIDATE CONSTRAINT` dijalankan setelah orphan bersih; kegagalan membatalkan transaksi.
+- Periksa laporan sebelum dan sesudah; jangan menjalankan `--apply` pada produksi tanpa persetujuan.
+
+## Quarantine Recovery
+
+Endpoint admin:
+
+```text
+GET  /api/admin/quarantine
+GET  /api/admin/quarantine/:id
+POST /api/admin/quarantine/:id/recover   { "confirm": true, "expectedPayloadHash": "..." }
+```
+
+- Super Admin dapat melihat seluruh tenant; Store Admin hanya tenant sendiri.
+- Preview tidak mengembalikan payload mentah; hanya ringkasan dan status validitas.
+- Recovery memerlukan konfirmasi eksplisit dan CSRF token.
+- Payload harus JSON valid, manifest ID unik/format valid, dan evidence valid.
+- State aktif sebelum recovery disalin ke `state_quarantine`.
+- Recovery berjalan dalam transaksi; kegagalan rollback.
+- Audit recovery disimpan append-only di `quarantine_recovery_audit`; trigger database menolak UPDATE/DELETE.
+- Tidak ada recovery otomatis.
+
+Retensi quarantine dapat dijalankan manual:
+
+```sh
+ORDERGUARD_QUARANTINE_RETENTION_DAYS=90 DATABASE_URL="..." npm run db:prune-quarantine
+# setelah review:
+ORDERGUARD_QUARANTINE_RETENTION_DAYS=90 DATABASE_URL="..." npm run db:prune-quarantine -- --apply --confirm orderguard
+```
+
+Quarantine yang sudah memiliki audit recovery tidak dihapus oleh prune.
+
+## Backup Encryption, Offsite, RPO/RTO
+
+Backup terenkripsi wajib memakai:
+
+```sh
+ORDERGUARD_BACKUP_ENCRYPTION_KEY="<32-byte-hex-64-char-atau-base64>"
+```
+
+- Algoritma: AES-256-GCM; IV acak per backup; authentication tag disimpan di metadata.
+- Checksum ciphertext dan plaintext disimpan di `.sha256`/`.meta.json`.
+- Kunci tidak pernah dicetak ke log dan tidak boleh disimpan di repository.
+- Restore mendukung `ORDERGUARD_BACKUP_PREVIOUS_ENCRYPTION_KEYS` (dipisahkan koma) untuk rotasi kunci.
+- `ORDERGUARD_BACKUP_OFFSITE_DIR` menyalin backup terverifikasi ke direktori mount/off-site; kegagalan off-site tidak menghapus backup lokal.
+- Backup lokal/off-site lama tidak dihapus sebelum backup baru lolos verifikasi.
+- Retensi: `ORDERGUARD_BACKUP_KEEP` (default 30).
+- Untuk mode development tanpa enkripsi, set `ORDERGUARD_BACKUP_ALLOW_PLAINTEXT=1`; jangan gunakan di production.
+
+**Prosedur rotasi key:**
+
+1. Buat key baru dan simpan sebagai secret.
+2. Pindahkan key lama ke `ORDERGUARD_BACKUP_PREVIOUS_ENCRYPTION_KEYS`, set key baru sebagai `ORDERGUARD_BACKUP_ENCRYPTION_KEY`.
+3. Backup baru memakai key baru; backup lama tetap dapat direstore memakai key sebelumnya.
+4. Setelah semua backup lama dipensiunkan, hapus key lama dari environment.
+
+**Scheduler:** `render.yaml` menyediakan cron job harian pukul 02:00 untuk `npm run db:backup`. Backup harus disalin off-site; disk Render tidak boleh menjadi satu-satunya lokasi.
+
+**RPO/RTO target:** RPO ≤ 24 jam dengan jadwal harian (perpendek jadwal bila diperlukan); RTO target ≤ 2 jam dengan restore terverifikasi ke database terpisah. Angka ini adalah target operasional, bukan jaminan; ukur ulang sesuai ukuran database dan kecepatan storage.

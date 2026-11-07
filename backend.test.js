@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
 const { Pool } = require('pg');
+const crypto = require('node:crypto');
 
 // Test helper: keep CSRF handling out of individual test calls while still
 // exercising the real server-side CSRF checks in dedicated negative tests.
@@ -1882,6 +1883,91 @@ test('official manifest close workflow remains allowed after final-state guards'
     assert.equal(response.status, 200, JSON.stringify(await response.clone().json().catch(() => ({}))));
     const after = await readStateForTest(port, cookie);
     assert.equal(after.state.manifests.find((manifest) => manifest.id === target.id).status, 'CLOSED');
+  } finally {
+    await stopTestServer(server);
+  }
+});
+
+test('quarantine recovery is tenant-scoped, explicit, audited, and rollback-safe', async () => {
+  const port = 4341;
+  const server = await createTestServer(port);
+
+  const quarantineHash = (payload) => crypto.createHash('sha256').update(payload).digest('hex');
+  try {
+    await waitForServer(port);
+    const admin = await loginCookie(port, 'admin', 'admin123');
+    const adminBase = await readStateForTest(port, admin);
+    const recoveredState = withTestIncident(adminBase.state, 'QUARANTINE-RECOVERY');
+    const payload = JSON.stringify(recoveredState);
+    await testDatabase.query(
+      `INSERT INTO "${server.schema}".state_quarantine (id, tenant_id, payload, payload_hash, reason, created_at) VALUES ($1, $2, $3, $4, $5, $6)`,
+      ['Q-W2-VALID', 'dfixer-store', payload, quarantineHash(payload), 'test quarantine', new Date().toISOString()],
+    );
+    const mayaState = await readStateForTest(port, await loginCookie(port, 'maya', 'maya123'));
+    const mayaPayload = JSON.stringify(withTestIncident(mayaState.state, 'QUARANTINE-MAYA', 'Maya Admin'));
+    await testDatabase.query(
+      `INSERT INTO "${server.schema}".state_quarantine (id, tenant_id, payload, payload_hash, reason, created_at) VALUES ($1, $2, $3, $4, $5, $6)`,
+      ['Q-W2-MAYA', 'maya-commerce', mayaPayload, quarantineHash(mayaPayload), 'test maya quarantine', new Date().toISOString()],
+    );
+
+    const adminList = await fetch(`http://127.0.0.1:${port}/api/admin/quarantine`, { headers: { Cookie: `orderguard_session=${admin}` } });
+    assert.equal(adminList.status, 200);
+    const adminListBody = await adminList.json();
+    assert.equal(adminListBody.quarantine.some((row) => row.id === 'Q-W2-MAYA'), true);
+
+    const rani = await loginCookie(port, 'rani', 'rani123');
+    const raniList = await fetch(`http://127.0.0.1:${port}/api/admin/quarantine`, { headers: { Cookie: `orderguard_session=${rani}` } });
+    assert.equal(raniList.status, 200);
+    const raniListBody = await raniList.json();
+    assert.equal(raniListBody.quarantine.some((row) => row.id === 'Q-W2-MAYA'), false);
+    const crossTenantPreview = await fetch(`http://127.0.0.1:${port}/api/admin/quarantine/Q-W2-MAYA`, { headers: { Cookie: `orderguard_session=${rani}` } });
+    assert.equal(crossTenantPreview.status, 404);
+
+    const preview = await fetch(`http://127.0.0.1:${port}/api/admin/quarantine/Q-W2-VALID`, { headers: { Cookie: `orderguard_session=${admin}` } });
+    assert.equal(preview.status, 200);
+    const previewBody = await preview.json();
+    assert.equal(previewBody.quarantine.valid, true);
+    assert.equal(previewBody.quarantine.preview.manifestCount, adminBase.state.manifests.length);
+
+    const noConfirm = await fetch(`http://127.0.0.1:${port}/api/admin/quarantine/Q-W2-VALID/recover`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${admin}` },
+      body: JSON.stringify({}),
+    });
+    assert.equal(noConfirm.status, 400);
+    assert.equal((await noConfirm.json()).code, 'RECOVERY_CONFIRMATION_REQUIRED');
+
+    const recover = await fetch(`http://127.0.0.1:${port}/api/admin/quarantine/Q-W2-VALID/recover`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${admin}` },
+      body: JSON.stringify({ confirm: true, expectedPayloadHash: quarantineHash(payload) }),
+    });
+    assert.equal(recover.status, 200, JSON.stringify(await recover.clone().json().catch(() => ({}))));
+    const after = await readStateForTest(port, admin);
+    assert.equal(after.state.incidents.some((incident) => incident.id === 'INC-AUTH-QUARANTINE-RECOVERY'), true);
+    const quarantineRows = await testDatabase.query(`SELECT COUNT(*)::INTEGER AS count FROM "${server.schema}".state_quarantine WHERE tenant_id = $1`, ['dfixer-store']);
+    assert.ok(quarantineRows.rows[0].count >= 2);
+    const recoveryAudit = await testDatabase.query(`SELECT action, before_hash, after_hash FROM "${server.schema}".quarantine_recovery_audit WHERE quarantine_id = $1`, ['Q-W2-VALID']);
+    assert.equal(recoveryAudit.rowCount, 1);
+    assert.equal(recoveryAudit.rows[0].action, 'QUARANTINE_RECOVERY');
+    assert.ok(recoveryAudit.rows[0].after_hash);
+    await assert.rejects(testDatabase.query(`UPDATE "${server.schema}".quarantine_recovery_audit SET action = 'changed'`), /append-only/);
+
+    const invalidPayload = JSON.stringify({ manifests: [{ id: 'dup', packages: [], scans: [], sessions: [] }, { id: 'dup', packages: [], scans: [], sessions: [] }], incidents: [], audit: [], importJobs: [], orderEvents: [] });
+    await testDatabase.query(
+      `INSERT INTO "${server.schema}".state_quarantine (id, tenant_id, payload, payload_hash, reason, created_at) VALUES ($1, $2, $3, $4, $5, $6)`,
+      ['Q-W2-INVALID', 'dfixer-store', invalidPayload, quarantineHash(invalidPayload), 'invalid test quarantine', new Date().toISOString()],
+    );
+    const invalidPreview = await fetch(`http://127.0.0.1:${port}/api/admin/quarantine/Q-W2-INVALID`, { headers: { Cookie: `orderguard_session=${admin}` } });
+    assert.equal((await invalidPreview.json()).quarantine.valid, false);
+    const invalidRecover = await fetch(`http://127.0.0.1:${port}/api/admin/quarantine/Q-W2-INVALID/recover`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: `orderguard_session=${admin}` },
+      body: JSON.stringify({ confirm: true }),
+    });
+    assert.equal(invalidRecover.status, 422);
+    const unchanged = await readStateForTest(port, admin);
+    assert.equal(unchanged.state.incidents.some((incident) => incident.id === 'INC-AUTH-QUARANTINE-RECOVERY'), true);
   } finally {
     await stopTestServer(server);
   }

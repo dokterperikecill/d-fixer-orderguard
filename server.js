@@ -567,6 +567,63 @@ async function seedTestDemoState() {
   }
 }
 
+function statePreview(state) {
+  return {
+    manifestCount: state.manifests.length,
+    manifestIds: state.manifests.slice(0, 100).map((manifest) => manifest.id),
+    packageCount: state.manifests.reduce((total, manifest) => total + (Array.isArray(manifest.packages) ? manifest.packages.length : 0), 0),
+    incidentCount: state.incidents.length,
+    auditCount: state.audit.length,
+    importJobCount: state.importJobs.length,
+    orderEventCount: state.orderEvents.length,
+  };
+}
+
+function validateRecoveredState(state) {
+  const ids = new Set();
+  for (const manifest of state.manifests) {
+    if (typeof manifest.id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(manifest.id)) {
+      return 'ID manifest pada payload quarantine tidak valid.';
+    }
+    if (ids.has(manifest.id)) return `ID manifest ${manifest.id} duplikat pada payload quarantine.`;
+    ids.add(manifest.id);
+  }
+  return null;
+}
+
+function parseQuarantinePayload(row) {
+  try {
+    const parsed = JSON.parse(row.payload);
+    const state = normalizeState(parsed, 'Quarantine');
+    const validationError = validateRecoveredState(state);
+    if (validationError) return { ok: false, error: validationError, state: null };
+    for (const manifest of state.manifests) {
+      for (const session of manifest.sessions) {
+        if (session.evidence !== undefined && session.evidence !== null && !Evidence.validateEvidenceDataUri(session.evidence).ok) {
+          return { ok: false, error: `Evidence sesi ${session.id || 'tanpa ID'} tidak valid.`, state: null };
+        }
+      }
+    }
+    for (const event of state.orderEvents) {
+      if (event.evidence !== undefined && event.evidence !== null && !Evidence.validateEvidenceDataUri(event.evidence).ok) {
+        return { ok: false, error: `Evidence order event ${event.id || 'tanpa ID'} tidak valid.`, state: null };
+      }
+    }
+    return { ok: true, error: '', state };
+  } catch (error) {
+    return { ok: false, error: 'Payload quarantine bukan JSON/state yang valid.', state: null };
+  }
+}
+
+async function quarantineRowForUser(req, id) {
+  const row = await db.prepare(
+    'SELECT id, tenant_id AS tenantId, payload, payload_hash AS payloadHash, reason, created_at AS createdAt FROM state_quarantine WHERE id = ?'
+  ).get(id);
+  if (!row) return null;
+  if (req.user.role !== 'super-admin' && row.tenantId !== req.user.tenantId) return null;
+  return row;
+}
+
 function parseIfMatchVersion(header) {
   if (header === undefined || header === null || header === '') return null;
   const value = String(header).trim();
@@ -1271,6 +1328,87 @@ app.get('/api/session', asyncRoute(async (req, res) => {
   }
   res.cookie('orderguard_csrf', user.csrfToken, csrfCookieOptions());
   res.json({ user: await publicUser(user), csrfToken: user.csrfToken });
+}));
+
+app.get('/api/admin/quarantine', requireAuth, requireRole(['super-admin', 'store-admin']), asyncRoute(async (req, res) => {
+  const requestedTenant = req.query.tenantId ? String(req.query.tenantId) : null;
+  const tenantId = req.user.role === 'super-admin' ? requestedTenant : req.user.tenantId;
+  const rows = tenantId
+    ? await db.prepare(
+      `SELECT id, tenant_id AS tenantId, payload_hash AS payloadHash, reason, created_at AS createdAt
+       FROM state_quarantine WHERE tenant_id = ? ORDER BY created_at DESC LIMIT 200`
+    ).all(tenantId)
+    : await db.prepare(
+      `SELECT id, tenant_id AS tenantId, payload_hash AS payloadHash, reason, created_at AS createdAt
+       FROM state_quarantine ORDER BY created_at DESC LIMIT 200`
+    ).all();
+  res.json({ quarantine: rows });
+}));
+
+app.get('/api/admin/quarantine/:id', requireAuth, requireRole(['super-admin', 'store-admin']), asyncRoute(async (req, res) => {
+  const row = await quarantineRowForUser(req, req.params.id);
+  if (!row) return res.status(404).json({ error: 'Quarantine tidak ditemukan.' });
+  const parsed = parseQuarantinePayload(row);
+  res.json({
+    quarantine: {
+      id: row.id,
+      tenantId: row.tenantId,
+      payloadHash: row.payloadHash,
+      reason: row.reason,
+      createdAt: row.createdAt,
+      valid: parsed.ok,
+      error: parsed.ok ? '' : parsed.error,
+      preview: parsed.ok ? statePreview(parsed.state) : null,
+    },
+  });
+}));
+
+app.post('/api/admin/quarantine/:id/recover', requireAuth, requireRole(['super-admin', 'store-admin']), requireCsrf, asyncRoute(async (req, res) => {
+  if (req.body?.confirm !== true) {
+    return res.status(400).json({ error: 'Konfirmasi recovery diperlukan.', code: 'RECOVERY_CONFIRMATION_REQUIRED' });
+  }
+  const row = await quarantineRowForUser(req, req.params.id);
+  if (!row) return res.status(404).json({ error: 'Quarantine tidak ditemukan.' });
+  const tenant = await getTenant(row.tenantId);
+  if (!tenant) return res.status(422).json({ error: 'Tenant tujuan quarantine tidak ditemukan.', code: 'TENANT_NOT_FOUND' });
+  const parsed = parseQuarantinePayload(row);
+  if (!parsed.ok) return res.status(422).json({ error: parsed.error, code: 'INVALID_QUARANTINE_PAYLOAD' });
+
+  const beforeHash = req.body?.expectedPayloadHash ? String(req.body.expectedPayloadHash) : null;
+  if (beforeHash && beforeHash !== row.payloadHash) {
+    return res.status(409).json({ error: 'Payload quarantine telah berubah. Muat ulang preview.', code: 'QUARANTINE_HASH_MISMATCH' });
+  }
+
+  const mutation = await db.transaction(async (tx) => {
+    await tx.prepare('SELECT pg_advisory_xact_lock(hashtext(?::text), hashtext(?::text))')
+      .get('orderguard:tenant-state', row.tenantId);
+    const current = await tx.prepare('SELECT payload, version FROM tenant_state WHERE tenant_id = ? FOR UPDATE').get(row.tenantId);
+    const currentHash = current ? hashOpaqueValue(current.payload) : null;
+    if (current) {
+      await tx.prepare(
+        'INSERT INTO state_quarantine (id, tenant_id, payload, payload_hash, reason, created_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (tenant_id, payload_hash) DO NOTHING'
+      ).run(crypto.randomUUID(), row.tenantId, current.payload, currentHash, `Pre-recovery snapshot for ${row.id}`, new Date().toISOString());
+    }
+    const nextVersion = current
+      ? Number((await tx.prepare('UPDATE tenant_state SET payload = ?, version = version + 1, updated_at = ? WHERE tenant_id = ? RETURNING version')
+        .get(JSON.stringify(parsed.state), new Date().toISOString(), row.tenantId)).version)
+      : 1;
+    if (!current) {
+      await tx.prepare('INSERT INTO tenant_state (tenant_id, payload, version, updated_at) VALUES (?, ?, 1, ?)')
+        .run(row.tenantId, JSON.stringify(parsed.state), new Date().toISOString());
+    }
+    await registerManifestIds(tx, row.tenantId, parsed.state);
+    const afterHash = hashOpaqueValue(JSON.stringify(parsed.state));
+    const now = new Date().toISOString();
+    await tx.prepare(
+      'INSERT INTO quarantine_recovery_audit (id, quarantine_id, tenant_id, actor_id, actor_name, action, before_hash, after_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    ).run(crypto.randomUUID(), row.id, row.tenantId, req.user.id, req.user.name, 'QUARANTINE_RECOVERY', currentHash, afterHash, now);
+    await tx.prepare('INSERT INTO tenant_audit (id, actor_id, actor_name, tenant_id, action, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(crypto.randomUUID(), req.user.id, req.user.name, row.tenantId, `Quarantine recovery: ${row.id}`, now);
+    return { version: nextVersion, afterHash, beforeHash: currentHash };
+  });
+
+  res.json({ ok: true, quarantineId: row.id, tenantId: row.tenantId, version: mutation.version, beforeHash: mutation.beforeHash, afterHash: mutation.afterHash });
 }));
 
 app.post('/api/tenants', requireAuth, requireRole(['super-admin']), requireCsrf, asyncRoute(async (req, res) => {

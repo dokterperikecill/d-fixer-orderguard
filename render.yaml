@@ -39,3 +39,25 @@ services:
         sync: false
       - key: ORDERGUARD_TOKEN_ENCRYPTION_KEY
         sync: false
+  - type: cron
+    name: dfixer-orderguard-backup
+    runtime: node
+    plan: starter
+    schedule: "0 2 * * *"
+    buildCommand: npm ci
+    startCommand: npm run db:backup
+    envVars:
+      - key: NODE_VERSION
+        value: 24
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: ORDERGUARD_BACKUP_ENCRYPTION_KEY
+        sync: false
+      - key: ORDERGUARD_BACKUP_DIR
+        sync: false
+      - key: ORDERGUARD_BACKUP_OFFSITE_DIR
+        sync: false
+      - key: ORDERGUARD_BACKUP_KEEP
+        value: "30"

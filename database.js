@@ -35,6 +35,30 @@ const SCHEMA = `
     UNIQUE (tenant_id, payload_hash)
   );
   CREATE INDEX IF NOT EXISTS state_quarantine_tenant_created_idx ON state_quarantine (tenant_id, created_at DESC);
+  CREATE TABLE IF NOT EXISTS quarantine_recovery_audit (
+    id TEXT PRIMARY KEY,
+    quarantine_id TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    actor_name TEXT NOT NULL,
+    action TEXT NOT NULL,
+    before_hash TEXT,
+    after_hash TEXT,
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS quarantine_recovery_audit_tenant_idx ON quarantine_recovery_audit (tenant_id, created_at DESC);
+  CREATE TABLE IF NOT EXISTS integrity_orphans (
+    id TEXT PRIMARY KEY,
+    source_table TEXT NOT NULL,
+    source_key TEXT NOT NULL,
+    tenant_id TEXT,
+    payload TEXT NOT NULL,
+    payload_hash TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (source_table, source_key, payload_hash)
+  );
+  CREATE INDEX IF NOT EXISTS integrity_orphans_created_idx ON integrity_orphans (created_at DESC);
   CREATE INDEX IF NOT EXISTS tenant_manifest_ids_tenant_idx ON tenant_manifest_ids (tenant_id);
   CREATE TABLE IF NOT EXISTS tenant_audit (
     id TEXT PRIMARY KEY,
@@ -188,6 +212,24 @@ const MIGRATIONS = [
   `DO $$ BEGIN
     ALTER TABLE auth_audit ADD CONSTRAINT auth_audit_user_fk
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL NOT VALID;
+  EXCEPTION WHEN duplicate_object THEN NULL; END $$`,
+  `DO $$ BEGIN
+    ALTER TABLE quarantine_recovery_audit ADD CONSTRAINT quarantine_recovery_audit_tenant_fk
+      FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE RESTRICT NOT VALID;
+  EXCEPTION WHEN duplicate_object THEN NULL; END $$`,
+  `DO $$ BEGIN
+    ALTER TABLE quarantine_recovery_audit ADD CONSTRAINT quarantine_recovery_audit_quarantine_fk
+      FOREIGN KEY (quarantine_id) REFERENCES state_quarantine(id) ON DELETE RESTRICT NOT VALID;
+  EXCEPTION WHEN duplicate_object THEN NULL; END $$`,
+  `DO $$ BEGIN
+    ALTER TABLE integrity_orphans ADD CONSTRAINT integrity_orphans_tenant_fk
+      FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE SET NULL NOT VALID;
+  EXCEPTION WHEN duplicate_object THEN NULL; END $$`,
+  `CREATE OR REPLACE FUNCTION prevent_quarantine_audit_mutation() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'quarantine_recovery_audit is append-only'; END; $$`,
+  `DO $$ BEGIN
+    CREATE TRIGGER quarantine_recovery_audit_immutable
+      BEFORE UPDATE OR DELETE ON quarantine_recovery_audit
+      FOR EACH ROW EXECUTE FUNCTION prevent_quarantine_audit_mutation();
   EXCEPTION WHEN duplicate_object THEN NULL; END $$`,
 ];
 
