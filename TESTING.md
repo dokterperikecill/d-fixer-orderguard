@@ -1,5 +1,7 @@
 # Panduan Pengujian
 
+> Jalankan `npm test`, `npm run e2e`, dan `npm run load` secara berurutan. Ketiganya memakai database test dan resource lokal yang sama; eksekusi paralel dapat menyebabkan kegagalan karena contention, bukan karena defect aplikasi.
+
 ## Backend dan unit test
 
 ```sh
