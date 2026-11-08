@@ -1,0 +1,71 @@
+# Render Blueprint untuk STAGING.
+# File ini sengaja tidak bernama render.yaml di root agar tidak mengubah blueprint produksi.
+# Jangan deploy sebelum audit staging disetujui.
+#
+# Catatan:
+# - NODE_ENV=production dipakai agar cookie Secure, HSTS, dan pemeriksaan akun demo
+#   berperilaku seperti produksi. Staging tetap terisolasi lewat project, database,
+#   bucket, key, domain, dan kredensial terpisah.
+# - autoDeploy dimatikan; deploy harus manual dari commit yang CI-nya hijau.
+# - Nilai sync:false diisi manual di dashboard/secret manager. Jangan commit secret.
+# - Backup runner tidak didefinisikan di sini karena image Node native belum tentu
+#   memiliki pg_dump/aws/rclone. Lihat staging/BACKUP-RUNNER.md.
+
+databases:
+  - name: dfixer-orderguard-staging-db
+    databaseName: orderguard_staging
+    user: orderguard_staging
+    plan: basic-256mb
+    region: singapore
+    # Pin major version yang sama dengan produksi. Jika properti ini tidak didukung
+    # oleh akun Render, set versi 16 melalui dashboard.
+    postgresMajorVersion: "16"
+
+services:
+  - type: web
+    name: dfixer-orderguard-staging
+    runtime: node
+    plan: starter
+    region: singapore
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /api/health
+    autoDeploy: false
+    envVars:
+      - key: NODE_VERSION
+        value: "24"
+      - key: NODE_ENV
+        value: production
+      - key: ORDERGUARD_TRUST_PROXY
+        value: "1"
+      - key: ORDERGUARD_ALLOWED_ORIGINS
+        sync: false
+      - key: ORDERGUARD_SESSION_HOURS
+        value: "8"
+      - key: ORDERGUARD_LOGIN_WINDOW_MINUTES
+        value: "15"
+      - key: ORDERGUARD_LOGIN_MAX_ATTEMPTS
+        value: "5"
+      - key: ORDERGUARD_LOGIN_MAX_IP_ATTEMPTS
+        value: "20"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: dfixer-orderguard-staging-db
+          property: connectionString
+      # Hanya untuk database kosong. Hapus ORDERGUARD_BOOTSTRAP_PASSWORD
+      # setelah admin pertama berhasil dibuat.
+      - key: ORDERGUARD_BOOTSTRAP_USERNAME
+        sync: false
+      - key: ORDERGUARD_BOOTSTRAP_NAME
+        sync: false
+      - key: ORDERGUARD_BOOTSTRAP_PASSWORD
+        sync: false
+      # Kosongkan jika integrasi TikTok belum diuji di staging.
+      - key: TIKTOK_APP_KEY
+        sync: false
+      - key: TIKTOK_APP_SECRET
+        sync: false
+      - key: TIKTOK_REDIRECT_URI
+        sync: false
+      - key: ORDERGUARD_TOKEN_ENCRYPTION_KEY
+        sync: false
