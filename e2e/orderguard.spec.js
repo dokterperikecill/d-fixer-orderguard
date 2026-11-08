@@ -238,11 +238,13 @@ test.describe.serial('OrderGuard browser E2E', () => {
     await page.reload();
     const result = await page.evaluate(async () => {
       const registration = await navigator.serviceWorker.ready;
-      return { scriptURL: registration.active?.scriptURL || '', caches: await caches.keys() };
+      return { scriptURL: registration.active?.scriptURL || '' };
     });
     expect(result.scriptURL).toContain('/service-worker.js');
-    expect(result.caches).toContain('dfixer-orderguard-shell-v10');
-    expect(result.caches).not.toContain('dfixer-orderguard-shell-v9');
+    await expect.poll(async () => {
+      const caches = await page.evaluate(() => caches.keys());
+      return { hasCurrent: caches.includes('dfixer-orderguard-shell-v10'), hasStale: caches.includes('dfixer-orderguard-shell-v9') };
+    }, { timeout: 15000 }).toEqual({ hasCurrent: true, hasStale: false });
     await context.close();
   });
 });
