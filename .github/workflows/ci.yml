@@ -1,0 +1,179 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TEST_DATABASE_URL: postgresql://orderguard:orderguard_ci@127.0.0.1:5432/orderguard_test
+  ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+
+jobs:
+  backend:
+    name: Backend, integrity, backup, and constraint tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: orderguard
+          POSTGRES_PASSWORD: orderguard_ci
+          POSTGRES_DB: orderguard_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U orderguard -d orderguard_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Record tested commit
+        run: |
+          mkdir -p test-results
+          echo "Tested commit: $(git rev-parse HEAD)"
+          {
+            echo "### Backend, integrity, backup, and constraint tests"
+            echo ""
+            echo "- Commit: \`$(git rev-parse HEAD)\`"
+            echo "- Ref: \`${GITHUB_REF}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Run test suite
+        run: >-
+          npm test --
+          --test-reporter=spec
+          --test-reporter-destination=stdout
+          --test-reporter=junit
+          --test-reporter-destination=test-results/backend-junit.xml
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-test-results-${{ github.sha }}
+          path: test-results/
+          if-no-files-found: ignore
+
+  e2e:
+    name: Playwright browser E2E
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: orderguard
+          POSTGRES_PASSWORD: orderguard_ci
+          POSTGRES_DB: orderguard_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U orderguard -d orderguard_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Record tested commit
+        run: |
+          echo "Tested commit: $(git rev-parse HEAD)"
+          {
+            echo "### Playwright browser E2E"
+            echo ""
+            echo "- Commit: \`$(git rev-parse HEAD)\`"
+            echo "- Ref: \`${GITHUB_REF}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Run browser E2E
+        run: npm run e2e
+      - name: Upload Playwright artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-artifacts-${{ github.sha }}
+          path: |
+            playwright-report/
+            test-results/
+          if-no-files-found: ignore
+
+  load:
+    name: Operational load test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: orderguard
+          POSTGRES_PASSWORD: orderguard_ci
+          POSTGRES_DB: orderguard_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U orderguard -d orderguard_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Record tested commit
+        run: |
+          echo "Tested commit: $(git rev-parse HEAD)"
+          {
+            echo "### Operational load test"
+            echo ""
+            echo "- Commit: \`$(git rev-parse HEAD)\`"
+            echo "- Ref: \`${GITHUB_REF}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Run load test
+        run: npm run load | tee load-result.txt
+      - name: Enforce zero errors
+        run: |
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const text = fs.readFileSync('load-result.txt', 'utf8');
+          const report = JSON.parse(text.slice(text.indexOf('{')));
+          console.log(`Tested commit: ${process.env.GITHUB_SHA}`);
+          console.log(`Transactions: ${report.totalTransactions}; errors: ${report.totalErrors}; serverRssKb: ${report.serverRssKb}`);
+          if (report.totalTransactions < 1 || report.totalErrors !== 0) {
+            console.error(JSON.stringify(report, null, 2));
+            process.exit(1);
+          }
+          NODE
+      - name: Upload load result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: load-result-${{ github.sha }}
+          path: load-result.txt
+          if-no-files-found: ignore
