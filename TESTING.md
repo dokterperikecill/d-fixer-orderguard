@@ -6,7 +6,7 @@
 TEST_DATABASE_URL="postgresql://user:password@host:5432/orderguard_test" npm test
 ```
 
-Mencakup Wave 1 security, Wave 2 data integrity, backup crypto, TikTok, dan evidence validation.
+Mencakup Wave 1 security, Wave 2 data integrity, backup crypto, off-site transport, key rotation, backup preflight, constraint validation, TikTok, dan evidence validation.
 
 ## Browser E2E (Playwright)
 
@@ -42,6 +42,7 @@ Load test membuat schema sementara, menjalankan server test, lalu menguji:
 - `GET /api/state`
 - concurrent manifest creation
 - concurrent package scanning
+- concurrent 25 scans across 5 manifests
 - concurrent handover
 - memory RSS server dan error rate
 
@@ -62,11 +63,37 @@ npm run db:restore -- /tmp/orderguard-backups/orderguard-....dump.enc
 
 Restore harus diuji ke database terpisah dan diverifikasi tabel/data setelah restore.
 
-## Integrity audit
+## Backup preflight dan key rotation
+
+```sh
+ORDERGUARD_BACKUP_ENCRYPTION_KEY="<key>" npm run db:backup:check
+
+ORDERGUARD_BACKUP_ENCRYPTION_KEY="<key-lama>" \
+ORDERGUARD_BACKUP_NEW_ENCRYPTION_KEY="<key-baru>" \
+ORDERGUARD_BACKUP_DIR=/tmp/orderguard-backups npm run db:backup:rotate-keys
+```
+
+Dry-run adalah default. Untuk menerapkan:
+
+```sh
+ORDERGUARD_BACKUP_ENCRYPTION_KEY="<key-lama>" \
+ORDERGUARD_BACKUP_NEW_ENCRYPTION_KEY="<key-baru>" \
+ORDERGUARD_BACKUP_DIR=/tmp/orderguard-backups \
+npm run db:backup:rotate-keys -- --apply --confirm /tmp/orderguard-backups
+```
+
+## Integrity audit dan constraint validation
 
 ```sh
 DATABASE_URL="postgresql://user:password@host:5432/orderguard" npm run db:integrity:audit
 DATABASE_URL="postgresql://user:password@host:5432/orderguard" npm run db:integrity:reconcile
+DATABASE_URL="postgresql://user:password@host:5432/orderguard" npm run db:constraints:validate
 ```
 
-Jangan menjalankan `--apply` tanpa review laporan dan persetujuan.
+Untuk menerapkan validasi constraint:
+
+```sh
+DATABASE_URL="postgresql://user:password@host:5432/orderguard" npm run db:constraints:validate -- --apply --confirm orderguard
+```
+
+Jangan menjalankan `--apply` tanpa review laporan dan persetujuan. Validasi constraint diblokir bila masih ada orphan atau referensi lintas tenant.

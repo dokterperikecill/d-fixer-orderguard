@@ -191,6 +191,32 @@ test.describe.serial('OrderGuard browser E2E', () => {
     await page.locator('[data-action="close-modal"]').last().click();
   });
 
+  test('quarantine data from another tenant is not visible to a store admin', async ({ page }) => {
+    const createdAt = new Date().toISOString();
+    const payload = JSON.stringify({ manifests: [], incidents: [], audit: [], importJobs: [], orderEvents: [] });
+    const hash = crypto.createHash('sha256').update(payload).digest('hex');
+    const db = new Client({ connectionString: DATABASE_URL });
+    await db.connect();
+    try {
+      await db.query(`INSERT INTO "${E2E_SCHEMA}".state_quarantine (id, tenant_id, payload, payload_hash, reason, created_at) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING`, ['Q-E2E-TENANT-SCOPED', 'dfixer-store', payload, hash, 'Tenant scoping test', createdAt]);
+    } finally {
+      await db.end();
+    }
+
+    await login(page, 'maya', 'maya123');
+    await expect(page.locator('#workspace-tenant-name')).toHaveText('Maya Commerce');
+    await goView(page, 'quarantine');
+    await expect(page.locator('#page-content')).toContainText('Quarantine recovery');
+    await expect(page.locator('#page-content')).not.toContainText('Q-E2E-TENANT-SCOPED');
+
+    const list = await page.request.get('/api/admin/quarantine');
+    expect(list.ok()).toBeTruthy();
+    const listed = await list.json();
+    expect(listed.quarantine.some((item) => item.id === 'Q-E2E-TENANT-SCOPED')).toBeFalsy();
+    const detail = await page.request.get('/api/admin/quarantine/Q-E2E-TENANT-SCOPED');
+    expect(detail.status()).toBe(404);
+  });
+
   test('connection failure during session bootstrap renders login safely', async ({ browser }) => {
     const context = await browser.newContext();
     const page = await context.newPage();
@@ -200,16 +226,23 @@ test.describe.serial('OrderGuard browser E2E', () => {
     await context.close();
   });
 
-  test('PWA service worker registers and uses the current shell cache', async ({ browser }) => {
+  test('PWA service worker upgrades from v9 and removes the stale shell cache', async ({ browser }) => {
     const context = await browser.newContext();
     const page = await context.newPage();
     await page.goto('/');
+    await page.evaluate(async () => {
+      await caches.open('dfixer-orderguard-shell-v9');
+      const registrations = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(registrations.map((registration) => registration.unregister()));
+    });
+    await page.reload();
     const result = await page.evaluate(async () => {
       const registration = await navigator.serviceWorker.ready;
       return { scriptURL: registration.active?.scriptURL || '', caches: await caches.keys() };
     });
     expect(result.scriptURL).toContain('/service-worker.js');
     expect(result.caches).toContain('dfixer-orderguard-shell-v10');
+    expect(result.caches).not.toContain('dfixer-orderguard-shell-v9');
     await context.close();
   });
 });

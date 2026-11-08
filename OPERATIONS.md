@@ -185,12 +185,19 @@ npm run db:backup
 
 Jalankan `pg_dump` dan `pg_restore` dari PostgreSQL client tools yang tersedia. Secara default file custom-format disimpan di `data/backups/` dan retensi menyimpan 30 backup terakhir. Atur `ORDERGUARD_BACKUP_DIR` atau `ORDERGUARD_BACKUP_KEEP` bila lokasi atau retensinya berbeda. Backup berisi data operasional dan wajib diperlakukan sebagai data sensitif. Pastikan user database memiliki izin backup dan restore.
 
-Setiap backup menghasilkan:
+Sebelum backup terjadwal, jalankan preflight yang memeriksa koneksi database, format key, ketersediaan `pg_dump`/`pg_restore`, direktori tujuan, dan konfigurasi off-site tanpa menulis backup:
 
-- `orderguard-YYYYMMDDTHHMMSSZ.dump` — custom-format PostgreSQL.
-- `orderguard-YYYYMMDDTHHMMSSZ.dump.sha256` — checksum integritas.
+```sh
+ORDERGUARD_BACKUP_ENCRYPTION_KEY="<key>" npm run db:backup:check
+```
 
-Script memvalidasi arsip dengan `pg_restore --list` dan menulis checksum SHA-256. Simpan file `.dump` dan `.sha256` bersama-sama. Backup tidak dienkripsi oleh script; gunakan enkripsi disk/secret manager bila diperlukan.
+Setiap backup terenkripsi menghasilkan:
+
+- `orderguard-YYYYMMDDTHHMMSSZ.dump.enc` — ciphertext AES-256-GCM.
+- `orderguard-YYYYMMDDTHHMMSSZ.dump.enc.meta.json` — IV, authentication tag, checksum plaintext/ciphertext, `keyId`, dan jumlah baris tabel penting.
+- `orderguard-YYYYMMDDTHHMMSSZ.dump.enc.sha256` — checksum ciphertext.
+
+Script memvalidasi arsip dengan `pg_restore --list` dan menulis checksum SHA-256. Simpan file `.enc`, `.meta.json`, dan `.sha256` bersama-sama. Backup plaintext hanya untuk development dengan `ORDERGUARD_BACKUP_ALLOW_PLAINTEXT=1`; jangan gunakan di production.
 
 ## Restore
 
@@ -231,12 +238,14 @@ Jangan gunakan opsi tersebut pada production.
 - Setiap scan wajib memiliki catatan audit yang sesuai; setiap sesi handover wajib memiliki audit `Serah terima <id> dikonfirmasi: ...`.
 - Bukti handover bersifat append-only; evidence pada sesi lama tidak dapat diubah.
 - Payload state yang tidak valid tidak diganti dengan state demo. Payload asli dipertahankan di `state_quarantine` untuk investigasi/recovery manual, dan API mengembalikan `503 STATE_CORRUPTED`.
-- Foreign key ditambahkan secara additive dengan `NOT VALID`: constraint berlaku untuk data baru tanpa menggagalkan startup karena data lama. Setelah audit data lama, constraint dapat divalidasi manual:
+- Foreign key ditambahkan secara additive dengan `NOT VALID`: constraint berlaku untuk data baru tanpa menggagalkan startup karena data lama. Validasi constraint produksi harus melalui script yang memblokir orphan/referensi lintas tenant:
 
-  ```sql
-  ALTER TABLE users VALIDATE CONSTRAINT users_tenant_fk;
+  ```sh
+  DATABASE_URL="..." npm run db:constraints:validate
+  DATABASE_URL="..." npm run db:constraints:validate -- --apply --confirm orderguard
   ```
 
+  Script memakai `lock_timeout` dan `statement_timeout` agar tidak menggantung. Tanpa `--apply --confirm <nama-database>`, script hanya melaporkan constraint yang belum tervalidasi.
 - Index tambahan tersedia untuk session, audit, user tenant, manifest registry, dan quarantine.
 
 ## Audit Integritas & Rekonsiliasi
@@ -316,7 +325,21 @@ ORDERGUARD_BACKUP_ENCRYPTION_KEY="<32-byte-hex-64-char-atau-base64>"
 1. Buat key baru dan simpan sebagai secret.
 2. Pindahkan key lama ke `ORDERGUARD_BACKUP_PREVIOUS_ENCRYPTION_KEYS`, set key baru sebagai `ORDERGUARD_BACKUP_ENCRYPTION_KEY`.
 3. Backup baru memakai key baru; backup lama tetap dapat direstore memakai key sebelumnya.
-4. Setelah semua backup lama dipensiunkan, hapus key lama dari environment.
+4. Re-enkripsi backup lama secara batch (dry-run default):
+
+   ```sh
+   ORDERGUARD_BACKUP_ENCRYPTION_KEY="<key-lama>" \
+   ORDERGUARD_BACKUP_NEW_ENCRYPTION_KEY="<key-baru>" \
+   ORDERGUARD_BACKUP_DIR=/path/backups npm run db:backup:rotate-keys
+
+   ORDERGUARD_BACKUP_ENCRYPTION_KEY="<key-lama>" \
+   ORDERGUARD_BACKUP_NEW_ENCRYPTION_KEY="<key-baru>" \
+   ORDERGUARD_BACKUP_DIR=/path/backups \
+   npm run db:backup:rotate-keys -- --apply --confirm /path/backups
+   ```
+
+   Script mendekripsi dan memverifikasi plaintext, menulis ciphertext baru, memverifikasi hasil re-enkripsi, lalu menyimpan file asli sebagai `.pre-rotation.enc` beserta metadata/checksum. File asli tidak dihapus sebelum verifikasi berhasil dan tetap dapat direstore dengan key lama.
+5. Setelah seluruh backup berhasil dirotasi dan diuji restore, hapus key lama dari environment.
 
 **Scheduler:** `render.yaml` menyediakan cron job harian pukul 02:00 untuk `npm run db:backup`. Backup harus disalin off-site; disk Render tidak boleh menjadi satu-satunya lokasi.
 

@@ -167,6 +167,40 @@ async function main() {
     const scanDuration = (now() - scanStarted) / 1000;
     metrics.push({ phase: 'POST /api/manifests/:id/scans concurrent scanning', virtualUsers: 10, transactions: scanStatuses.length, throughput: Number((scanStatuses.length / scanDuration).toFixed(2)), errors: scanStatuses.filter((status) => status !== 201).length, retries: 0, latencyMs: percentiles(scanLatencies) });
 
+    const multiTasks = [];
+    for (let manifestIndex = 0; manifestIndex < 5; manifestIndex += 1) {
+      const setupBase = await getState();
+      const setup = structuredClone(setupBase.body);
+      const id = `OG-LOAD-MULTI-${manifestIndex}`;
+      const createdAt = new Date().toISOString();
+      const manifestPackages = Array.from({ length: 5 }, (_, packageIndex) => ({
+        order: `ORD-LOAD-MULTI-${manifestIndex}-${packageIndex}`,
+        tracking: `TRK-LOAD-MULTI-${manifestIndex}-${packageIndex}`,
+        status: 'EXPECTED',
+        scannedAt: null,
+      }));
+      for (const parcel of manifestPackages) multiTasks.push({ manifestId: id, tracking: parcel.tracking });
+      setup.manifests.unshift({ id, shop: "D'Fixer Store", courier: 'JNE', date: createdAt.slice(0, 10), location: 'Load', status: 'OPEN', createdAt, createdBy: 'Platform Admin', source: 'manual', packages: manifestPackages, scans: [], sessions: [] });
+      setup.audit.unshift({ id: `AU-${id}`, actor: 'Platform Admin', action: 'Manifest dibuat manual dengan 5 paket', object: id, createdAt });
+      const setupResponse = await postState(setup, setupBase.version);
+      if (setupResponse.status !== 200) throw new Error(`multi-manifest setup failed: ${setupResponse.status}`);
+    }
+    const multiLatencies = [];
+    const multiStatuses = [];
+    const multiStarted = now();
+    await runQueue(multiTasks, async (task) => {
+      const begin = now();
+      const response = await fetch(`http://127.0.0.1:${PORT}/api/manifests/${encodeURIComponent(task.manifestId)}/scans`, {
+        method: 'POST',
+        headers: writeHeaders,
+        body: JSON.stringify({ tracking: task.tracking }),
+      });
+      multiStatuses.push(response.status);
+      multiLatencies.push(now() - begin);
+    }, 25);
+    const multiDuration = (now() - multiStarted) / 1000;
+    metrics.push({ phase: 'POST /api/manifests/:id/scans concurrent 25 scans across 5 manifests', virtualUsers: 25, transactions: multiStatuses.length, throughput: Number((multiStatuses.length / multiDuration).toFixed(2)), errors: multiStatuses.filter((status) => status !== 201).length, retries: 0, latencyMs: percentiles(multiLatencies) });
+
     const handoverLatencies = [];
     const handoverStatuses = [];
     const handoverManifests = [];
