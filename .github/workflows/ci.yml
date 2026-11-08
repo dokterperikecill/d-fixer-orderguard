@@ -55,12 +55,9 @@ jobs:
             echo "- Ref: \`${GITHUB_REF}\`"
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Run test suite
-        run: >-
-          npm test --
-          --test-reporter=spec
-          --test-reporter-destination=stdout
-          --test-reporter=junit
-          --test-reporter-destination=test-results/backend-junit.xml
+        run: |
+          mkdir -p test-results
+          npm run test:ci
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
