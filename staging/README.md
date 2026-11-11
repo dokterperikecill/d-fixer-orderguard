@@ -2,6 +2,8 @@
 
 **Status: PREPARATION ONLY.** Dokumen ini adalah hasil audit dan rancangan staging. Tidak ada deployment, merge, akses database produksi, atau penggunaan kredensial produksi pada tahap ini.
 
+> **Update 2026-11-11:** rehearsal staging sudah dieksekusi di VPS (nginx TLS, PostgreSQL terpisah, Node 24) untuk area runtime, keamanan, backup/restore, rollback, dan observability. Deployment staging Render serta checklist fungsional penuh masih belum. Bukti: [`EXECUTION-2026-11-11.md`](EXECUTION-2026-11-11.md).
+
 - Base branch: `fix/wave-2.2-local-hardening`
 - Base commit: `4a0a030a176c5dbd3dd1672bbea0a4b21affa625`
 - Branch kerja: `fix/wave-2.3-staging-verification`

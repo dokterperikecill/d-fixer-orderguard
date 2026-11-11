@@ -11,7 +11,7 @@ Cache PWA hanya menyimpan shell aplikasi. Setelah mengubah `app.js`, `styles.css
 1. Push proyek ke repository GitHub, lalu di Render pilih **New → Blueprint** dan hubungkan repository tersebut.
 2. Sediakan PostgreSQL terkelola dan isi `DATABASE_URL` di Render sebagai secret. Blueprint tidak membuat database berbayar secara otomatis.
 3. Isi `ORDERGUARD_BOOTSTRAP_USERNAME`, `ORDERGUARD_BOOTSTRAP_NAME`, dan `ORDERGUARD_BOOTSTRAP_PASSWORD` sebagai environment variable rahasia di Render. Password harus minimal 12 karakter. Jangan simpan rahasia di repository atau kirim melalui chat.
-4. Tunggu health check `/api/health` berhasil, lalu gunakan URL HTTPS `*.onrender.com` yang diberikan Render.
+4. Tunggu health check `/api/ready` berhasil, lalu gunakan URL HTTPS `*.onrender.com` yang diberikan Render.
 
 URL Render sudah cukup untuk uji coba dan PWA; domain pribadi bisa ditambahkan kemudian. Gunakan URL akhir yang sama saat membuat installer desktop dan konfigurasi TWA Android.
 
@@ -31,6 +31,29 @@ npm run desktop:dist
 Installer NSIS akan dibuat di `release/desktop/`. Perintah ini perlu dijalankan di Windows untuk build Windows yang paling andal. Untuk pengembangan desktop, set `ORDERGUARD_APP_URL` ke URL HTTPS server, lalu jalankan `npm run desktop:dev`.
 
 APK Android melalui Trusted Web Activity (TWA) belum dapat dibuat sebelum domain produksi tersedia. APK memerlukan PWA yang sudah ter-deploy, konfigurasi verifikasi domain (`/.well-known/assetlinks.json`), Android SDK, dan kunci penandatanganan Android. Domain publik juga diperlukan untuk menyiapkan serta menguji file verifikasi tersebut.
+
+## Health, Readiness, Observability, dan Shutdown
+
+- `GET /api/health` adalah **liveness**: tidak menyentuh database; mengembalikan `status`, `uptimeSeconds`, `version`, dan `runtime` Node.
+- `GET /api/ready` adalah **readiness**: menjalankan `SELECT 1` dan mengembalikan `503` bila PostgreSQL tidak dapat dijangkau. Render `healthCheckPath` memakai endpoint ini.
+- `GET /api/metrics` menyajikan metrik Prometheus (request, respons per kelas status, error 5xx, `db_up`, `inflight_requests`, uptime, RSS). Endpoint **tersembunyi (404)** bila `ORDERGUARD_METRICS_TOKEN` tidak diatur. Bila diatur, wajib mengirim `Authorization: Bearer <token>`.
+- Log akses ditulis sebagai JSON satu baris ke stdout (request ID, method, path, status, durasi) tanpa IP mentah, cookie, token, atau body. Nonaktifkan dengan `ORDERGUARD_ACCESS_LOG=0`; test otomatis selalu nonaktif.
+- Setiap respons menyertakan `X-Request-Id` (nilai dari klien dipakai bila formatnya valid).
+- Server menangani `SIGTERM`/`SIGINT`: berhenti menerima koneksi baru, menyelesaikan request in-flight, menutup pool PostgreSQL, lalu keluar `0`. Batas paksa diatur oleh `ORDERGUARD_SHUTDOWN_TIMEOUT_MS` (default 25000, harus lebih kecil dari grace period platform).
+- Timeout HTTP: `headersTimeout` 20 dtk, `requestTimeout` 30 dtk, `keepAliveTimeout` 65 dtk.
+- `ORDERGUARD_HOST` mengatur alamat bind (default `0.0.0.0`). Untuk deployment di belakang reverse proxy di host yang sama, gunakan `127.0.0.1` agar aplikasi tidak dapat diakses langsung dari jaringan.
+
+### Alerting
+
+```sh
+ORDERGUARD_ALERT_WEBHOOK_URL="https://hooks.slack.com/services/..."
+ORDERGUARD_ALERT_WEBHOOK_FORMAT="slack"   # atau "generic"
+```
+
+- Backup yang gagal, restore yang gagal, kegagalan off-site, dan restore drill yang gagal mengirim alert.
+- Health check eksternal dijalankan dengan `npm run ops:healthcheck` terhadap `ORDERGUARD_HEALTHCHECK_URL` (atau `STAGING_BASE_URL`).
+- Unit systemd tersedia di `ops/systemd/`; workflow GitHub Actions terjadwal ada di `.github/workflows/ops-healthcheck.yml`.
+- Uji jalur alert tanpa menunggu insiden: `npm run ops:alert -- --title "Uji" --message "..." --severity info`.
 
 ## Inisialisasi Production
 
@@ -199,6 +222,21 @@ Setiap backup terenkripsi menghasilkan:
 
 Script memvalidasi arsip dengan `pg_restore --list` dan menulis checksum SHA-256. Simpan file `.enc`, `.meta.json`, dan `.sha256` bersama-sama. Backup plaintext hanya untuk development dengan `ORDERGUARD_BACKUP_ALLOW_PLAINTEXT=1`; jangan gunakan di production.
 
+### Restore drill otomatis
+
+`npm run db:drill` menjalankan rantai bukti: backup terenkripsi → restore ke database terpisah → bandingkan jumlah baris → tolak key salah → tolak ciphertext yang dimodifikasi.
+
+```sh
+DRILL_SOURCE_DATABASE_URL="postgresql://.../orderguard_staging" \
+DRILL_TARGET_DATABASE_URL="postgresql://.../orderguard_staging_restore" \
+ORDERGUARD_BACKUP_ENCRYPTION_KEY="<key>" \
+DRILL_BACKUP_DIR=/tmp/orderguard-drill \
+DRILL_REPORT_PATH=/tmp/orderguard-drill/report.json \
+npm run db:drill
+```
+
+Database target **wajib berbeda** dari sumber dan khusus untuk drill. Perintah keluar `0` hanya jika semua langkah lulus, dan mengirim alert bila gagal. Jalankan minimal sebelum rilis produksi dan setelah perubahan skema/backup.
+
 ## Restore
 
 Restore adalah tindakan destruktif pada database target. Script membutuhkan konfirmasi eksplisit berupa nama database target:
@@ -341,6 +379,6 @@ ORDERGUARD_BACKUP_ENCRYPTION_KEY="<32-byte-hex-64-char-atau-base64>"
    Script mendekripsi dan memverifikasi plaintext, menulis ciphertext baru, memverifikasi hasil re-enkripsi, lalu menyimpan file asli sebagai `.pre-rotation.enc` beserta metadata/checksum. File asli tidak dihapus sebelum verifikasi berhasil dan tetap dapat direstore dengan key lama.
 5. Setelah seluruh backup berhasil dirotasi dan diuji restore, hapus key lama dari environment.
 
-**Scheduler:** `render.yaml` menyediakan cron job harian pukul 02:00 untuk `npm run db:backup`. Backup harus disalin off-site; disk Render tidak boleh menjadi satu-satunya lokasi.
+**Scheduler:** `render.yaml` menyediakan cron **Docker** harian pukul 02:00 yang membangun `ops/backup/Dockerfile` (Node 24 + `postgresql-client-16` + AWS CLI + rclone) dan menjalankan preflight lalu backup. Runtime Node native tidak dijamin memiliki tool tersebut, jadi jangan mengganti cron kembali ke `runtime: node`. Alternatif: unit systemd di `ops/backup/orderguard-backup.service`/`.timer` atau GitHub Actions scheduled. Backup harus disalin off-site; disk Render tidak boleh menjadi satu-satunya lokasi.
 
 **RPO/RTO target:** RPO ≤ 24 jam dengan jadwal harian (perpendek jadwal bila diperlukan); RTO target ≤ 2 jam dengan restore terverifikasi ke database terpisah. Angka ini adalah target operasional, bukan jaminan; ukur ulang sesuai ukuran database dan kecepatan storage.

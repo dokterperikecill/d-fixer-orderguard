@@ -155,6 +155,11 @@ If-Match: "state-12"
 - [ ] Set `ORDERGUARD_TRUST_PROXY=1` di Render/reverse proxy.
 - [ ] Pastikan HTTPS aktif; cookie sesi memakai `Secure`.
 - [ ] Jangan nonaktifkan CSRF/Origin check di production.
+- [ ] Monitor `/api/ready` (readiness) dan `/api/health` (liveness); jangan memakai `/api/health` sebagai satu-satunya indikator database.
+- [ ] Set `ORDERGUARD_METRICS_TOKEN` bila metrik Prometheus akan di-scrape; biarkan kosong untuk menonaktifkan endpoint.
+- [ ] Set `ORDERGUARD_ALERT_WEBHOOK_URL` agar kegagalan backup/restore/healthcheck terkirim.
+- [ ] Pastikan log JSON tidak memuat cookie, token, password, atau body request sensitif.
+- [ ] Uji graceful shutdown: `SIGTERM` harus menyelesaikan request in-flight dan keluar `0`.
 - [ ] Backup dan restore diuji sebelum operasional.
 - [ ] Monitor `auth_audit` untuk lonjakan `LOGIN_FAILED`/`LOGIN_BLOCKED`.
 

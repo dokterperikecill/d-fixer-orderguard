@@ -50,6 +50,60 @@ Load test membuat schema sementara, menjalankan server test, lalu menguji:
 
 Hasil ditampilkan sebagai JSON; tidak dijalankan terhadap produksi.
 
+## Runtime dan operasional
+
+`backend.test.js`, `tiktok-shop.test.js`, `evidence.test.js`, dan `ops.test.js` mencakup readiness, metrics terproteksi token, serta graceful shutdown (`SIGTERM` keluar `0` dan listener tertutup).
+
+```sh
+TEST_DATABASE_URL="postgresql://user:password@host:5432/orderguard_test" npm test
+```
+
+## Staging verification
+
+Smoke keamanan + fungsional dasar (health, readiness, header, cookie, CSRF, origin, rate limit, logout):
+
+```sh
+STAGING_BASE_URL="https://staging.example.com" \
+STAGING_USERNAME="staging-verifier" \
+STAGING_PASSWORD="<rahasia>" \
+STAGING_RATE_LIMIT_USERNAME="rate-limit-probe" \
+npm run staging:smoke
+```
+
+Browser E2E ke staging nyata (tanpa `webServer`, tanpa seeding demo):
+
+```sh
+STAGING_BASE_URL="https://staging.example.com" \
+STAGING_USERNAME="staging-verifier" \
+STAGING_PASSWORD="<rahasia>" \
+STAGING_TENANT_NAME="D'Fixer Store" \
+npm run e2e:staging
+```
+
+Load read-only ke staging (tidak menulis data):
+
+```sh
+LOAD_TEST_BASE_URL="https://staging.example.com" \
+LOAD_TEST_USERNAME="staging-verifier" \
+LOAD_TEST_PASSWORD="<rahasia>" \
+npm run load:staging
+```
+
+`STAGING_ALLOW_HTTP=1` hanya untuk rehearsal lokal. Jangan gunakan `STAGING_INSECURE_TLS=1` pada staging sungguhan.
+
+## Restore drill
+
+```sh
+DRILL_SOURCE_DATABASE_URL="postgresql://.../orderguard_staging" \
+DRILL_TARGET_DATABASE_URL="postgresql://.../orderguard_staging_restore" \
+ORDERGUARD_BACKUP_ENCRYPTION_KEY="<key>" \
+DRILL_BACKUP_DIR=/tmp/orderguard-drill \
+DRILL_REPORT_PATH=/tmp/orderguard-drill/report.json \
+npm run db:drill
+```
+
+Drill lulus hanya jika restore ke database terpisah berhasil, jumlah baris cocok, key salah ditolak, dan ciphertext termodifikasi ditolak.
+
 ## Backup/restore
 
 ```sh

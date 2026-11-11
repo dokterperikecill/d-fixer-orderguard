@@ -1,6 +1,9 @@
 # Checklist Verifikasi Staging
 
-**Status staging: BELUM DIJALANKAN.** Checklist ini disiapkan untuk tahap eksekusi setelah persetujuan.
+**Status: rehearsal staging dieksekusi 2026-11-11 di VPS (nginx TLS + PostgreSQL terpisah); deployment staging Render BELUM dijalankan.**
+Hasil lengkap: [`staging/EXECUTION-2026-11-11.md`](EXECUTION-2026-11-11.md).
+
+Checklist ini tetap menjadi sumber kebenaran. Item yang sudah diverifikasi pada rehearsal ditandai di laporan eksekusi; item fungsional penuh (impor, scan, handover, evidence, quarantine, laporan), TikTok Shop, Cloudflare Access, dan deployment Render masih harus dijalankan pada staging sungguhan.
 
 Baseline yang sudah ada (bukan verifikasi staging):
 
@@ -22,7 +25,7 @@ Baseline yang sudah ada (bukan verifikasi staging):
 
 - [ ] CI hijau pada SHA yang akan di-deploy.
 - [ ] Deploy manual dari SHA dicatat.
-- [ ] Health check `/api/health` mengembalikan `status: ok` dan `database: ok`.
+- [ ] Health check `/api/ready` mengembalikan `status: ready` dan `database: ok`.
 - [ ] Log startup tidak menunjukkan error migrasi.
 - [ ] `/api/config` merespons.
 - [ ] Bootstrap admin berhasil.
@@ -96,9 +99,9 @@ Baseline yang sudah ada (bukan verifikasi staging):
 
 ## 8. Kesenjangan yang harus diselesaikan sebelum eksekusi staging
 
-- [ ] **Staging browser E2E harness.** `playwright.config.js` saat ini menjalankan server test lokal. Perlu konfigurasi terpisah yang menargetkan `https://<staging-host>` dengan user staging, tanpa `webServer`.
-- [ ] **Staging load harness.** `scripts/load-test.js` saat ini membuat server/schema sendiri. Perlu mode target eksternal atau skrip load terpisah untuk staging.
-- [ ] **Backup runner image.** Render native cron belum tentu memiliki `pg_dump`, `aws`, atau `rclone`; pilih Docker cron private-network atau GitHub Actions scheduled.
+- [x] **Staging browser E2E harness.** `playwright.staging.config.js` menargetkan `STAGING_BASE_URL` tanpa `webServer` dan tanpa seeding demo (`npm run e2e:staging`).
+- [x] **Staging load harness.** `scripts/load-test.js --external` menjalankan load read-only ke `LOAD_TEST_BASE_URL` (`npm run load:staging`).
+- [ ] **Backup runner image.** Render native cron belum tentu memiliki `pg_dump`, `aws`, atau `rclone`; gunakan Docker cron (`ops/backup/Dockerfile`) atau GitHub Actions scheduled. Konfigurasi sudah disediakan, build/deploy belum diverifikasi.
 - [ ] **PostgreSQL major version.** Konfirmasi versi produksi dan pin staging ke major yang sama.
 - [ ] **Cloudflare Access policy.** Definisikan siapa yang boleh mengakses staging.
 - [ ] **Alert channel.** Tentukan tujuan alert (email/Slack/WhatsApp) dan penanggung jawab.

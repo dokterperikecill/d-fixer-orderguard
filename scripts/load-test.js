@@ -3,13 +3,15 @@ const { Client } = require('pg');
 const path = require('node:path');
 
 const APP_DIR = path.join(__dirname, '..');
+const EXTERNAL_BASE_URL = (process.env.LOAD_TEST_BASE_URL || '').replace(/\/+$/, '');
+const EXTERNAL_MODE = process.argv.includes('--external') || Boolean(EXTERNAL_BASE_URL);
 const DATABASE_URL = process.env.TEST_DATABASE_URL;
 const PORT = Number(process.env.LOAD_TEST_PORT || 4563);
 const SCHEMA = process.env.LOAD_TEST_SCHEMA || 'orderguard_load_test';
 const users = [
   { id: 'admin', username: 'admin', password: 'admin123', name: 'Platform Admin', role: 'super-admin', tenantId: 'dfixer-store' },
 ];
-if (!DATABASE_URL) throw new Error('TEST_DATABASE_URL wajib diatur untuk load test.');
+if (!DATABASE_URL && !EXTERNAL_MODE) throw new Error('TEST_DATABASE_URL wajib diatur untuk load test.');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const now = () => performance.now();
@@ -270,7 +272,66 @@ async function main() {
   }
 }
 
-main().catch((error) => {
+async function externalMain() {
+  if (!EXTERNAL_BASE_URL) throw new Error('LOAD_TEST_BASE_URL wajib diatur untuk mode --external.');
+  const username = process.env.LOAD_TEST_USERNAME || 'admin';
+  const password = process.env.LOAD_TEST_PASSWORD || '';
+  if (!password) throw new Error('LOAD_TEST_PASSWORD wajib diatur untuk load test staging.');
+
+  const login = await fetch(`${EXTERNAL_BASE_URL}/api/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  });
+  const loginBody = await login.json().catch(() => null);
+  const cookie = /orderguard_session=([^;]+)/.exec(login.headers.get('set-cookie') || '')?.[1];
+  if (!login.ok || !cookie || !loginBody?.csrfToken) throw new Error(`load test staging login gagal: HTTP ${login.status}`);
+  const authHeaders = { Cookie: `orderguard_session=${cookie}` };
+
+  const metrics = [];
+  const measure = async (name, virtualUsers, requests, url, headers) => {
+    const started = now();
+    const latencies = [];
+    const statuses = [];
+    await runQueue(Array.from({ length: virtualUsers * requests }, (_, index) => index), async () => {
+      const begin = now();
+      try {
+        const response = await fetch(`${EXTERNAL_BASE_URL}${url}`, { headers });
+        statuses.push(response.status);
+        await response.arrayBuffer();
+      } catch {
+        statuses.push(0);
+      }
+      latencies.push(now() - begin);
+    }, virtualUsers);
+    const duration = (now() - started) / 1000;
+    metrics.push({
+      phase: name,
+      virtualUsers,
+      transactions: statuses.length,
+      throughput: Number((statuses.length / duration).toFixed(2)),
+      errors: statuses.filter((status) => status !== 200).length,
+      latencyMs: percentiles(latencies),
+    });
+  };
+
+  await measure('GET /api/health', 20, 10, '/api/health', {});
+  await measure('GET /api/session', 10, 10, '/api/session', authHeaders);
+  await measure('GET /api/state', 10, 10, '/api/state', authHeaders);
+
+  console.log(JSON.stringify({
+    generatedAt: new Date().toISOString(),
+    mode: 'external-read-only',
+    target: new URL(EXTERNAL_BASE_URL).host,
+    metrics,
+    totalTransactions: metrics.reduce((sum, metric) => sum + metric.transactions, 0),
+    totalErrors: metrics.reduce((sum, metric) => sum + metric.errors, 0),
+    note: 'Read-only staging load. Write-path scale must be measured on an isolated staging tenant.',
+  }, null, 2));
+}
+
+const runner = EXTERNAL_MODE ? externalMain : main;
+runner().catch((error) => {
   console.error(error.stack || error);
   process.exitCode = 1;
 });
