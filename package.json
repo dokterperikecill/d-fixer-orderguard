@@ -13,6 +13,7 @@
     "ops:healthcheck": "node scripts/healthcheck.js",
     "ops:alert": "node scripts/alert.js",
     "staging:smoke": "node scripts/staging-smoke.js",
+    "staging:seed": "node scripts/staging-seed.js",
     "e2e:staging": "playwright test --config=playwright.staging.config.js",
     "load:staging": "node scripts/load-test.js --external",
     "db:drill": "node scripts/drill-restore.js",
