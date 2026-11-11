@@ -1,11 +1,16 @@
 const fs = require('node:fs');
 const path = require('node:path');
+const os = require('node:os');
 const { spawnSync } = require('node:child_process');
+const { decodeKey, decryptFile, encryptFile, sha256File } = require('./backup-crypto');
+const { sendAlert } = require('./alert');
 
 const databaseUrl = process.env.DATABASE_URL;
 const backupDirectory = path.resolve(process.env.ORDERGUARD_BACKUP_DIR || path.join(__dirname, '..', 'data', 'backups'));
 const backupPath = process.argv[2] ? path.resolve(process.argv[2]) : '';
 const timestamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+const currentKey = process.env.ORDERGUARD_BACKUP_ENCRYPTION_KEY || '';
+const previousKeys = String(process.env.ORDERGUARD_BACKUP_PREVIOUS_ENCRYPTION_KEYS || '').split(',').map((value) => value.trim()).filter(Boolean);
 
 function postgresEnvironment() {
   if (!databaseUrl) throw new Error('DATABASE_URL wajib diatur untuk restore PostgreSQL.');
@@ -20,26 +25,170 @@ function postgresEnvironment() {
   };
 }
 
+function databaseName() {
+  if (!databaseUrl) throw new Error('DATABASE_URL wajib diatur untuk restore PostgreSQL.');
+  return decodeURIComponent(new URL(databaseUrl).pathname.slice(1));
+}
+
 function run(command, args) {
   const result = spawnSync(command, args, { env: { ...process.env, ...postgresEnvironment() }, encoding: 'utf8' });
   if (result.error) throw result.error;
   if (result.status !== 0) throw new Error(result.stderr.trim() || `${command} exited with status ${result.status}.`);
+  return result.stdout;
 }
 
-try {
-  if (!backupPath || !fs.existsSync(backupPath) || path.extname(backupPath) !== '.dump') {
-    throw new Error('Berikan path file backup PostgreSQL .dump yang tersedia.');
+function expectedChecksum(filePath) {
+  const checksumPath = `${filePath}.sha256`;
+  if (!fs.existsSync(checksumPath)) {
+    console.warn('Peringatan: file checksum .sha256 tidak ditemukan; validasi integritas hanya memakai pg_restore --list.');
+    return null;
   }
-  run('pg_restore', ['--list', backupPath]);
-
-  fs.mkdirSync(backupDirectory, { recursive: true, mode: 0o700 });
-  fs.chmodSync(backupDirectory, 0o700);
-  const safetyBackupPath = path.join(backupDirectory, `orderguard-pre-restore-${timestamp}.dump`);
-  run('pg_dump', ['--format=custom', '--no-owner', '--no-acl', '--file', safetyBackupPath]);
-  fs.chmodSync(safetyBackupPath, 0o600);
-  run('pg_restore', ['--clean', '--if-exists', '--no-owner', '--no-acl', '--exit-on-error', backupPath]);
-  console.log(`Database PostgreSQL dipulihkan dari ${backupPath}. Backup sebelum restore: ${safetyBackupPath}`);
-} catch (error) {
-  console.error(`Restore gagal: ${error.message}`);
-  process.exitCode = 1;
+  return fs.readFileSync(checksumPath, 'utf8').trim().split(/\s+/)[0];
 }
+
+async function preparePlainbackup(tempDirectory) {
+  if (!fs.existsSync(backupPath) || !['.dump', '.enc'].includes(path.extname(backupPath))) {
+    throw new Error('Berikan path file backup PostgreSQL .dump atau .dump.enc yang tersedia.');
+  }
+  const metadataPath = `${backupPath}.meta.json`;
+  const metadata = fs.existsSync(metadataPath) ? JSON.parse(fs.readFileSync(metadataPath, 'utf8')) : null;
+  if (path.extname(backupPath) === '.enc') {
+    if (!metadata) throw new Error('Metadata enkripsi backup tidak ditemukan.');
+    if (!currentKey && !previousKeys.length) throw new Error('ORDERGUARD_BACKUP_ENCRYPTION_KEY wajib diatur untuk restore backup terenkripsi.');
+    const checksum = expectedChecksum(backupPath);
+    if (checksum && checksum !== sha256File(backupPath)) throw new Error('Checksum ciphertext backup tidak cocok.');
+    const plainPath = path.join(tempDirectory, 'restore.dump');
+    const keys = [currentKey, ...previousKeys].filter(Boolean);
+    let lastError = null;
+    for (const key of keys) {
+      try {
+        await decryptFile(backupPath, plainPath, key, metadata);
+        return { restoreSource: plainPath, metadata };
+      } catch (error) {
+        lastError = error;
+        if (fs.existsSync(plainPath)) fs.unlinkSync(plainPath);
+      }
+    }
+    throw new Error(`Dekripsi backup gagal dengan seluruh encryption key yang tersedia: ${lastError?.message || 'unknown error'}`);
+  }
+
+  const checksum = expectedChecksum(backupPath);
+  if (checksum && checksum !== sha256File(backupPath)) throw new Error('Checksum backup tidak cocok. File backup mungkin rusak atau berubah.');
+  return { restoreSource: backupPath, metadata };
+}
+
+async function queryCount(target, table) {
+  if (!/^[a-z_][a-z0-9_]*$/.test(table)) throw new Error(`Nama tabel tidak valid: ${table}`);
+  const value = run('psql', ['--dbname', target, '--tuples-only', '--no-align', '--command', `SELECT COUNT(*) FROM "${table}"`]).trim();
+  return Number(value);
+}
+
+async function queryScalar(target, sql) {
+  const value = run('psql', ['--dbname', target, '--tuples-only', '--no-align', '--command', sql]).trim();
+  return Number(value || 0);
+}
+
+async function verifyConsistency(target, tables) {
+  const checks = [
+    {
+      label: 'users tanpa tenant',
+      sql: 'SELECT COUNT(*) FROM users u LEFT JOIN tenants t ON t.id = u.tenant_id WHERE u.tenant_id IS NOT NULL AND t.id IS NULL',
+    },
+    {
+      label: 'tenant_state tanpa tenant',
+      sql: 'SELECT COUNT(*) FROM tenant_state s LEFT JOIN tenants t ON t.id = s.tenant_id WHERE t.id IS NULL',
+    },
+    {
+      label: 'tenant_state payload kosong',
+      sql: "SELECT COUNT(*) FROM tenant_state WHERE payload IS NULL OR payload = ''",
+    },
+  ];
+  if (tables.includes('quarantine_recovery_audit') && tables.includes('state_quarantine')) {
+    checks.push({
+      label: 'quarantine_recovery_audit tanpa quarantine',
+      sql: 'SELECT COUNT(*) FROM quarantine_recovery_audit a LEFT JOIN state_quarantine q ON q.id = a.quarantine_id WHERE q.id IS NULL',
+    });
+  }
+  if (tables.includes('tiktok_shops') && tables.includes('tiktok_connections')) {
+    checks.push({
+      label: 'tiktok_shops lintas tenant',
+      sql: 'SELECT COUNT(*) FROM tiktok_shops s JOIN tiktok_connections c ON c.id = s.connection_id WHERE s.tenant_id IS DISTINCT FROM c.tenant_id',
+    });
+  }
+  if (tables.includes('tiktok_oauth_states') && tables.includes('users')) {
+    checks.push({
+      label: 'tiktok_oauth_states lintas tenant',
+      sql: 'SELECT COUNT(*) FROM tiktok_oauth_states o JOIN users u ON u.id = o.user_id WHERE o.tenant_id IS DISTINCT FROM u.tenant_id',
+    });
+  }
+  for (const check of checks) {
+    const count = await queryScalar(target, check.sql);
+    if (count !== 0) throw new Error(`Verifikasi restore gagal: ${check.label} ditemukan ${count} baris.`);
+  }
+}
+
+async function verifyRestore(target, metadata) {
+  const existing = run('psql', ['--dbname', target, '--tuples-only', '--no-align', '--command', "SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema()"]).split(/\s+/).filter(Boolean);
+  const coreTables = ['tenants', 'users', 'tenant_state'];
+  for (const table of coreTables) {
+    if (!existing.includes(table)) throw new Error(`Verifikasi restore gagal: tabel ${table} tidak ditemukan.`);
+  }
+
+  const expected = metadata?.counts && typeof metadata.counts === 'object' ? metadata.counts : null;
+  if (expected) {
+    for (const [table, count] of Object.entries(expected)) {
+      const actual = await queryCount(target, table);
+      if (actual !== Number(count)) throw new Error(`Verifikasi restore gagal: ${table} diharapkan ${count}, ditemukan ${actual}.`);
+    }
+  } else {
+    console.warn('Peringatan: metadata backup tidak memiliki jumlah baris; memverifikasi konsistensi relasi inti saja.');
+  }
+  await verifyConsistency(target, existing);
+}
+
+
+async function main() {
+  if (!backupPath) throw new Error('Berikan path file backup PostgreSQL.');
+  const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'orderguard-restore-'));
+  try {
+    const prepared = await preparePlainbackup(tempDirectory);
+    const restoreSource = prepared.restoreSource;
+    run('pg_restore', ['--list', restoreSource]);
+
+    const target = databaseName();
+    const confirmation = process.env.ORDERGUARD_CONFIRM_RESTORE || '';
+    if (confirmation !== target) {
+      throw new Error(`Konfirmasi restore diperlukan. Set ORDERGUARD_CONFIRM_RESTORE=${target} untuk database target.`);
+    }
+
+    fs.mkdirSync(backupDirectory, { recursive: true, mode: 0o700 });
+    fs.chmodSync(backupDirectory, 0o700);
+    const safetyKey = [currentKey, ...previousKeys].find((key) => {
+      try { decodeKey(key); return true; } catch { return false; }
+    });
+    if (!safetyKey) throw new Error('ORDERGUARD_BACKUP_ENCRYPTION_KEY wajib diatur agar safety backup selalu terenkripsi.');
+    const safetyBackupPath = path.join(backupDirectory, `orderguard-pre-restore-${timestamp}.dump`);
+    run('pg_dump', ['--format=custom', '--no-owner', '--no-acl', '--file', safetyBackupPath]);
+    fs.chmodSync(safetyBackupPath, 0o600);
+    const encryptedSafetyPath = `${safetyBackupPath}.enc`;
+    const safetyMetadata = await encryptFile(safetyBackupPath, encryptedSafetyPath, safetyKey);
+    const safetyMetadataPath = `${encryptedSafetyPath}.meta.json`;
+    fs.writeFileSync(safetyMetadataPath, JSON.stringify(safetyMetadata, null, 2), { mode: 0o600 });
+    fs.chmodSync(safetyMetadataPath, 0o600);
+    const safetyChecksumPath = `${encryptedSafetyPath}.sha256`;
+    fs.writeFileSync(safetyChecksumPath, `${sha256File(encryptedSafetyPath)}  ${path.basename(encryptedSafetyPath)}\n`, { mode: 0o600 });
+    fs.chmodSync(safetyChecksumPath, 0o600);
+    fs.unlinkSync(safetyBackupPath);
+    run('pg_restore', ['--clean', '--if-exists', '--single-transaction', '--no-owner', '--no-acl', '--exit-on-error', '--dbname', target, restoreSource]);
+    await verifyRestore(target, prepared.metadata);
+    console.log(`Database PostgreSQL dipulihkan dari ${backupPath}. Backup sebelum restore: ${encryptedSafetyPath}`);
+  } finally {
+    fs.rmSync(tempDirectory, { recursive: true, force: true });
+  }
+}
+
+main().catch(async (error) => {
+  console.error(`Restore gagal: ${error.message}`);
+  await sendAlert({ title: 'Restore OrderGuard gagal', message: error.message, severity: 'critical' });
+  process.exitCode = 1;
+});

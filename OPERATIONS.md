@@ -11,7 +11,7 @@ Cache PWA hanya menyimpan shell aplikasi. Setelah mengubah `app.js`, `styles.css
 1. Push proyek ke repository GitHub, lalu di Render pilih **New → Blueprint** dan hubungkan repository tersebut.
 2. Sediakan PostgreSQL terkelola dan isi `DATABASE_URL` di Render sebagai secret. Blueprint tidak membuat database berbayar secara otomatis.
 3. Isi `ORDERGUARD_BOOTSTRAP_USERNAME`, `ORDERGUARD_BOOTSTRAP_NAME`, dan `ORDERGUARD_BOOTSTRAP_PASSWORD` sebagai environment variable rahasia di Render. Password harus minimal 12 karakter. Jangan simpan rahasia di repository atau kirim melalui chat.
-4. Tunggu health check `/api/health` berhasil, lalu gunakan URL HTTPS `*.onrender.com` yang diberikan Render.
+4. Tunggu health check `/api/ready` berhasil, lalu gunakan URL HTTPS `*.onrender.com` yang diberikan Render.
 
 URL Render sudah cukup untuk uji coba dan PWA; domain pribadi bisa ditambahkan kemudian. Gunakan URL akhir yang sama saat membuat installer desktop dan konfigurasi TWA Android.
 
@@ -32,6 +32,29 @@ Installer NSIS akan dibuat di `release/desktop/`. Perintah ini perlu dijalankan 
 
 APK Android melalui Trusted Web Activity (TWA) belum dapat dibuat sebelum domain produksi tersedia. APK memerlukan PWA yang sudah ter-deploy, konfigurasi verifikasi domain (`/.well-known/assetlinks.json`), Android SDK, dan kunci penandatanganan Android. Domain publik juga diperlukan untuk menyiapkan serta menguji file verifikasi tersebut.
 
+## Health, Readiness, Observability, dan Shutdown
+
+- `GET /api/health` adalah **liveness**: tidak menyentuh database; mengembalikan `status`, `uptimeSeconds`, `version`, dan `runtime` Node.
+- `GET /api/ready` adalah **readiness**: menjalankan `SELECT 1` dan mengembalikan `503` bila PostgreSQL tidak dapat dijangkau. Render `healthCheckPath` memakai endpoint ini.
+- `GET /api/metrics` menyajikan metrik Prometheus (request, respons per kelas status, error 5xx, `db_up`, `inflight_requests`, uptime, RSS). Endpoint **tersembunyi (404)** bila `ORDERGUARD_METRICS_TOKEN` tidak diatur. Bila diatur, wajib mengirim `Authorization: Bearer <token>`.
+- Log akses ditulis sebagai JSON satu baris ke stdout (request ID, method, path, status, durasi) tanpa IP mentah, cookie, token, atau body. Nonaktifkan dengan `ORDERGUARD_ACCESS_LOG=0`; test otomatis selalu nonaktif.
+- Setiap respons menyertakan `X-Request-Id` (nilai dari klien dipakai bila formatnya valid).
+- Server menangani `SIGTERM`/`SIGINT`: berhenti menerima koneksi baru, menyelesaikan request in-flight, menutup pool PostgreSQL, lalu keluar `0`. Batas paksa diatur oleh `ORDERGUARD_SHUTDOWN_TIMEOUT_MS` (default 25000, harus lebih kecil dari grace period platform).
+- Timeout HTTP: `headersTimeout` 20 dtk, `requestTimeout` 30 dtk, `keepAliveTimeout` 65 dtk.
+- `ORDERGUARD_HOST` mengatur alamat bind (default `0.0.0.0`). Untuk deployment di belakang reverse proxy di host yang sama, gunakan `127.0.0.1` agar aplikasi tidak dapat diakses langsung dari jaringan.
+
+### Alerting
+
+```sh
+ORDERGUARD_ALERT_WEBHOOK_URL="https://hooks.slack.com/services/..."
+ORDERGUARD_ALERT_WEBHOOK_FORMAT="slack"   # atau "generic"
+```
+
+- Backup yang gagal, restore yang gagal, kegagalan off-site, dan restore drill yang gagal mengirim alert.
+- Health check eksternal dijalankan dengan `npm run ops:healthcheck` terhadap `ORDERGUARD_HEALTHCHECK_URL` (atau `STAGING_BASE_URL`).
+- Unit systemd tersedia di `ops/systemd/`; workflow GitHub Actions terjadwal ada di `.github/workflows/ops-healthcheck.yml`.
+- Uji jalur alert tanpa menunggu insiden: `npm run ops:alert -- --title "Uji" --message "..." --severity info`.
+
 ## Inisialisasi Production
 
 Database PostgreSQL baru tidak membuat akun demo. Tentukan `DATABASE_URL` dan bootstrap Platform Admin melalui environment saat menjalankan aplikasi:
@@ -48,6 +71,43 @@ npm start
 Simpan password melalui secret manager, bukan file yang masuk Git atau log shell. Password bootstrap hanya digunakan jika tabel pengguna kosong. Untuk migrasi database demo lama, nonaktifkan/ganti seluruh akun demo dan passwordnya sebelum membuka layanan ke jaringan.
 
 Production harus menggunakan HTTPS. Cookie sesi hanya diberi flag `Secure` saat `NODE_ENV=production`.
+
+## Keamanan Autentikasi dan CSRF
+
+OrderGuard memakai cookie sesi dan CSRF token yang terikat ke sesi.
+
+- Setiap login atau `GET /api/session` mengembalikan `csrfToken`.
+- Request `POST`, `PATCH`, dan `DELETE` wajib mengirim header `X-CSRF-Token`.
+- Frontend resmi sudah mengirim header tersebut secara otomatis.
+- API client non-browser harus mengambil token dari login/session lalu mengirim header yang sama.
+- Request tanpa token, token salah, atau token dari sesi lain ditolak `403` dengan kode `CSRF_INVALID`.
+
+Konfigurasi origin produksi:
+
+```sh
+ORDERGUARD_ALLOWED_ORIGINS="https://app.domainanda.com"
+ORDERGUARD_TRUST_PROXY=1
+```
+
+- `ORDERGUARD_ALLOWED_ORIGINS` berisi origin persis, dipisahkan koma. Wildcard `*` tidak diizinkan dan akan menggagalkan startup.
+- Same-origin selalu diizinkan.
+- Di Render/reverse proxy, `ORDERGUARD_TRUST_PROXY=1` diperlukan agar Origin dan IP client dibaca benar.
+- Origin/Referer tidak tepercaya ditolak `403` dengan kode `ORIGIN_REJECTED`.
+
+Rate limit login (opsional; default ditampilkan):
+
+```sh
+ORDERGUARD_LOGIN_WINDOW_MINUTES=15
+ORDERGUARD_LOGIN_MAX_ATTEMPTS=5
+ORDERGUARD_LOGIN_MAX_IP_ATTEMPTS=20
+ORDERGUARD_SESSION_HOURS=8
+```
+
+Percobaan login berulang menghasilkan `429` dengan `Retry-After`. Batas berlaku per jendela waktu; akun tidak dikunci permanen.
+
+Audit autentikasi disimpan di tabel `auth_audit` (login sukses/gagal/blocked, logout, session expired/invalid, perubahan kredensial, pencabutan sesi). Password, session token, CSRF token, dan secret tidak disimpan. Lihat `SECURITY.md` untuk detail dan contoh query.
+
+Password user baru dan perubahan password minimal 10 karakter; password bootstrap Platform Admin minimal 12 karakter.
 
 ## PostgreSQL Lokal
 
@@ -106,7 +166,7 @@ Access/refresh token disimpan terenkripsi di PostgreSQL dan tidak dikirim ke bro
    ```
 
    Jika database SQLite berada di lokasi lain, gunakan path yang sesuai. Simpan salinan di lokasi aman.
-3. Jalankan migrasi satu kali dengan dependensi proyek terpasang:
+3. Jalankan migrasi satu kali dengan dependensi proyek terpasang. `better-sqlite3` adalah **devDependency** (tidak disertakan pada instalasi produksi `npm ci --omit=dev`), jadi jalankan migrasi dari checkout yang memiliki devDependencies (`npm ci` penuh):
 
    ```sh
    DATABASE_URL="postgresql://user:password@host:5432/orderguard" \
@@ -148,12 +208,177 @@ npm run db:backup
 
 Jalankan `pg_dump` dan `pg_restore` dari PostgreSQL client tools yang tersedia. Secara default file custom-format disimpan di `data/backups/` dan retensi menyimpan 30 backup terakhir. Atur `ORDERGUARD_BACKUP_DIR` atau `ORDERGUARD_BACKUP_KEEP` bila lokasi atau retensinya berbeda. Backup berisi data operasional dan wajib diperlakukan sebagai data sensitif. Pastikan user database memiliki izin backup dan restore.
 
-## Restore
-
-Pulihkan dari backup custom-format yang sudah diverifikasi:
+Sebelum backup terjadwal, jalankan preflight yang memeriksa koneksi database, format key, ketersediaan `pg_dump`/`pg_restore`, direktori tujuan, dan konfigurasi off-site tanpa menulis backup:
 
 ```sh
+ORDERGUARD_BACKUP_ENCRYPTION_KEY="<key>" npm run db:backup:check
+```
+
+Setiap backup terenkripsi menghasilkan:
+
+- `orderguard-YYYYMMDDTHHMMSSZ.dump.enc` — ciphertext AES-256-GCM.
+- `orderguard-YYYYMMDDTHHMMSSZ.dump.enc.meta.json` — IV, authentication tag, checksum plaintext/ciphertext, `keyId`, dan jumlah baris tabel penting.
+- `orderguard-YYYYMMDDTHHMMSSZ.dump.enc.sha256` — checksum ciphertext.
+
+Script memvalidasi arsip dengan `pg_restore --list` dan menulis checksum SHA-256. Simpan file `.enc`, `.meta.json`, dan `.sha256` bersama-sama. Backup plaintext hanya untuk development dengan `ORDERGUARD_BACKUP_ALLOW_PLAINTEXT=1`; jangan gunakan di production.
+
+### Restore drill otomatis
+
+`npm run db:drill` menjalankan rantai bukti: backup terenkripsi → restore ke database terpisah → bandingkan jumlah baris → tolak key salah → tolak ciphertext yang dimodifikasi.
+
+```sh
+DRILL_SOURCE_DATABASE_URL="postgresql://.../orderguard_staging" \
+DRILL_TARGET_DATABASE_URL="postgresql://.../orderguard_staging_restore" \
+ORDERGUARD_BACKUP_ENCRYPTION_KEY="<key>" \
+DRILL_BACKUP_DIR=/tmp/orderguard-drill \
+DRILL_REPORT_PATH=/tmp/orderguard-drill/report.json \
+npm run db:drill
+```
+
+Database target **wajib berbeda** dari sumber dan khusus untuk drill. Perintah keluar `0` hanya jika semua langkah lulus, dan mengirim alert bila gagal. Jalankan minimal sebelum rilis produksi dan setelah perubahan skema/backup.
+
+## Restore
+
+Restore adalah tindakan destruktif pada database target. Script membutuhkan konfirmasi eksplisit berupa nama database target:
+
+```sh
+DATABASE_URL="postgresql://user:password@host:5432/orderguard" \
+ORDERGUARD_CONFIRM_RESTORE="orderguard" \
 npm run db:restore -- data/backups/orderguard-YYYYMMDDTHHMMSSZ.dump
 ```
 
-Script membuat backup keselamatan terlebih dahulu, lalu memulihkan objek dari arsip ke database `DATABASE_URL` menggunakan `pg_restore --clean`. Setelah restore berhasil, jalankan test/health check sebelum membuka layanan kembali. Jadwalkan backup rutin dan simpan salinan di media terpisah; script ini tidak menjadwalkan backup otomatis.
+Script akan:
+
+1. Memeriksa checksum `.sha256` bila tersedia.
+2. Memvalidasi arsip dengan `pg_restore --list`.
+3. Membuat backup keselamatan `orderguard-pre-restore-*.dump`.
+4. Menjalankan restore atomik (`--single-transaction --clean --if-exists`) ke database target.
+5. Memverifikasi keberadaan tabel inti dan membandingkan jumlah baris tabel penting dengan metadata backup.
+
+**Jangan arahkan `DATABASE_URL` restore ke database produksi tanpa persetujuan dan backup terbaru.** Uji restore pada database terpisah terlebih dahulu, lalu jalankan health check/test setelah restore. Script ini tidak menjadwalkan backup otomatis; jadwalkan melalui cron/Render cron job dan simpan salinan di media terpisah.
+
+## Inisialisasi Tenant Baru
+
+Tenant baru selalu dimulai dengan state operasional kosong. Data demo tidak lagi dibuat otomatis untuk tenant baru. Data lama pada tenant yang sudah ada tidak dihapus.
+
+Untuk pengembangan/test internal, data demo hanya dapat diaktifkan eksplisit melalui environment test:
+
+```sh
+NODE_ENV=test ORDERGUARD_TEST_SEED_DEMO=1 npm start
+```
+
+Jangan gunakan opsi tersebut pada production.
+
+## Integritas Data
+
+- Setiap manifest ID dicatat di `tenant_manifest_ids` dan divalidasi unik per tenant. Pembuatan manifest berjalan di dalam transaksi tenant state yang sama, sehingga dua request paralel tidak dapat menghasilkan ID duplikat.
+- Manifest berstatus `CLOSED`, `CANCELLED`, atau `CONFIRMED` tidak dapat diubah melalui scan atau handover. Penutupan/pembatalan resmi tetap melalui workflow Store Admin yang tercatat.
+- Setiap scan wajib memiliki catatan audit yang sesuai; setiap sesi handover wajib memiliki audit `Serah terima <id> dikonfirmasi: ...`.
+- Bukti handover bersifat append-only; evidence pada sesi lama tidak dapat diubah.
+- Payload state yang tidak valid tidak diganti dengan state demo. Payload asli dipertahankan di `state_quarantine` untuk investigasi/recovery manual, dan API mengembalikan `503 STATE_CORRUPTED`.
+- Foreign key ditambahkan secara additive dengan `NOT VALID`: constraint berlaku untuk data baru tanpa menggagalkan startup karena data lama. Validasi constraint produksi harus melalui script yang memblokir orphan/referensi lintas tenant:
+
+  ```sh
+  DATABASE_URL="..." npm run db:constraints:validate
+  DATABASE_URL="..." npm run db:constraints:validate -- --apply --confirm orderguard
+  ```
+
+  Script memakai `lock_timeout` dan `statement_timeout` agar tidak menggantung. Tanpa `--apply --confirm <nama-database>`, script hanya melaporkan constraint yang belum tervalidasi.
+- Index tambahan tersedia untuk session, audit, user tenant, manifest registry, dan quarantine.
+
+## Audit Integritas & Rekonsiliasi
+
+Audit bersifat read-only dan tidak menghapus data:
+
+```sh
+DATABASE_URL="postgresql://user:password@host:5432/orderguard" npm run db:integrity:audit
+```
+
+Audit memeriksa foreign key `NOT VALID`, orphan record, dan manifest ID duplikat. Rekonsiliasi default dry-run:
+
+```sh
+DATABASE_URL="..." npm run db:integrity:reconcile
+```
+
+Untuk menerapkan pemindahan orphan ke `integrity_orphans` dan validasi FK:
+
+```sh
+DATABASE_URL="..." npm run db:integrity:reconcile -- --apply --confirm orderguard
+```
+
+- Tanpa `--apply --confirm <nama-database>`, tidak ada perubahan.
+- Orphan disalin ke `integrity_orphans` sebelum dihapus.
+- Manifest ID duplikat tidak dihapus otomatis; harus ditinjau manual.
+- `VALIDATE CONSTRAINT` dijalankan setelah orphan bersih; kegagalan membatalkan transaksi.
+- Periksa laporan sebelum dan sesudah; jangan menjalankan `--apply` pada produksi tanpa persetujuan.
+
+## Quarantine Recovery
+
+Endpoint admin:
+
+```text
+GET  /api/admin/quarantine
+GET  /api/admin/quarantine/:id
+POST /api/admin/quarantine/:id/recover   { "confirm": true, "expectedPayloadHash": "..." }
+```
+
+- Super Admin dapat melihat seluruh tenant; Store Admin hanya tenant sendiri.
+- Preview tidak mengembalikan payload mentah; hanya ringkasan dan status validitas.
+- Recovery memerlukan konfirmasi eksplisit dan CSRF token.
+- Payload harus JSON valid, manifest ID unik/format valid, dan evidence valid.
+- State aktif sebelum recovery disalin ke `state_quarantine`.
+- Recovery berjalan dalam transaksi; kegagalan rollback.
+- Audit recovery disimpan append-only di `quarantine_recovery_audit`; trigger database menolak UPDATE/DELETE.
+- Tidak ada recovery otomatis.
+
+Retensi quarantine dapat dijalankan manual:
+
+```sh
+ORDERGUARD_QUARANTINE_RETENTION_DAYS=90 DATABASE_URL="..." npm run db:prune-quarantine
+# setelah review:
+ORDERGUARD_QUARANTINE_RETENTION_DAYS=90 DATABASE_URL="..." npm run db:prune-quarantine -- --apply --confirm orderguard
+```
+
+Quarantine yang sudah memiliki audit recovery tidak dihapus oleh prune.
+
+## Backup Encryption, Offsite, RPO/RTO
+
+Backup terenkripsi wajib memakai:
+
+```sh
+ORDERGUARD_BACKUP_ENCRYPTION_KEY="<32-byte-hex-64-char-atau-base64>"
+```
+
+- Algoritma: AES-256-GCM; IV acak per backup; authentication tag disimpan di metadata.
+- Checksum ciphertext dan plaintext disimpan di `.sha256`/`.meta.json`.
+- Kunci tidak pernah dicetak ke log dan tidak boleh disimpan di repository.
+- Restore mendukung `ORDERGUARD_BACKUP_PREVIOUS_ENCRYPTION_KEYS` (dipisahkan koma) untuk rotasi kunci.
+- Off-site nyata: set `ORDERGUARD_BACKUP_OFFSITE_S3_URI=s3://bucket/prefix` (AWS CLI) atau `ORDERGUARD_BACKUP_OFFSITE_RCLONE_REMOTE=nama-remote:path` (rclone). `ORDERGUARD_BACKUP_OFFSITE_DIR` hanya mirror filesystem lokal dan diberi peringatan; jangan dianggap disaster recovery terpisah.
+- Backup lokal/off-site lama tidak dihapus sebelum backup baru lolos verifikasi.
+- Retensi: `ORDERGUARD_BACKUP_KEEP` (default 30).
+- Untuk mode development tanpa enkripsi, set `ORDERGUARD_BACKUP_ALLOW_PLAINTEXT=1`; jangan gunakan di production.
+
+**Prosedur rotasi key:**
+
+1. Buat key baru dan simpan sebagai secret.
+2. Pindahkan key lama ke `ORDERGUARD_BACKUP_PREVIOUS_ENCRYPTION_KEYS`, set key baru sebagai `ORDERGUARD_BACKUP_ENCRYPTION_KEY`.
+3. Backup baru memakai key baru; backup lama tetap dapat direstore memakai key sebelumnya.
+4. Re-enkripsi backup lama secara batch (dry-run default):
+
+   ```sh
+   ORDERGUARD_BACKUP_ENCRYPTION_KEY="<key-lama>" \
+   ORDERGUARD_BACKUP_NEW_ENCRYPTION_KEY="<key-baru>" \
+   ORDERGUARD_BACKUP_DIR=/path/backups npm run db:backup:rotate-keys
+
+   ORDERGUARD_BACKUP_ENCRYPTION_KEY="<key-lama>" \
+   ORDERGUARD_BACKUP_NEW_ENCRYPTION_KEY="<key-baru>" \
+   ORDERGUARD_BACKUP_DIR=/path/backups \
+   npm run db:backup:rotate-keys -- --apply --confirm /path/backups
+   ```
+
+   Script mendekripsi dan memverifikasi plaintext, menulis ciphertext baru, memverifikasi hasil re-enkripsi, lalu menyimpan file asli sebagai `.pre-rotation.enc` beserta metadata/checksum. File asli tidak dihapus sebelum verifikasi berhasil dan tetap dapat direstore dengan key lama.
+5. Setelah seluruh backup berhasil dirotasi dan diuji restore, hapus key lama dari environment.
+
+**Scheduler:** `render.yaml` menyediakan cron **Docker** harian pukul 02:00 yang membangun `ops/backup/Dockerfile` (Node 24 + `postgresql-client-16` + AWS CLI + rclone) dan menjalankan preflight lalu backup. Runtime Node native tidak dijamin memiliki tool tersebut, jadi jangan mengganti cron kembali ke `runtime: node`. Alternatif: unit systemd di `ops/backup/orderguard-backup.service`/`.timer` atau GitHub Actions scheduled. Backup harus disalin off-site; disk Render tidak boleh menjadi satu-satunya lokasi.
+
+**RPO/RTO target:** RPO ≤ 24 jam dengan jadwal harian (perpendek jadwal bila diperlukan); RTO target ≤ 2 jam dengan restore terverifikasi ke database terpisah. Angka ini adalah target operasional, bukan jaminan; ukur ulang sesuai ukuran database dan kecepatan storage.

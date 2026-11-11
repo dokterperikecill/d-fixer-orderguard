@@ -1,0 +1,10 @@
+[Unit]
+Description=OrderGuard readiness health check
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/orderguard/healthcheck.env
+ExecStart=/usr/bin/node /opt/orderguard/scripts/healthcheck.js
+TimeoutStartSec=60

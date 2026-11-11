@@ -9,11 +9,12 @@ const VIEW_LABELS = {
   returns: "Pembatalan & Retur",
   reports: "Laporan",
   audit: "Audit log",
+  quarantine: "Quarantine",
   employees: "Karyawan",
 };
 const ROLE_PERMISSIONS = {
-  'super-admin': ['dashboard', 'manifests', 'imports', 'incidents', 'returns', 'reports', 'audit', 'employees'],
-  'store-admin': ['dashboard', 'manifests', 'imports', 'incidents', 'returns', 'reports', 'audit'],
+  'super-admin': ['dashboard', 'manifests', 'imports', 'incidents', 'returns', 'reports', 'audit', 'quarantine', 'employees'],
+  'store-admin': ['dashboard', 'manifests', 'imports', 'incidents', 'returns', 'reports', 'audit', 'quarantine'],
   'handover-staff': ['dashboard', 'manifests', 'returns'],
 };
 const ROLE_LABELS = {
@@ -56,6 +57,19 @@ const SCAN_LABELS = {
   RETURN_IN_TRANSIT: "Dalam retur",
   RETURN_RECEIVED: "Retur diterima",
 };
+function scanAuditAction(result, tracking) {
+  return {
+    MATCH: `Paket dipindai: ${tracking}`,
+    NOT_IN_MANIFEST: `Pemindaian di luar manifest: ${tracking}`,
+    DUPLICATE_SCAN: `Pemindaian duplikat: ${tracking}`,
+    ALREADY_HANDED_OVER: `Paket sudah diserahkan: ${tracking}`,
+    INVALID_PACKAGE: `Paket tidak valid: ${tracking}`,
+    CANCELLED: `Paket dibatalkan: ${tracking}`,
+    CANCELLED_BY_BUYER: `Paket dibatalkan pembeli: ${tracking}`,
+    RETURN_IN_TRANSIT: `Retur dalam perjalanan: ${tracking}`,
+    RETURN_RECEIVED: `Retur diterima: ${tracking}`,
+  }[result] || `Pemindaian: ${tracking}`;
+}
 const ORDER_EVENT_LABELS = {
   CANCELLED_BEFORE_HANDOVER: "Pembatalan pembeli",
   CANCELLATION_AFTER_HANDOVER: "Pembatalan setelah pickup",
@@ -127,7 +141,7 @@ function loadState(storageKey = STORAGE_KEY, shopName = "D'Fixer Store") {
   } catch (error) {
     console.warn("Data lokal tidak dapat dibaca.", error);
   }
-  return sampleState(shopName);
+  return { manifests: [], incidents: [], audit: [], importJobs: [], orderEvents: [] };
 }
 
 const tenantStorageKey = () => `${STORAGE_KEY}:${currentUser?.tenantId || 'anonymous'}`;
@@ -144,10 +158,12 @@ function activateTenantCache() {
 
 async function hydrateStateFromServer() {
   try {
-    const response = await fetch('/api/state');
+    const response = await apiFetch('/api/state');
     if (!response.ok) return;
     const remote = await response.json();
     if (remote && Array.isArray(remote.manifests)) {
+      const version = response.headers.get('x-state-version');
+      if (version !== null && version !== '' && Number.isFinite(Number(version))) stateVersion = Number(version);
       localStorage.setItem(tenantStorageKey(), JSON.stringify(remote));
       Object.assign(state, remote);
     }
@@ -157,6 +173,18 @@ async function hydrateStateFromServer() {
 }
 
 const state = { manifests: [], incidents: [], audit: [], importJobs: [], orderEvents: [] };
+let stateVersion = null;
+let csrfToken = null;
+const nativeFetch = window.fetch.bind(window);
+
+function apiFetch(url, options = {}) {
+  const method = String(options.method || "GET").toUpperCase();
+  const headers = new Headers(options.headers || {});
+  if (!["GET", "HEAD", "OPTIONS"].includes(method) && csrfToken) {
+    headers.set("X-CSRF-Token", csrfToken);
+  }
+  return nativeFetch(url, { ...options, headers, credentials: options.credentials || "same-origin" });
+}
 let currentUser = null;
 let currentView = "dashboard";
 let selectedManifestId = null;
@@ -174,7 +202,7 @@ let runtimeConfig = { environment: "sandbox" };
 
 async function loadRuntimeConfig() {
   try {
-    const response = await fetch("/api/config", { credentials: "same-origin" });
+    const response = await apiFetch("/api/config", { credentials: "same-origin" });
     if (response.ok) {
       const config = await response.json();
       if (config?.environment) runtimeConfig = config;
@@ -188,10 +216,11 @@ async function loadRuntimeConfig() {
 
 async function getSession() {
   try {
-    const response = await fetch('/api/session', { credentials: 'same-origin' });
+    const response = await apiFetch('/api/session', { credentials: 'same-origin' });
     if (!response.ok) return null;
     const data = await response.json();
     currentUser = data.user;
+    csrfToken = data.csrfToken || null;
     if (currentUser) {
       localStorage.setItem(CURRENT_USER_KEY, JSON.stringify(currentUser));
       activateTenantCache();
@@ -205,7 +234,7 @@ async function getSession() {
 }
 
 async function login(username, password) {
-  const response = await fetch('/api/login', {
+  const response = await apiFetch('/api/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ username, password }),
@@ -218,6 +247,7 @@ async function login(username, password) {
   }
 
   currentUser = data.user;
+  csrfToken = data.csrfToken || null;
   localStorage.setItem(CURRENT_USER_KEY, JSON.stringify(currentUser));
   activateTenantCache();
   await hydrateStateFromServer();
@@ -228,8 +258,15 @@ async function login(username, password) {
 }
 
 async function logout() {
-  await fetch('/api/logout', { method: 'POST', credentials: 'same-origin' });
+  const response = await apiFetch('/api/logout', { method: 'POST', credentials: 'same-origin' });
+  if (!response.ok) {
+    const result = await response.json().catch(() => ({}));
+    toast(result.error || 'Logout gagal. Muat ulang halaman lalu coba lagi.', true);
+    return;
+  }
   currentUser = null;
+  csrfToken = null;
+  stateVersion = null;
   localStorage.removeItem(CURRENT_USER_KEY);
   currentView = 'dashboard';
   selectedManifestId = null;
@@ -259,18 +296,25 @@ async function persist() {
   const snapshot = JSON.stringify(state);
   localStorage.setItem(tenantStorageKey(), snapshot);
   try {
-    const response = await fetch('/api/state', {
+    const headers = { 'Content-Type': 'application/json' };
+    if (Number.isInteger(stateVersion)) headers['If-Match'] = `"state-${stateVersion}"`;
+    const response = await apiFetch('/api/state', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: snapshot,
     });
+    const result = await response.json().catch(() => ({}));
     if (!response.ok) {
-      const result = await response.json().catch(() => ({}));
       await hydrateStateFromServer();
       renderPage();
-      toast(result.error || 'Perubahan ditolak oleh server.', true);
+      if (response.status === 409) {
+        toast('Data telah diperbarui pengguna lain. Perubahan Anda belum tersimpan; silakan ulangi.', true);
+      } else {
+        toast(result.error || 'Perubahan ditolak oleh server.', true);
+      }
       return false;
     }
+    if (Number.isInteger(result.version)) stateVersion = result.version;
     return true;
   } catch (error) {
     console.warn('Gagal menyimpan state ke backend.', error);
@@ -306,6 +350,24 @@ function openModal(title, subtitle, body) {
 function closeModal() {
   modalBackdrop.hidden = true;
   modal.innerHTML = "";
+}
+
+function openEvidenceModal(title, subtitle, dataUri, alt) {
+  openModal(title, subtitle, '<div id="evidence-modal-content"></div><div class="modal-actions" style="margin-top:12px"><button type="button" class="button button-secondary" data-action="close-modal">Tutup</button></div>');
+  const container = document.querySelector("#evidence-modal-content");
+  if (!container) return;
+  const library = window.OrderGuardEvidence;
+  const result = library && typeof library.createEvidenceImage === "function"
+    ? library.createEvidenceImage(document, dataUri, alt)
+    : { ok: false, error: "Validator bukti foto tidak tersedia." };
+  if (result.ok) {
+    container.append(result.element);
+    return;
+  }
+  const message = document.createElement("p");
+  message.className = "row-error";
+  message.textContent = result.error || "Bukti foto tidak valid atau formatnya tidak didukung.";
+  container.append(message);
 }
 
 function getManifest(id) {
@@ -412,6 +474,7 @@ function renderPage() {
     reports: renderReports,
     audit: renderAudit,
     employees: renderEmployees,
+    quarantine: renderQuarantine,
     "manifest-detail": () => renderManifestDetail(getManifest(selectedManifestId)),
   };
   (renderers[currentView] || renderDashboard)();
@@ -577,7 +640,7 @@ async function loadTikTokIntegration() {
   const target = document.querySelector("#tiktok-integration");
   if (!target) return;
   try {
-    const statusResponse = await fetch('/api/tiktok/status');
+    const statusResponse = await apiFetch('/api/tiktok/status');
     const status = await statusResponse.json();
     if (!statusResponse.ok) throw new Error(status.error || 'Status integrasi TikTok Shop tidak dapat dibaca.');
     if (!status.configured) {
@@ -585,7 +648,7 @@ async function loadTikTokIntegration() {
       return;
     }
 
-    const shopsResponse = await fetch('/api/tiktok/shops');
+    const shopsResponse = await apiFetch('/api/tiktok/shops');
     const shopData = await shopsResponse.json();
     if (!shopsResponse.ok) throw new Error(shopData.error || 'Daftar toko TikTok Shop tidak dapat dibaca.');
     tiktokShops = shopData.shops || [];
@@ -606,7 +669,7 @@ async function syncTikTokOrders(button) {
   if (!shopId) return toast('Pilih toko TikTok Shop terlebih dahulu.', true);
   button.disabled = true;
   try {
-    const response = await fetch('/api/tiktok/sync', {
+    const response = await apiFetch('/api/tiktok/sync', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ shopId }),
@@ -758,7 +821,7 @@ function createManifest({ shop, courier, date, location, parcels, source = "manu
   return manifest;
 }
 
-function commitImport() {
+async function commitImport() {
   if (!importDraft) return;
   readImportMapping();
   const rows = analyzeImport();
@@ -776,7 +839,8 @@ function commitImport() {
   const job = { id: makeId("IMP"), fileName: importDraft.fileName, total: rows.length, valid: validRows.length, failed: failedRows.length, manifestCount: created.length, createdAt: nowISO(), errors: failedRows.map(({ line, order, tracking, issue }) => ({ line, order, tracking, issue })) };
   state.importJobs.unshift(job);
   logAudit(`Impor ${job.fileName}: ${job.valid} valid, ${job.failed} ditolak`, job.id);
-  persist();
+  const saved = await persist();
+  if (!saved) return;
   lastImportJob = job;
   importDraft = null;
   toast(`${job.valid} paket dimasukkan ke ${created.length} manifest.`);
@@ -817,7 +881,7 @@ function openOrderEventModal(manifest, parcel, type) {
     ${needsReason ? '<div class="field"><label for="event-reason">Alasan <span class="required-mark">*</span></label><textarea id="event-reason" name="reason" required maxlength="500" placeholder="Contoh: pembeli membatalkan pesanan"></textarea></div>' : ""}
     <div class="modal-grid">
       <div class="field"><label for="event-occurred-at">Waktu kejadian</label><input id="event-occurred-at" name="occurredAt" type="datetime-local" value="${localDateTimeInput()}" /></div>
-      ${needsPhoto ? '<div class="field"><label for="event-photo">Foto bukti retur <span class="required-mark">*</span></label><input id="event-photo" name="photo" type="file" accept="image/*" required /><span class="field-help">Wajib. Foto dikompres sebelum disimpan.</span></div>' : ""}
+      ${needsPhoto ? '<div class="field"><label for="event-photo">Foto bukti retur <span class="required-mark">*</span></label><input id="event-photo" name="photo" type="file" accept="image/jpeg,image/png,image/webp" required /><span class="field-help">Wajib. Foto dikompres sebelum disimpan.</span></div>' : ""}
     </div>
     <div class="field"><label for="event-note">Catatan</label><textarea id="event-note" name="note" maxlength="1000" placeholder="Opsional"></textarea></div>
     <div class="modal-actions"><button type="button" class="button button-secondary" data-action="close-modal">Batal</button><button type="submit" class="button button-primary"><i data-lucide="save"></i> Simpan kejadian</button></div>
@@ -835,7 +899,7 @@ async function submitOrderEvent(form) {
     try { evidence = await loadImageData(photo); }
     catch (error) { return toast(error.message, true); }
   }
-  const response = await fetch("/api/order-events", {
+  const response = await apiFetch("/api/order-events", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     credentials: "same-origin",
@@ -913,7 +977,7 @@ function renderReturns() {
 function showOrderEventEvidence(eventId) {
   const event = (state.orderEvents || []).find((item) => item.id === eventId);
   if (!event?.evidence) return;
-  openModal("Bukti retur diterima", `${event.tracking} · ${formatDateTime(event.recordedAt)}`, `<img src="${event.evidence}" alt="Bukti retur ${escapeHtml(event.tracking)}" style="display:block;width:100%;max-height:62vh;object-fit:contain;border-radius:5px;background:#f2f3f1" /><div class="modal-actions" style="margin-top:12px"><button type="button" class="button button-secondary" data-action="close-modal">Tutup</button></div>`);
+  openEvidenceModal("Bukti retur diterima", `${event.tracking} · ${formatDateTime(event.recordedAt)}`, event.evidence, `Bukti retur ${event.tracking}`);
 }
 
 function renderManifestDetail(manifest) {
@@ -937,7 +1001,7 @@ function renderManifestDetail(manifest) {
       <div class="scanner-actions"><button class="button button-secondary button-small" id="camera-toggle" type="button"><i data-lucide="camera"></i> Buka kamera</button></div><video class="camera-frame" id="camera-frame" playsinline muted></video>
       <div class="scan-log" id="scan-log">${scanEntries.map((entry) => `<div class="scan-log-entry"><div><strong>${escapeHtml(entry.tracking)}</strong><small style="display:block;margin-top:4px">${formatDateTime(entry.createdAt)} · ${escapeHtml(entry.actor || ACTOR)}</small></div><span class="status-pill ${statusClass(entry.result)}">${escapeHtml(SCAN_LABELS[entry.result] || entry.result)}</span></div>`).join("") || '<span class="field-help">Belum ada aktivitas pemindaian.</span>'}</div>
     </section><section class="panel handover-panel"><h2>Konfirmasi serah terima</h2><p>Setiap sesi menyimpan daftar resi yang dipilih, penerima, waktu, dan bukti secara terpisah.</p>
-      <form id="handover-form"><div class="handover-fields"><div class="field"><label for="receiver-name">Nama penerima / kurir <span class="required-mark">*</span></label><input id="receiver-name" name="receiver" required placeholder="Nama petugas kurir" /></div><div class="field"><label for="handover-note">Catatan sesi</label><input id="handover-note" name="note" placeholder="Opsional" /></div><div class="field"><label for="handover-photo">Foto bukti</label><input id="handover-photo" name="photo" type="file" accept="image/*" /><span class="field-help">Opsional. Foto dikompres di perangkat lalu disimpan bersama data serah terima di server.</span></div></div>
+      <form id="handover-form"><div class="handover-fields"><div class="field"><label for="receiver-name">Nama penerima / kurir <span class="required-mark">*</span></label><input id="receiver-name" name="receiver" required placeholder="Nama petugas kurir" /></div><div class="field"><label for="handover-note">Catatan sesi</label><input id="handover-note" name="note" placeholder="Opsional" /></div><div class="field"><label for="handover-photo">Foto bukti</label><input id="handover-photo" name="photo" type="file" accept="image/jpeg,image/png,image/webp" /><span class="field-help">Opsional. Foto dikompres di perangkat lalu disimpan bersama data serah terima di server.</span></div></div>
         ${scannedPackages.length ? `<div class="field" style="margin-top:12px"><label>Paket yang diterima (${scannedPackages.length} dipindai)</label>${scannedPackages.map((parcel) => `<label class="handover-ready"><span><input type="checkbox" name="accepted" value="${escapeHtml(parcel.tracking)}" checked /> <span class="mono">${escapeHtml(parcel.tracking)}</span></span><span>Diterima</span></label>`).join("")}<span class="field-help">Hapus centang pada paket yang ditolak kurir. Paket tersebut tidak diberi status diterima.</span></div>` : `<div class="handover-ready"><span>Belum ada paket yang siap diserahkan</span><strong>0 paket</strong></div>`}
         <button class="button button-primary" type="submit" style="width:100%;margin-top:12px" ${canHandover ? "" : "disabled"}><i data-lucide="badge-check"></i> Konfirmasi penerimaan</button>
       </form></section></div>
@@ -949,39 +1013,32 @@ function renderManifestDetail(manifest) {
   if (scanInput && canHandover) scanInput.focus();
 }
 
-function recordScan(manifest, rawTracking) {
+async function recordScan(manifest, rawTracking) {
   const tracking = String(rawTracking || "").trim();
   if (!tracking) return;
   if (["CLOSED", "CANCELLED", "CONFIRMED"].includes(computedManifestStatus(manifest))) return toast("Manifest sudah final dan tidak menerima pemindaian baru.", true);
-  const parcel = manifest.packages.find((item) => normalize(item.tracking) === normalize(tracking));
-  let result = "INVALID_PACKAGE";
-  if (parcel) {
-    if (parcel.status === "HANDED_OVER") result = "ALREADY_HANDED_OVER";
-    else if (parcel.status === "SCANNED") result = "DUPLICATE_SCAN";
-    else if (parcel.status === "CANCELLED") result = "CANCELLED";
-    else if (["CANCELLED_BEFORE_HANDOVER", "CANCELLATION_AFTER_HANDOVER"].includes(parcel.status)) result = "CANCELLED_BY_BUYER";
-    else if (parcel.status === "RETURN_IN_TRANSIT") result = "RETURN_IN_TRANSIT";
-    else if (parcel.status === "RETURN_RECEIVED") result = "RETURN_RECEIVED";
-    else if (parcel.status === "REJECTED") result = "INVALID_PACKAGE";
-    else if (parcel.status === "EXPECTED") {
-      parcel.status = "SCANNED";
-      parcel.scannedAt = nowISO();
-      result = "MATCH";
+  const response = await apiFetch(`/api/manifests/${encodeURIComponent(manifest.id)}/scans`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ tracking }),
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    if (response.status === 409 || response.status === 404) {
+      await hydrateStateFromServer();
+      renderPage();
     }
-  } else {
-    const handedElsewhere = state.manifests.some((other) => other.id !== manifest.id && other.packages.some((item) => normalize(item.tracking) === normalize(tracking) && item.status === "HANDED_OVER"));
-    result = handedElsewhere ? "ALREADY_HANDED_OVER" : "NOT_IN_MANIFEST";
+    toast(result.error || "Pemindaian ditolak oleh server.", true);
+    return;
   }
-  manifest.scans.push({ tracking, result, createdAt: nowISO(), actor: currentUser?.name || ACTOR });
-  if (result === "NOT_IN_MANIFEST") logAudit(`Pemindaian di luar manifest: ${tracking}`, manifest.id);
-  else if (result === "MATCH") logAudit(`Paket dipindai: ${tracking}`, manifest.id);
-  persist();
+  await hydrateStateFromServer();
   currentView = "manifest-detail";
   renderPage();
   const feedback = document.querySelector("#scan-feedback");
-  const stateClass = result === "MATCH" ? "match" : ["DUPLICATE_SCAN"].includes(result) ? "warning" : "error";
+  if (!feedback) return;
+  const stateClass = result.result === "MATCH" ? "match" : ["DUPLICATE_SCAN"].includes(result.result) ? "warning" : "error";
   feedback.className = `scan-feedback ${stateClass}`;
-  feedback.innerHTML = `<i data-lucide="${result === "MATCH" ? "circle-check" : result === "DUPLICATE_SCAN" ? "triangle-alert" : "circle-alert"}"></i><span><strong>${escapeHtml(SCAN_LABELS[result])}:</strong> ${escapeHtml(tracking)}${result === "NOT_IN_MANIFEST" ? ". Resi ini tidak menambah jumlah paket yang sah." : ""}</span>`;
+  feedback.innerHTML = `<i data-lucide="${result.result === "MATCH" ? "circle-check" : result.result === "DUPLICATE_SCAN" ? "triangle-alert" : "circle-alert"}"></i><span><strong>${escapeHtml(SCAN_LABELS[result.result])}:</strong> ${escapeHtml(tracking)}${result.result === "NOT_IN_MANIFEST" ? ". Resi ini tidak menambah jumlah paket yang sah." : ""}</span>`;
   renderIcons(feedback);
   document.querySelector("#scan-input")?.focus();
 }
@@ -1015,7 +1072,6 @@ async function confirmHandover(form) {
   const scanned = manifest.packages.filter((parcel) => parcel.status === "SCANNED");
   if (!receiver || !accepted.length) return toast("Nama penerima dan minimal satu paket yang diterima wajib diisi.", true);
   if (accepted.some((tracking) => !scanned.some((parcel) => parcel.tracking === tracking))) return toast("Daftar paket berubah. Muat ulang manifest sebelum mengonfirmasi.", true);
-  const rejected = scanned.filter((parcel) => !accepted.includes(parcel.tracking));
   if (!window.confirm(`Konfirmasi ${accepted.length} paket diterima oleh ${receiver}? Catatan sesi ini tidak dapat ditimpa.`)) return;
   let evidence = null;
   const photo = formData.get("photo");
@@ -1023,21 +1079,26 @@ async function confirmHandover(form) {
     try { evidence = await loadImageData(photo); }
     catch (error) { return toast(error.message, true); }
   }
-  const session = { id: makeId("TR"), receiver, actor: currentUser?.name || ACTOR, createdAt: nowISO(), note: String(formData.get("note") || "").trim(), items: [...accepted], evidence };
-  accepted.forEach((tracking) => {
-    const parcel = manifest.packages.find((item) => item.tracking === tracking);
-    parcel.status = "HANDED_OVER";
-    parcel.handedOverAt = session.createdAt;
-    parcel.handedOverSessionId = session.id;
+  const response = await apiFetch(`/api/manifests/${encodeURIComponent(manifest.id)}/handovers`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      receiver,
+      items: [...accepted],
+      note: String(formData.get("note") || "").trim(),
+      evidence,
+    }),
   });
-  rejected.forEach((parcel) => {
-    parcel.status = "REJECTED";
-    state.incidents.unshift({ id: makeId("INC"), category: "Paket ditolak kurir", manifestId: manifest.id, tracking: parcel.tracking, description: `Paket ditolak oleh ${receiver} saat sesi ${session.id}.`, reportedBy: currentUser?.name || ACTOR, createdAt: nowISO(), status: "OPEN", resolution: "" });
-  });
-  manifest.sessions.push(session);
-  manifest.status = getManifestCounts(manifest).outstanding === 0 ? "CONFIRMED" : "PARTIALLY_HANDED_OVER";
-  logAudit(`Serah terima ${session.id} dikonfirmasi: ${accepted.length} diterima${rejected.length ? `, ${rejected.length} ditolak` : ""}`, manifest.id);
-  persist();
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    if (response.status === 409 || response.status === 404) {
+      await hydrateStateFromServer();
+      renderPage();
+    }
+    toast(result.error || "Serah terima ditolak oleh server.", true);
+    return;
+  }
+  await hydrateStateFromServer();
   toast(`Serah terima tersimpan untuk ${accepted.length} paket.`);
   renderPage();
 }
@@ -1116,6 +1177,45 @@ function renderReports() {
     <div class="footer-note">Ekspor memuat nomor pesanan, resi, toko, kurir, jadwal, status paket, kejadian pembatalan/retur terakhir, dan manifest. Data pelanggan yang tidak diperlukan tidak disertakan.</div>`;
 }
 
+async function renderQuarantine() {
+  content.innerHTML = `${pageHeading("PEMULIHAN DATA", "Quarantine recovery", "Tinjau payload state yang gagal dibaca sebelum melakukan recovery eksplisit.")}<section class="panel"><div class="panel-heading"><div><h2>Daftar quarantine</h2><p>Hanya tenant yang diizinkan yang ditampilkan.</p></div><span class="cell-secondary">Memuat...</span></div></section>`;
+  try {
+    const response = await apiFetch("/api/admin/quarantine");
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "Quarantine tidak dapat dimuat.");
+    const rows = data.quarantine.map((row) => `<tr><td><span class="cell-primary mono">${escapeHtml(row.id)}</span><span class="cell-secondary">${formatDateTime(row.createdAt)}</span></td><td>${escapeHtml(row.tenantId)}</td><td>${escapeHtml(row.reason)}</td><td class="mono">${escapeHtml(row.payloadHash.slice(0, 12))}...</td><td><button class="table-action" data-action="view-quarantine" data-id="${escapeHtml(row.id)}"><i data-lucide="eye"></i> Tinjau</button></td></tr>`).join("");
+    content.innerHTML = `${pageHeading("PEMULIHAN DATA", "Quarantine recovery", "Tinjau payload state yang gagal dibaca sebelum melakukan recovery eksplisit.")}<section class="panel"><div class="panel-heading"><div><h2>Daftar quarantine</h2><p>Recovery tidak pernah otomatis.</p></div><span class="status-pill">${data.quarantine.length} catatan</span></div>${data.quarantine.length ? `<div class="table-wrap"><table><thead><tr><th>ID / WAKTU</th><th>TENANT</th><th>ALASAN</th><th>HASH</th><th>AKSI</th></tr></thead><tbody>${rows}</tbody></table></div>` : emptyState("shield-alert", "Tidak ada quarantine", "State yang valid tidak memerlukan recovery.")}</section>`;
+    renderIcons(content);
+  } catch (error) {
+    content.innerHTML = `${pageHeading("PEMULIHAN DATA", "Quarantine recovery", "Tinjau payload state yang gagal dibaca sebelum melakukan recovery eksplisit.")}<section class="panel">${emptyState("shield-alert", "Quarantine tidak tersedia", error.message)}</section>`;
+  }
+}
+
+async function showQuarantine(id) {
+  const response = await apiFetch(`/api/admin/quarantine/${encodeURIComponent(id)}`);
+  const data = await response.json();
+  if (!response.ok) return toast(data.error || "Quarantine tidak ditemukan.", true);
+  const quarantine = data.quarantine;
+  const preview = quarantine.preview ? `<div class="event-detail-grid"><div><span>Manifest</span><strong>${quarantine.preview.manifestCount}</strong></div><div><span>Paket</span><strong>${quarantine.preview.packageCount}</strong></div><div><span>Insiden</span><strong>${quarantine.preview.incidentCount}</strong></div><div><span>Audit</span><strong>${quarantine.preview.auditCount}</strong></div></div><p class="field-help">Manifest IDs: ${quarantine.preview.manifestIds.map(escapeHtml).join(", ") || "-"}</p>` : `<p class="row-error">${escapeHtml(quarantine.error || "Payload tidak valid.")}</p>`;
+  const history = data.history && data.history.length ? data.history.map((entry) => `<div class="history-session"><div><strong>${escapeHtml(entry.action)}</strong><small>${formatDateTime(entry.createdAt)} · ${escapeHtml(entry.actorName)}</small></div></div>`).join("") : '<p class="page-subtitle">Belum ada riwayat recovery.</p>';
+  openModal("Detail quarantine", `${quarantine.id} · ${quarantine.tenantId}`, `<div class="help-copy"><p><strong>Alasan:</strong> ${escapeHtml(quarantine.reason)}</p><p class="mono">Hash: ${escapeHtml(quarantine.payloadHash)}</p>${preview}<p><strong>Riwayat recovery</strong></p>${history}</div><div class="modal-actions"><button type="button" class="button button-secondary" data-action="close-modal">Tutup</button>${quarantine.valid ? `<button type="button" class="button button-primary" data-action="recover-quarantine" data-id="${escapeHtml(quarantine.id)}" data-hash="${escapeHtml(quarantine.payloadHash)}"><i data-lucide="rotate-ccw"></i> Pulihkan</button>` : ""}</div>`);
+}
+
+async function recoverQuarantine(id, payloadHash) {
+  if (!window.confirm(`Pulihkan quarantine ${id}? State aktif akan disalin ke quarantine terlebih dahulu.`)) return;
+  const response = await apiFetch(`/api/admin/quarantine/${encodeURIComponent(id)}/recover`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ confirm: true, expectedPayloadHash: payloadHash }),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) return toast(data.error || "Recovery gagal.", true);
+  closeModal();
+  await hydrateStateFromServer();
+  toast("Quarantine berhasil dipulihkan.");
+  renderQuarantine();
+}
+
 function renderAudit() {
   const rows = state.audit.slice(0, 250).map((entry) => `<div class="audit-entry"><span class="audit-icon"><i data-lucide="history"></i></span><p><strong>${escapeHtml(entry.actor)}</strong> ${escapeHtml(entry.action)}<span class="cell-secondary">Objek: ${escapeHtml(entry.object)}</span></p><small>${formatDateTime(entry.createdAt)}</small></div>`).join("");
   content.innerHTML = `${pageHeading("JEJAK PERUBAHAN", "Audit log", "Riwayat tindakan operasional yang tercatat di server.", '<button class="button button-secondary" data-action="export-audit"><i data-lucide="download"></i> Ekspor log</button>')}
@@ -1134,7 +1234,7 @@ async function renderEmployees() {
   const loadingActions = '<button class="button button-secondary" disabled><i data-lucide="building-2"></i> Tambah tenant</button><button class="button button-primary" disabled><i data-lucide="user-plus"></i> Tambah karyawan</button>';
   content.innerHTML = `${pageHeading("ADMINISTRASI", "Karyawan dan tenant", "Kelola akun, peran, serta organisasi yang menggunakan OrderGuard.", loadingActions)}<section class="panel"><div class="section-toolbar"><label class="search-box"><i data-lucide="search"></i><input id="employee-search" type="search" placeholder="Cari nama atau username" aria-label="Cari karyawan" /></label><span class="cell-secondary">Memuat daftar karyawan...</span></div></section>`;
   try {
-    const response = await fetch('/api/users', { credentials: 'same-origin' });
+    const response = await apiFetch('/api/users', { credentials: 'same-origin' });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || 'Daftar karyawan tidak dapat dimuat.');
     employeeDirectory = data;
@@ -1184,7 +1284,7 @@ async function saveTenant(form) {
   const payload = editing
     ? { name: String(formData.get('name') || '').trim() }
     : { id: String(formData.get('id') || '').trim(), name: String(formData.get('name') || '').trim() };
-  const response = await fetch(endpoint, {
+  const response = await apiFetch(endpoint, {
     method: editing ? 'PATCH' : 'POST',
     headers: { 'Content-Type': 'application/json' },
     credentials: 'same-origin',
@@ -1209,7 +1309,7 @@ async function saveEmployee(form) {
   const password = String(formData.get('password') || '');
   if (password) payload.password = password;
   const editing = Boolean(form.dataset.id);
-  const response = await fetch(editing ? `/api/users/${encodeURIComponent(form.dataset.id)}` : '/api/users', {
+  const response = await apiFetch(editing ? `/api/users/${encodeURIComponent(form.dataset.id)}` : '/api/users', {
     method: editing ? 'PATCH' : 'POST',
     headers: { 'Content-Type': 'application/json' },
     credentials: 'same-origin',
@@ -1225,7 +1325,7 @@ async function saveEmployee(form) {
 async function deactivateEmployee(id) {
   const employee = employeeDirectory.users.find((item) => item.id === id);
   if (!employee || !window.confirm(`Nonaktifkan akun ${employee.name} (${employee.username})?`)) return;
-  const response = await fetch(`/api/users/${encodeURIComponent(id)}`, { method: 'DELETE', credentials: 'same-origin' });
+  const response = await apiFetch(`/api/users/${encodeURIComponent(id)}`, { method: 'DELETE', credentials: 'same-origin' });
   const result = await response.json();
   if (!response.ok) return toast(result.error || 'Akun gagal dinonaktifkan.', true);
   toast('Akun karyawan dinonaktifkan.');
@@ -1236,7 +1336,7 @@ function openNewManifestModal() {
   openModal("Buat manifest manual", "Tambahkan paket yang akan diserahkan ke kurir.", `<form class="modal-form" id="new-manifest-form"><div class="modal-grid"><div class="field"><label for="new-shop">Toko <span class="required-mark">*</span></label><input id="new-shop" name="shop" required value="D'Fixer Store" /></div><div class="field"><label for="new-courier">Kurir / ekspedisi <span class="required-mark">*</span></label><input id="new-courier" name="courier" required placeholder="Contoh: J&T Express" /></div><div class="field"><label for="new-date">Tanggal rencana <span class="required-mark">*</span></label><input id="new-date" name="date" type="date" required value="${todayISO()}" /></div><div class="field"><label for="new-location">Lokasi</label><input id="new-location" name="location" placeholder="Gudang / titik serah" /></div></div><div class="field"><label for="new-parcels">Nomor resi <span class="required-mark">*</span></label><textarea id="new-parcels" name="parcels" required placeholder="Satu nomor resi per baris"></textarea><span class="field-help">Nomor resi duplikat atau yang sudah ada pada manifest aktif akan ditolak.</span></div><div class="modal-actions"><button type="button" class="button button-secondary" data-action="close-modal">Batal</button><button type="submit" class="button button-primary"><i data-lucide="plus"></i> Buat manifest</button></div></form>`);
 }
 
-function submitNewManifest(form) {
+async function submitNewManifest(form) {
   const data = new FormData(form);
   const trackingNumbers = String(data.get("parcels") || "").split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
   if (!trackingNumbers.length) return toast("Masukkan minimal satu nomor resi.", true);
@@ -1249,7 +1349,8 @@ function submitNewManifest(form) {
   }
   const manifest = createManifest({ shop: String(data.get("shop")).trim(), courier: String(data.get("courier")).trim(), date: String(data.get("date")), location: String(data.get("location") || "").trim(), parcels: trackingNumbers.map((tracking) => ({ tracking, order: tracking })), source: "manual" });
   logAudit(`Manifest dibuat manual dengan ${trackingNumbers.length} paket`, manifest.id);
-  persist();
+  const saved = await persist();
+  if (!saved) return;
   closeModal();
   selectedManifestId = manifest.id;
   currentView = "manifest-detail";
@@ -1262,12 +1363,13 @@ function openNewIncidentModal() {
   openModal("Catat insiden", "Simpan konteks dan nomor resi agar selisih dapat ditelusuri.", `<form class="modal-form" id="new-incident-form"><div class="modal-grid"><div class="field"><label for="incident-category">Kategori <span class="required-mark">*</span></label><select id="incident-category" name="category" required><option>Paket kurang</option><option>Paket berlebih</option><option>Resi duplikat</option><option>Paket di luar manifest</option><option>Paket ditolak kurir</option><option>Kesalahan impor</option><option>Paket telah diserahkan sebelumnya</option><option>Kesalahan pemindaian</option><option>Masalah lain</option></select></div><div class="field"><label for="incident-manifest">Manifest terkait</label><select id="incident-manifest" name="manifestId"><option value="">Tidak terkait</option>${options}</select></div></div><div class="field"><label for="incident-tracking">Nomor resi</label><input id="incident-tracking" name="tracking" placeholder="Opsional" /></div><div class="field"><label for="incident-description">Deskripsi <span class="required-mark">*</span></label><textarea id="incident-description" name="description" required placeholder="Jelaskan kejadian dan tindakan yang diperlukan"></textarea></div><div class="modal-actions"><button type="button" class="button button-secondary" data-action="close-modal">Batal</button><button type="submit" class="button button-primary"><i data-lucide="triangle-alert"></i> Simpan insiden</button></div></form>`);
 }
 
-function submitIncident(form) {
+async function submitIncident(form) {
   const data = new FormData(form);
   const incident = { id: makeId("INC"), category: String(data.get("category")), manifestId: String(data.get("manifestId") || ""), tracking: String(data.get("tracking") || "").trim(), description: String(data.get("description") || "").trim(), reportedBy: currentUser?.name || ACTOR, createdAt: nowISO(), status: "OPEN", resolution: "" };
   state.incidents.unshift(incident);
   logAudit(`Insiden dicatat: ${incident.category}`, incident.id);
-  persist();
+  const saved = await persist();
+  if (!saved) return;
   closeModal();
   currentView = "incidents";
   renderPage();
@@ -1280,7 +1382,7 @@ function openResolveModal(id) {
   openModal("Selesaikan insiden", `${incident.id} · ${incident.category}`, `<form class="modal-form" id="resolve-incident-form" data-id="${escapeHtml(id)}"><div class="field"><label for="resolution">Tindakan perbaikan <span class="required-mark">*</span></label><textarea id="resolution" name="resolution" required placeholder="Catat hasil pemeriksaan dan alasan penutupan"></textarea></div><div class="modal-actions"><button type="button" class="button button-secondary" data-action="close-modal">Batal</button><button type="submit" class="button button-primary"><i data-lucide="check"></i> Tandai selesai</button></div></form>`);
 }
 
-function resolveIncident(form) {
+async function resolveIncident(form) {
   const incident = state.incidents.find((item) => item.id === form.dataset.id);
   const resolution = String(new FormData(form).get("resolution") || "").trim();
   if (!incident || !resolution) return;
@@ -1289,7 +1391,8 @@ function resolveIncident(form) {
   incident.resolvedAt = nowISO();
   incident.resolvedBy = currentUser?.name || ACTOR;
   logAudit(`Insiden diselesaikan: ${incident.category} — ${resolution}`, incident.id);
-  persist();
+  const saved = await persist();
+  if (!saved) return;
   closeModal();
   renderPage();
   toast("Insiden ditutup dan tindak lanjut dicatat.");
@@ -1312,7 +1415,7 @@ function downloadCsv(filename, headers, rows) {
   URL.revokeObjectURL(url);
 }
 
-function exportReport() {
+async function exportReport() {
   const rows = [];
   state.manifests.forEach((manifest) => manifest.packages.forEach((parcel) => {
     const event = latestOrderEvent(parcel.tracking);
@@ -1320,7 +1423,7 @@ function exportReport() {
   }));
   downloadCsv(`orderguard-rekonsiliasi-${todayISO()}.csv`, ["ID Manifest", "Toko", "Kurir", "Tanggal", "Nomor Pesanan", "Nomor Resi", "Status Paket", "Waktu Pindai", "Sesi Penerimaan", "Kejadian Terakhir", "Waktu Kejadian", "Alasan"], rows);
   logAudit("Laporan rekonsiliasi diekspor", "CSV");
-  persist();
+  await persist();
 }
 
 function exportAudit() {
@@ -1337,10 +1440,10 @@ function showEvidence(sessionId) {
   const manifest = getManifest(selectedManifestId);
   const session = manifest?.sessions.find((item) => item.id === sessionId);
   if (!session?.evidence) return;
-  openModal("Bukti foto penerimaan", `${session.id} · ${session.items.length} paket · ${formatDateTime(session.createdAt)}`, `<img src="${session.evidence}" alt="Bukti foto sesi ${escapeHtml(session.id)}" style="display:block;width:100%;max-height:62vh;object-fit:contain;border-radius:5px;background:#f2f3f1" /><div class="modal-actions" style="margin-top:12px"><button type="button" class="button button-secondary" data-action="close-modal">Tutup</button></div>`);
+  openEvidenceModal("Bukti foto penerimaan", `${session.id} · ${session.items.length} paket · ${formatDateTime(session.createdAt)}`, session.evidence, `Bukti foto sesi ${session.id}`);
 }
 
-function changeManifestStatus(id, action) {
+async function changeManifestStatus(id, action) {
   const manifest = getManifest(id);
   if (!manifest) return;
   if (action === "close-manifest") {
@@ -1355,7 +1458,8 @@ function changeManifestStatus(id, action) {
     manifest.packages.forEach((parcel) => { if (parcel.status !== "HANDED_OVER") parcel.status = "CANCELLED"; });
     logAudit("Manifest dibatalkan", manifest.id);
   }
-  persist();
+  const saved = await persist();
+  if (!saved) return;
   renderPage();
   toast(action === "close-manifest" ? "Manifest ditutup." : "Manifest dibatalkan.");
 }
@@ -1402,6 +1506,8 @@ document.addEventListener("click", async (event) => {
     else if (name === "export-audit") { if (!hasAccess('audit')) return toast('Anda tidak memiliki izin untuk melihat audit log.', true); exportAudit(); }
     else if (name === "export-failed") exportFailedRows(id);
     else if (name === "view-evidence") showEvidence(id);
+    else if (name === "view-quarantine") showQuarantine(id);
+    else if (name === "recover-quarantine") recoverQuarantine(id, action.dataset.hash);
     else if (name === "new-employee") { if (!hasAccess('employees')) return toast('Hanya Platform Admin yang dapat mengelola karyawan.', true); openEmployeeModal(); }
     else if (name === "edit-employee") { if (!hasAccess('employees')) return toast('Hanya Platform Admin yang dapat mengelola karyawan.', true); openEmployeeModal(id); }
     else if (name === "deactivate-employee") { if (!hasAccess('employees')) return toast('Hanya Platform Admin yang dapat mengelola karyawan.', true); deactivateEmployee(id).catch((error) => toast(error.message, true)); }

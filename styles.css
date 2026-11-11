@@ -203,6 +203,7 @@ tbody tr:hover { background: #fbfcfa; }
 .preview-table { max-height: 270px; overflow: auto; border: 1px solid var(--line); border-radius: 5px; }
 .preview-table th, .preview-table td { padding: 9px; font-size: 9px; }
 .row-error { color: #ad5644; }
+.evidence-image { display: block; width: 100%; max-height: 62vh; object-fit: contain; border-radius: 5px; background: #f2f3f1; }
 .import-sidebar { display: grid; gap: 12px; }
 .guide-card { padding: 16px; border: 1px solid var(--line); border-radius: 7px; background: #fff; }
 .guide-card h3 { margin: 0 0 11px; font: 700 12px "Manrope", sans-serif; }

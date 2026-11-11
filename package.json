@@ -3,14 +3,34 @@
   "version": "1.0.0",
   "description": "D'Fixer OrderGuard MVP backend and frontend",
   "main": "server.js",
+  "engines": {
+    "node": ">=24.0.0 <25"
+  },
   "scripts": {
     "start": "node server.js",
-    "test": "node --test backend.test.js tiktok-shop.test.js",
+    "test": "node --test backend.test.js tiktok-shop.test.js evidence.test.js ops.test.js scripts/backup-crypto.test.js scripts/backup-offsite.test.js scripts/backup-retention.test.js scripts/rotate-backup-keys.test.js scripts/backup-preflight.test.js scripts/integrity.test.js scripts/validate-constraints.test.js",
+    "test:ci": "node --test --test-reporter=spec --test-reporter-destination=stdout --test-reporter=junit --test-reporter-destination=test-results/backend-junit.xml backend.test.js tiktok-shop.test.js evidence.test.js ops.test.js scripts/backup-crypto.test.js scripts/backup-offsite.test.js scripts/backup-retention.test.js scripts/rotate-backup-keys.test.js scripts/backup-preflight.test.js scripts/integrity.test.js scripts/validate-constraints.test.js",
+    "ops:healthcheck": "node scripts/healthcheck.js",
+    "ops:alert": "node scripts/alert.js",
+    "staging:smoke": "node scripts/staging-smoke.js",
+    "staging:seed": "node scripts/staging-seed.js",
+    "e2e:staging": "playwright test --config=playwright.staging.config.js",
+    "load:staging": "node scripts/load-test.js --external",
+    "db:drill": "node scripts/drill-restore.js",
     "db:migrate": "node scripts/migrate-sqlite-to-postgres.js",
     "db:backup": "node scripts/backup.js",
+    "db:backup:check": "node scripts/backup.js --dry-run",
+    "db:backup:rotate-keys": "node scripts/rotate-backup-keys.js",
     "db:restore": "node scripts/restore.js",
+    "db:constraints:validate": "node scripts/validate-constraints.js",
     "desktop:dev": "electron electron/main.js",
-    "desktop:dist": "node scripts/build-desktop.js"
+    "desktop:dist": "node scripts/build-desktop.js",
+    "e2e": "playwright test",
+    "test:e2e": "playwright test",
+    "db:integrity:audit": "node scripts/integrity-audit.js",
+    "db:integrity:reconcile": "node scripts/integrity-reconcile.js",
+    "db:prune-quarantine": "node scripts/prune-quarantine.js",
+    "load": "node scripts/load-test.js"
   },
   "build": {
     "appId": "id.dfixer.orderguard",
@@ -37,12 +57,14 @@
     }
   },
   "dependencies": {
-    "better-sqlite3": "^11.7.0",
     "express": "^4.21.2",
     "pg": "^8.23.1"
   },
   "devDependencies": {
+    "@playwright/test": "^1.65.0",
+    "better-sqlite3": "^11.7.0",
     "electron": "^44.8.0",
-    "electron-builder": "^26.15.3"
+    "electron-builder": "^26.15.3",
+    "xlsx": "^0.18.5"
   }
 }

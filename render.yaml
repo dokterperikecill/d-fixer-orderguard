@@ -5,12 +5,25 @@ services:
     plan: starter
     buildCommand: npm ci
     startCommand: npm start
-    healthCheckPath: /api/health
+    healthCheckPath: /api/ready
+    maxShutdownDelaySeconds: 60
     envVars:
       - key: NODE_VERSION
         value: 24
       - key: NODE_ENV
         value: production
+      - key: ORDERGUARD_TRUST_PROXY
+        value: "1"
+      - key: ORDERGUARD_ALLOWED_ORIGINS
+        sync: false
+      - key: ORDERGUARD_LOGIN_WINDOW_MINUTES
+        value: "15"
+      - key: ORDERGUARD_LOGIN_MAX_ATTEMPTS
+        value: "5"
+      - key: ORDERGUARD_LOGIN_MAX_IP_ATTEMPTS
+        value: "20"
+      - key: ORDERGUARD_SESSION_HOURS
+        value: "8"
       - key: DATABASE_URL
         sync: false
       - key: ORDERGUARD_BOOTSTRAP_USERNAME
@@ -27,3 +40,29 @@ services:
         sync: false
       - key: ORDERGUARD_TOKEN_ENCRYPTION_KEY
         sync: false
+  - type: cron
+    name: dfixer-orderguard-backup
+    runtime: docker
+    schedule: "0 2 * * *"
+    dockerfilePath: ./ops/backup/Dockerfile
+    dockerContext: .
+    plan: starter
+    envVars:
+      - key: NODE_VERSION
+        value: 24
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: ORDERGUARD_BACKUP_ENCRYPTION_KEY
+        sync: false
+      - key: ORDERGUARD_BACKUP_DIR
+        sync: false
+      - key: ORDERGUARD_BACKUP_OFFSITE_S3_URI
+        sync: false
+      - key: ORDERGUARD_BACKUP_OFFSITE_RCLONE_REMOTE
+        sync: false
+      - key: ORDERGUARD_BACKUP_OFFSITE_DIR
+        sync: false
+      - key: ORDERGUARD_BACKUP_KEEP
+        value: "30"
