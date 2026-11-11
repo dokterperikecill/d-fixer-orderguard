@@ -166,7 +166,7 @@ Access/refresh token disimpan terenkripsi di PostgreSQL dan tidak dikirim ke bro
    ```
 
    Jika database SQLite berada di lokasi lain, gunakan path yang sesuai. Simpan salinan di lokasi aman.
-3. Jalankan migrasi satu kali dengan dependensi proyek terpasang:
+3. Jalankan migrasi satu kali dengan dependensi proyek terpasang. `better-sqlite3` adalah **devDependency** (tidak disertakan pada instalasi produksi `npm ci --omit=dev`), jadi jalankan migrasi dari checkout yang memiliki devDependencies (`npm ci` penuh):
 
    ```sh
    DATABASE_URL="postgresql://user:password@host:5432/orderguard" \

@@ -54,6 +54,8 @@ Hasil ditampilkan sebagai JSON; tidak dijalankan terhadap produksi.
 
 `backend.test.js`, `tiktok-shop.test.js`, `evidence.test.js`, dan `ops.test.js` mencakup readiness, metrics terproteksi token, serta graceful shutdown (`SIGTERM` keluar `0` dan listener tertutup).
 
+> `better-sqlite3` adalah devDependency (hanya untuk migrasi SQLite). Instalasi produksi memakai `npm ci --omit=dev` sehingga tidak memerlukan compiler native. Jalankan migrasi SQLite dari checkout dengan `npm ci` penuh.
+
 ```sh
 TEST_DATABASE_URL="postgresql://user:password@host:5432/orderguard_test" npm test
 ```
