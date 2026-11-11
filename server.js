@@ -9,10 +9,28 @@ const TikTokShop = require('./tiktok-shop');
 const app = express();
 app.disable('x-powered-by');
 const port = Number(process.env.PORT || 4173);
+const host = process.env.ORDERGUARD_HOST || '0.0.0.0';
 const appDir = __dirname;
 const db = createPool();
 const tiktokTokenRefreshes = new Map();
 const isProduction = process.env.NODE_ENV === 'production';
+const release = process.env.ORDERGUARD_RELEASE || process.env.GITHUB_SHA || 'dev';
+const accessLogEnabled = process.env.ORDERGUARD_ACCESS_LOG === '1'
+  || (process.env.NODE_ENV !== 'test' && process.env.ORDERGUARD_ACCESS_LOG !== '0');
+const metrics = {
+  requestsTotal: 0,
+  responses2xx: 0,
+  responses3xx: 0,
+  responses4xx: 0,
+  responses5xx: 0,
+  serverErrorsTotal: 0,
+  dbUp: 0,
+  inflight: 0,
+};
+
+function logEvent(level, event, fields = {}) {
+  console.log(JSON.stringify({ level, event, release, time: new Date().toISOString(), ...fields }));
+}
 
 function positiveInteger(value, fallback) {
   const parsed = Number.parseInt(value, 10);
@@ -1405,13 +1423,104 @@ app.use((req, res, next) => {
   if (req.path.startsWith('/api/')) res.set('Cache-Control', 'no-store');
   next();
 });
+app.use((req, res, next) => {
+  const incoming = String(req.get('x-request-id') || '').trim();
+  const requestId = /^[A-Za-z0-9._:-]{1,64}$/.test(incoming) ? incoming : crypto.randomUUID();
+  req.requestId = requestId;
+  res.set('X-Request-Id', requestId);
+  metrics.requestsTotal += 1;
+  metrics.inflight += 1;
+  const startedAt = process.hrtime.bigint();
+  let finished = false;
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    metrics.inflight -= 1;
+  };
+  res.on('finish', finish);
+  res.on('close', finish);
+  res.on('finish', () => {
+    const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+    if (res.statusCode >= 500) {
+      metrics.serverErrorsTotal += 1;
+      metrics.responses5xx += 1;
+    } else if (res.statusCode >= 400) {
+      metrics.responses4xx += 1;
+    } else if (res.statusCode >= 300) {
+      metrics.responses3xx += 1;
+    } else {
+      metrics.responses2xx += 1;
+    }
+    if (accessLogEnabled) {
+      logEvent('info', 'access', {
+        requestId,
+        method: req.method,
+        path: req.path,
+        status: res.statusCode,
+        durationMs: Number(durationMs.toFixed(1)),
+      });
+    }
+  });
+  next();
+});
 app.use(express.json({ limit: '10mb' }));
 app.use(validateRequestOrigin);
 
-app.get('/api/health', asyncRoute(async (req, res) => {
-  await db.prepare('SELECT 1').get();
-  res.json({ status: 'ok', database: 'ok', time: new Date().toISOString() });
-}));
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', uptimeSeconds: Math.floor(process.uptime()), version: release, runtime: process.version, time: new Date().toISOString() });
+});
+
+app.get('/api/ready', async (req, res) => {
+  try {
+    await db.prepare('SELECT 1').get();
+    metrics.dbUp = 1;
+    res.json({ status: 'ready', database: 'ok', version: release, time: new Date().toISOString() });
+  } catch (error) {
+    metrics.dbUp = 0;
+    console.error(`[ready] database check failed: ${error?.message || 'unknown error'}`);
+    res.status(503).json({ status: 'not_ready', database: 'error', time: new Date().toISOString() });
+  }
+});
+
+app.get('/api/metrics', (req, res) => {
+  const token = process.env.ORDERGUARD_METRICS_TOKEN || '';
+  if (!token) return res.status(404).json({ error: 'Endpoint tidak ditemukan.', code: 'API_NOT_FOUND' });
+  if (!timingSafeEqualString(req.get('authorization') || '', `Bearer ${token}`)) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  const memory = process.memoryUsage();
+  const lines = [
+    '# HELP orderguard_requests_total Total HTTP requests received.',
+    '# TYPE orderguard_requests_total counter',
+    `orderguard_requests_total ${metrics.requestsTotal}`,
+    '# HELP orderguard_responses_total HTTP responses by status class.',
+    '# TYPE orderguard_responses_total counter',
+    `orderguard_responses_total{class="2xx"} ${metrics.responses2xx}`,
+    `orderguard_responses_total{class="3xx"} ${metrics.responses3xx}`,
+    `orderguard_responses_total{class="4xx"} ${metrics.responses4xx}`,
+    `orderguard_responses_total{class="5xx"} ${metrics.responses5xx}`,
+    '# HELP orderguard_server_errors_total Unhandled server errors.',
+    '# TYPE orderguard_server_errors_total counter',
+    `orderguard_server_errors_total ${metrics.serverErrorsTotal}`,
+    '# HELP orderguard_up Whether the process is running.',
+    '# TYPE orderguard_up gauge',
+    'orderguard_up 1',
+    '# HELP orderguard_db_up Whether the last readiness probe reached PostgreSQL.',
+    '# TYPE orderguard_db_up gauge',
+    `orderguard_db_up ${metrics.dbUp}`,
+    '# HELP orderguard_inflight_requests Requests currently being processed.',
+    '# TYPE orderguard_inflight_requests gauge',
+    `orderguard_inflight_requests ${metrics.inflight}`,
+    '# HELP orderguard_uptime_seconds Process uptime in seconds.',
+    '# TYPE orderguard_uptime_seconds gauge',
+    `orderguard_uptime_seconds ${Math.floor(process.uptime())}`,
+    '# HELP orderguard_process_rss_bytes Resident memory size.',
+    '# TYPE orderguard_process_rss_bytes gauge',
+    `orderguard_process_rss_bytes ${memory.rss}`,
+    '',
+  ];
+  res.type('text/plain; version=0.0.4').send(lines.join('\n'));
+});
 
 app.get('/api/config', (req, res) => {
   res.set('Cache-Control', 'no-store');
@@ -2036,13 +2145,62 @@ app.use((error, req, res, next) => {
   if (error?.type === 'entity.too.large') {
     return res.status(413).json({ error: 'Payload terlalu besar.' });
   }
-  console.error(`[${req.method} ${req.path}] ${error?.message || 'Unknown error'}`);
+  console.error(JSON.stringify({
+    level: 'error',
+    event: 'request_failed',
+    requestId: req.requestId || null,
+    method: req.method,
+    path: req.path,
+    message: error?.message || 'Unknown error',
+  }));
   return res.status(500).json({ error: 'Terjadi kesalahan server.' });
 });
 
+let httpServer = null;
+let shuttingDown = false;
+const SHUTDOWN_TIMEOUT_MS = positiveInteger(process.env.ORDERGUARD_SHUTDOWN_TIMEOUT_MS, 25000);
+
+function shutdown(signal, exitCode = 0) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logEvent('info', 'shutdown_start', { signal, timeoutMs: SHUTDOWN_TIMEOUT_MS });
+  const forceTimer = setTimeout(() => {
+    console.error(JSON.stringify({ level: 'error', event: 'shutdown_forced', signal }));
+    process.exit(1);
+  }, SHUTDOWN_TIMEOUT_MS);
+  forceTimer.unref?.();
+  const finish = async (code) => {
+    clearTimeout(forceTimer);
+    try {
+      await db.pool.end();
+    } catch (error) {
+      console.error(JSON.stringify({ level: 'error', event: 'pool_close_failed', message: error?.message || 'unknown' }));
+    }
+    logEvent('info', 'shutdown_complete', { signal, code });
+    process.exit(code);
+  };
+  if (!httpServer) return finish(exitCode);
+  httpServer.close((error) => finish(error ? 1 : exitCode));
+  httpServer.closeIdleConnections?.();
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('unhandledRejection', (reason) => {
+  console.error(JSON.stringify({ level: 'error', event: 'unhandled_rejection', message: reason?.message || String(reason) }));
+  shutdown('unhandledRejection', 1);
+});
+process.on('uncaughtException', (error) => {
+  console.error(JSON.stringify({ level: 'error', event: 'uncaught_exception', message: error?.message || String(error), stack: error?.stack }));
+  shutdown('uncaughtException', 1);
+});
+
 initializeDatabase().then(() => {
-  app.listen(port, () => {
-    console.log(`OrderGuard backend connected to PostgreSQL and running on http://localhost:${port}`);
+  httpServer = app.listen(port, host, () => {
+    httpServer.headersTimeout = 20_000;
+    httpServer.requestTimeout = 30_000;
+    httpServer.keepAliveTimeout = 65_000;
+    logEvent('info', 'server_started', { port, host, environment: isProduction ? 'production' : 'sandbox' });
   });
 }).catch(async (error) => {
   console.error(`Gagal menginisialisasi PostgreSQL: ${error.message}`);
