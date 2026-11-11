@@ -1,0 +1,11 @@
+node_modules
+.git
+.gitignore
+data
+release
+test-results
+playwright-report
+playwright-report/staging
+*.log
+.env
+.env.*

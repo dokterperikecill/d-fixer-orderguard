@@ -5,7 +5,8 @@ services:
     plan: starter
     buildCommand: npm ci
     startCommand: npm start
-    healthCheckPath: /api/health
+    healthCheckPath: /api/ready
+    maxShutdownDelaySeconds: 60
     envVars:
       - key: NODE_VERSION
         value: 24
@@ -41,11 +42,11 @@ services:
         sync: false
   - type: cron
     name: dfixer-orderguard-backup
-    runtime: node
-    plan: starter
+    runtime: docker
     schedule: "0 2 * * *"
-    buildCommand: npm ci
-    startCommand: npm run db:backup
+    dockerfilePath: ./ops/backup/Dockerfile
+    dockerContext: .
+    plan: starter
     envVars:
       - key: NODE_VERSION
         value: 24

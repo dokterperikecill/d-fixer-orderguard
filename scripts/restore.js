@@ -3,6 +3,7 @@ const path = require('node:path');
 const os = require('node:os');
 const { spawnSync } = require('node:child_process');
 const { decodeKey, decryptFile, encryptFile, sha256File } = require('./backup-crypto');
+const { sendAlert } = require('./alert');
 
 const databaseUrl = process.env.DATABASE_URL;
 const backupDirectory = path.resolve(process.env.ORDERGUARD_BACKUP_DIR || path.join(__dirname, '..', 'data', 'backups'));
@@ -186,7 +187,8 @@ async function main() {
   }
 }
 
-main().catch((error) => {
+main().catch(async (error) => {
   console.error(`Restore gagal: ${error.message}`);
+  await sendAlert({ title: 'Restore OrderGuard gagal', message: error.message, severity: 'critical' });
   process.exitCode = 1;
 });

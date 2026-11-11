@@ -4,6 +4,7 @@ const { spawnSync } = require('node:child_process');
 const { Client } = require('pg');
 const { decodeKey, encryptFile, sha256File } = require('./backup-crypto');
 const { copyOffsite } = require('./backup-offsite');
+const { sendAlert } = require('./alert');
 
 const databaseUrl = process.env.DATABASE_URL;
 const backupDirectory = path.resolve(process.env.ORDERGUARD_BACKUP_DIR || path.join(__dirname, '..', 'data', 'backups'));
@@ -174,6 +175,7 @@ async function main() {
       if (offsite.mode === 'none') console.warn('Peringatan: backup tidak disalin off-site; konfigurasi S3/rclone diperlukan untuk disaster recovery.');
     } catch (offsiteError) {
       console.error(`Backup lokal valid, tetapi salinan off-site gagal: ${offsiteError.message}`);
+      await sendAlert({ title: 'OrderGuard backup off-site gagal', message: offsiteError.message, severity: 'critical' });
       process.exitCode = 1;
     }
   } catch (error) {
@@ -189,8 +191,9 @@ async function main() {
 }
 
 if (require.main === module) {
-  main().catch((error) => {
+  main().catch(async (error) => {
     console.error(`Backup gagal: ${error.message}`);
+    await sendAlert({ title: 'Backup OrderGuard gagal', message: error.message, severity: 'critical' });
     process.exitCode = 1;
   });
 }

@@ -1,0 +1,12 @@
+[Unit]
+Description=OrderGuard encrypted PostgreSQL backup
+Documentation=file:/opt/orderguard/ops/backup/README.md
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/orderguard/backup.env
+ExecStart=/usr/bin/docker run --rm --env-file /etc/orderguard/backup.env -v /var/backups/orderguard:/tmp/orderguard-backups orderguard-backup:latest
+TimeoutStartSec=1800
+Nice=10

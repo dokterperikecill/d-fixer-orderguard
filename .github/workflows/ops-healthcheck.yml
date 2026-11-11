@@ -1,0 +1,36 @@
+name: Ops healthcheck
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ops-healthcheck
+  cancel-in-progress: false
+
+jobs:
+  readiness:
+    name: Staging readiness and alert
+    runs-on: ubuntu-latest
+    env:
+      ORDERGUARD_HEALTHCHECK_URL: ${{ secrets.STAGING_BASE_URL }}
+      ORDERGUARD_ALERT_WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}
+      ORDERGUARD_ALERT_WEBHOOK_FORMAT: slack
+    steps:
+      - name: Skip when staging URL is not configured
+        if: env.ORDERGUARD_HEALTHCHECK_URL == ''
+        run: echo "STAGING_BASE_URL belum diatur; healthcheck dilewati."
+      - uses: actions/checkout@v4
+        if: env.ORDERGUARD_HEALTHCHECK_URL != ''
+      - uses: actions/setup-node@v4
+        if: env.ORDERGUARD_HEALTHCHECK_URL != ''
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - name: Run readiness probe
+        if: env.ORDERGUARD_HEALTHCHECK_URL != ''
+        run: node scripts/healthcheck.js
