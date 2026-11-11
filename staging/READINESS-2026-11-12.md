@@ -1,9 +1,8 @@
 # Staging Readiness Report — OrderGuard
 **Tanggal:** 2026-11-12 (Asia/Jakarta)
 **Status:** ✅ **STAGING CORE SIAP** — dengan 3 item eksternal yang ditandai *blocked*
-**Release:** `staging-2026-11-12` → commit **`84d8b69`**
-**Artefak deploy:** `/opt/orderguard-staging/releases/84d8b69` (symlink `current`)
-> Tag `staging-2026-11-12` menunjuk ke commit runtime `84d8b69`; commit tooling/dokumentasi setelahnya tidak mengubah runtime yang diuji.
+**Release:** tag `staging-2026-11-12`
+**Artefak deploy:** `/opt/orderguard-staging/current` → `releases/<commit>`
 **Lingkungan:** VPS `vps.ayra.id` — Ubuntu 24.04.5, Node **v24.22.2**, PostgreSQL 16.15, Nginx 1.24.0
 
 > Laporan rehearsal awal: [`EXECUTION-2026-11-11.md`](EXECUTION-2026-11-11.md).
@@ -97,7 +96,7 @@ Metrics (snapshot proses saat pengujian): `requests_total 626`, `5xx 0`, `server
 Backup terjadwal: `orderguard-staging-backup.timer`, harian 02:00, retensi 14, output `.dump.enc` + `.meta.json` + `.sha256` di `/var/backups/orderguard-staging` (owner `orderguard`, `700`). Eksekusi manual terakhir: **success**.
 
 ### 2.7 Rollback drill — **16 detik**
-- N (`84d8b69`) → N-1 (`4ae86d2`) → N.
+- N (release `staging-2026-11-12`) → N-1 (`4ae86d2`) → N.
 - Setelah rollback: `/api/health 200`, login + CSRF berhasil.
 - Setelah kembali ke N: `/api/ready 200`, login berhasil.
 
