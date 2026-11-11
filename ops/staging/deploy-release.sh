@@ -43,8 +43,8 @@ fi
 
 ln -sfn "$REL" "$BASE/current"
 chown -h orderguard:orderguard "$BASE/current"
-sed -i '/^ORDERGUARD_RELEASE=/d' "$ENV_FILE"
-printf 'ORDERGUARD_RELEASE=%s\n' "$TAG_NAME" >> "$ENV_FILE"
+sed -i '/^ORDERGUARD_RELEASE=/d;/^ORDERGUARD_HOST=/d' "$ENV_FILE"
+printf 'ORDERGUARD_HOST=127.0.0.1\nORDERGUARD_RELEASE=%s\n' "$TAG_NAME" >> "$ENV_FILE"
 chmod 600 "$ENV_FILE"
 
 systemctl restart orderguard-staging.service
