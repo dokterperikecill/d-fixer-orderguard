@@ -1,9 +1,10 @@
 # Checklist Verifikasi Staging
 
-**Status: rehearsal staging dieksekusi 2026-11-11 di VPS (nginx TLS + PostgreSQL terpisah); deployment staging Render BELUM dijalankan.**
-Hasil lengkap: [`staging/EXECUTION-2026-11-11.md`](EXECUTION-2026-11-11.md).
+**Status: staging core dieksekusi 2026-11-12 pada release `staging-2026-11-12` di VPS (nginx TLS + PostgreSQL terpisah, Node 24).**
+Hasil lengkap: [`staging/READINESS-2026-11-12.md`](READINESS-2026-11-12.md).
+Akses: [`staging/ACCESS.md`](ACCESS.md).
 
-Checklist ini tetap menjadi sumber kebenaran. Item yang sudah diverifikasi pada rehearsal ditandai di laporan eksekusi; item fungsional penuh (impor, scan, handover, evidence, quarantine, laporan), TikTok Shop, Cloudflare Access, dan deployment Render masih harus dijalankan pada staging sungguhan.
+Item fungsional inti (login, isolasi tenant, impor CSV/XLSX, scan, handover, evidence, finalisasi, laporan, quarantine) sudah lulus otomatis. Yang belum: TikTok Shop staging, Cloudflare Access, backup off-site, channel alert eksternal, dan deployment Render.
 
 Baseline yang sudah ada (bukan verifikasi staging):
 
