@@ -3,6 +3,7 @@
 **Status:** ✅ **STAGING CORE SIAP** — dengan 3 item eksternal yang ditandai *blocked*
 **Release:** `staging-2026-11-12` → commit **`84d8b69`**
 **Artefak deploy:** `/opt/orderguard-staging/releases/84d8b69` (symlink `current`)
+> Tag `staging-2026-11-12` menunjuk ke commit runtime `84d8b69`; commit tooling/dokumentasi setelahnya tidak mengubah runtime yang diuji.
 **Lingkungan:** VPS `vps.ayra.id` — Ubuntu 24.04.5, Node **v24.22.2**, PostgreSQL 16.15, Nginx 1.24.0
 
 > Laporan rehearsal awal: [`EXECUTION-2026-11-11.md`](EXECUTION-2026-11-11.md).
@@ -81,7 +82,7 @@ Health, readiness, HSTS, CSP, X-Frame-Options, Referrer/Permissions-Policy, cook
 | `GET /api/session` | 500 ms |
 | `GET /api/state` | 268 ms |
 
-Metrics setelah pengujian: `requests_total 626`, `5xx 0`, `server_errors_total 0`, `db_up 1`.
+Metrics (snapshot proses saat pengujian): `requests_total 626`, `5xx 0`, `server_errors_total 0`, `db_up 1`.
 
 ### 2.6 Backup & restore drill — **6/6 lulus**
 | Langkah | Hasil |
